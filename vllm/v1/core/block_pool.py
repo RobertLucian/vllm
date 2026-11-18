@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol
@@ -46,6 +47,36 @@ class CachedBlockEvictionPolicy(Protocol):
 
     def prepare_eviction(self, num_blocks: int) -> None:
         """`num_blocks` blocks are about to leave the queue front."""
+        ...
+
+    def peek_eviction_order(self, num_blocks: int) -> list[KVCacheBlock]:
+        """The free blocks the next allocations of `num_blocks` blocks would
+        take, by the current order, without changing it."""
+        ...
+
+
+class SpillGuard(Protocol):
+    """Holds back the eviction of cached blocks that a slower tier could
+    restore until that tier holds a copy: a CPU tier that copies blocks only
+    as they near eviction extends the GPU pool instead of mirroring it."""
+
+    @property
+    def holding(self) -> bool:
+        """Whether blocks that need a spill are held back now. False lets an
+        allocation that waited too long evict them."""
+        ...
+
+    def needs_spill(self, block: KVCacheBlock) -> bool:
+        """Whether evicting the free cached `block` now would lose it."""
+        ...
+
+    def on_allocation_held(self, num_blocks: int) -> None:
+        """An allocation waits for `num_blocks` more blocks to be spilled."""
+        ...
+
+    def on_unspilled_eviction(self, blocks: list[KVCacheBlock]) -> None:
+        """`blocks` leave the free queue without a copy: no other free block
+        was left."""
         ...
 
 
@@ -200,6 +231,8 @@ class BlockPool:
         ) = None
         # None keeps the free queue's LRU order.
         self.eviction_policy: CachedBlockEvictionPolicy | None = None
+        # Set by a tier that copies blocks only as they near eviction.
+        self.spill_guard: SpillGuard | None = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -755,6 +788,8 @@ class BlockPool:
 
         if self.eviction_policy is not None and self.enable_caching:
             self.eviction_policy.prepare_eviction(num_blocks)
+        if self.spill_guard is not None and self.enable_caching:
+            self._take_spilled_first(num_blocks)
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
@@ -782,6 +817,50 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _take_spilled_first(self, num_blocks: int) -> None:
+        """Before `num_blocks` blocks leave the queue front: the first free
+        blocks the spill guard lets go move ahead of those it holds back.
+        Held blocks leave only when no other free block is left."""
+        guard = self.spill_guard
+        assert guard is not None
+        queue = self.free_block_queue
+        safe: list[KVCacheBlock] = []
+        held = False
+        for block in queue.iter_blocks_after(None):
+            if len(safe) == num_blocks:
+                break
+            if guard.needs_spill(block):
+                held = True
+            else:
+                safe.append(block)
+        if not held:
+            return
+        for block in safe:
+            queue.remove(block)
+        queue.prepend_n(safe)
+        if len(safe) < num_blocks:
+            lost = itertools.islice(
+                queue.iter_blocks_after(None), len(safe), num_blocks
+            )
+            guard.on_unspilled_eviction(list(lost))
+
+    def num_spill_safe_free_blocks(
+        self, limit: int, exclude: Iterable[KVCacheBlock] = ()
+    ) -> int:
+        """The free blocks the spill guard lets go, counted up to `limit`
+        (all free blocks without a guard), other than `exclude`."""
+        guard = self.spill_guard
+        if guard is None or not self.enable_caching:
+            return min(limit, self.get_num_free_blocks())
+        skip = {block.block_id for block in exclude}
+        count = 0
+        for block in self.free_block_queue.iter_blocks_after(None):
+            if count >= limit:
+                break
+            if block.block_id not in skip and not guard.needs_spill(block):
+                count += 1
+        return count
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
         for block in blocks:

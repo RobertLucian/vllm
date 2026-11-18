@@ -401,19 +401,21 @@ class KVCacheManager:
 
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         fa_group_id = coordinator.full_attention_group_id
+        # The hit every group agrees on, with its extensions (a frontier
+        # checkpoint past the block grid, for instance).
+        reconciled = self.get_computed_blocks(request, max_cache_hit_length)
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, max_cache_hit_length
         )
-        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
-            # A lagging group hit deeper than full attention means its
-            # full-attention blocks were evicted; use the reconciled boundary
-            # that every group agrees on.
-            return *self.get_computed_blocks(request, max_cache_hit_length), False
-
         num_local = per_group_hits[fa_group_id]
+        if num_local <= reconciled[1] or any(hit > num_local for hit in per_group_hits):
+            # Not deeper than the reconciled hit, or a lagging group hit deeper
+            # than full attention (its full-attention blocks were evicted).
+            return *reconciled, False
+
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
-        return blocks, num_local, 0, min(per_group_hits) < num_local
+        return blocks, num_local, 0, True
 
     def allocate_slots(
         self,
@@ -624,6 +626,24 @@ class KVCacheManager:
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
+        guard = self.block_pool.spill_guard
+        if guard is not None and guard.holding:
+            # A request waits while its new blocks would evict cached blocks
+            # that a lazily filled tier does not hold yet; the hit blocks it
+            # takes from the free queue are not evicted. The scheduler retries
+            # it next step, after the tier stored what it lacked.
+            touched = [
+                block
+                for group in new_computed_block_list
+                for block in group
+                if block.ref_cnt == 0 and not block.is_null
+            ]
+            need = required_blocks - len(touched)
+            if need > 0:
+                safe = self.block_pool.num_spill_safe_free_blocks(need, touched)
+                if safe < need:
+                    guard.on_allocation_held(need - safe)
+                    return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks

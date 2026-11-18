@@ -3,6 +3,8 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import itertools
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, auto
@@ -50,6 +52,7 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadWorkerMetadata,
 )
 from vllm.v1.simple_kv_offload.metrics import (
+    LAZY_SPILL_EVENT_TO_FIELD,
     OUTCOME_TO_FIELD,
     MetricName,
     SimpleCPUOffloadStats,
@@ -63,6 +66,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Lazy mode: the most blocks a step stores beyond the walk's target for the
+# allocations held for a spill, and how long allocations may be held before
+# the spill guard lets them evict blocks the CPU pool does not hold.
+_MAX_SHORTFALL_STORE_BLOCKS = 256
+_MAX_SPILL_WAIT_S = 10.0
 
 
 @dataclass
@@ -138,6 +147,25 @@ class BoundaryStoreStats:
     skipped_in_flight: int = 0
     dropped_null_block: int = 0
     dropped_not_hashed: int = 0
+
+
+@dataclass
+class LazySpillStats:
+    """Cumulative counters of lazy mode's spill guard."""
+
+    # GPU blocks stored as they neared eviction.
+    stored_blocks: int = 0
+    # Allocations (one request, one step) that waited for blocks to be
+    # stored first.
+    held_allocations: int = 0
+    # Blocks the CPU pool could restore, evicted without a copy: the guard
+    # had let held allocations go, or no other free block was left.
+    unspilled_evicted_blocks: int = 0
+    # Times the guard let held allocations go (they waited too long, or the
+    # CPU pool had no block to store into).
+    guard_releases: int = 0
+    # Cached CPU blocks evicted to store new ones.
+    cpu_evicted_blocks: int = 0
 
 
 class SimpleCPUOffloadScheduler:
@@ -263,6 +291,14 @@ class SimpleCPUOffloadScheduler:
             )
         else:
             self._target_free = 0
+        # Lazy mode: the GPU pool's spill guard (`needs_spill`). Blocks the
+        # allocations held last step still need, when they were first held,
+        # and whether uncopied blocks are held back now.
+        self._spill_shortfall = 0
+        self._held_since: float | None = None
+        self._holding = True
+        self.lazy_spill_stats = LazySpillStats()
+        self._lazy_spill_snapshot = LazySpillStats()
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
         self._abandoned_store_event_to_blocks: dict[int, TransferMeta] = {}
         # Eager mode only
@@ -367,6 +403,66 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        if self._lazy_mode:
+            # Lazy stores extend the GPU pool instead of mirroring it: a block
+            # the CPU pool could restore leaves the GPU only once stored.
+            gpu_block_pool.spill_guard = self
+
+    @property
+    def holding(self) -> bool:
+        """SpillGuard: whether uncopied blocks are held back now."""
+        return self._holding
+
+    def needs_spill(self, block: "KVCacheBlock") -> bool:
+        """SpillGuard: whether the free cached GPU `block` is one a CPU lookup
+        could restore and the CPU pool does not hold yet. A page no GPU state
+        needs any more still counts: it is the prefix of states the CPU pool
+        holds."""
+        if (
+            block.block_hash is None
+            or block.is_null
+            or block.ref_cnt
+            or not self._restorable(block)
+        ):
+            return False
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        return cached.get_one_block(block.block_hash) is None
+
+    def on_allocation_held(self, num_blocks: int) -> None:
+        """SpillGuard: the next walk also stores `num_blocks` blocks."""
+        self._spill_shortfall += num_blocks
+        self.lazy_spill_stats.held_allocations += 1
+
+    def has_pending_block_frees(self) -> bool:
+        """Whether stores in flight, or the next walk, will let go blocks an
+        allocation was held for: the scheduler then waits a step instead of
+        preempting a request."""
+        return self._lazy_mode and self._holding and self._spill_shortfall > 0
+
+    def on_unspilled_eviction(self, blocks: list["KVCacheBlock"]) -> None:
+        """SpillGuard: `blocks` leave the GPU without a copy."""
+        self.lazy_spill_stats.unspilled_evicted_blocks += len(blocks)
+        logger.warning_once(
+            "SimpleCPU lazy offload evicted GPU blocks before storing them "
+            "(vllm:simple_kv_offload_lazy_spill_total, "
+            "event=unspilled_evicted_blocks)."
+        )
+
+    def _update_holding(self, num_cpu_free: int) -> None:
+        """Hold back uncopied blocks unless allocations have waited for stores
+        too long or the CPU pool has no block to store into."""
+        if not self._spill_shortfall:
+            self._held_since = None
+            self._holding = True
+            return
+        now = time.monotonic()
+        if self._held_since is None:
+            self._held_since = now
+        holding = num_cpu_free > 0 and now - self._held_since < _MAX_SPILL_WAIT_S
+        if self._holding and not holding:
+            self.lazy_spill_stats.guard_releases += 1
+            self._held_since = None
+        self._holding = holding
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -651,36 +747,47 @@ class SimpleCPUOffloadScheduler:
     ]:
         """Offload cached GPU blocks near eviction.
 
-        Walks the GPU free queue from its head, counting blocks that are
-        free-or-offloaded (safe for the allocator to evict). Stops when
-        target_free blocks are covered or CPU capacity is reached.
+        Walks the GPU pool's eviction order (its free queue's, or its eviction
+        policy's) and stores the blocks the spill guard holds back
+        (`needs_spill`). Stops once target_free blocks are covered (free or
+        stored) and as many blocks are stored as the allocations held in the
+        last step still need (up to a per-step cap), or at CPU capacity.
         """
         gpu_pool = self._gpu_block_pool
         if gpu_pool is None or self._target_free <= 0:
             return [], [], [], None
 
-        free_queue = gpu_pool.free_block_queue
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
+        shortfall = min(self._spill_shortfall, _MAX_SHORTFALL_STORE_BLOCKS)
+        self._update_holding(num_cpu_free)
+        self._spill_shortfall = 0
 
+        policy = gpu_pool.eviction_policy
+        order: Iterable[KVCacheBlock] = (
+            policy.peek_eviction_order(2 * (self._target_free + shortfall) + 16)
+            if policy is not None
+            else gpu_pool.free_block_queue.iter_blocks_after(None)
+        )
         gpu_ids: list[int] = []
-
-        for covered, node in enumerate(free_queue.iter_blocks_after(None)):
-            if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
-                break
-
-            bhash = node.block_hash
-
-            if (
-                bhash is not None
-                and not node.is_null
-                and self._restorable(node)
-                and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
+        for covered, node in enumerate(order):
+            if len(gpu_ids) >= num_cpu_free or (
+                covered >= self._target_free and len(gpu_ids) >= shortfall
             ):
+                break
+            if self.needs_spill(node):
                 gpu_ids.append(node.block_id)
 
         # Batch-allocate CPU blocks.
         if gpu_ids:
+            self.lazy_spill_stats.stored_blocks += len(gpu_ids)
+            self.lazy_spill_stats.cpu_evicted_blocks += sum(
+                1
+                for block in itertools.islice(
+                    cpu_pool.free_block_queue.iter_blocks_after(None), len(gpu_ids)
+                )
+                if block.block_hash is not None
+            )
             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             # Touch GPU blocks to prevent eviction during async copy.
@@ -1061,6 +1168,15 @@ class SimpleCPUOffloadScheduler:
             if delta > 0:
                 stats.increase_counter(MetricName.SAVE_OUTCOMES, delta, (outcome,))
         self._boundary_stats_snapshot = replace(current)
+
+        spill = self.lazy_spill_stats
+        for event, field_name in LAZY_SPILL_EVENT_TO_FIELD.items():
+            delta = getattr(spill, field_name) - getattr(
+                self._lazy_spill_snapshot, field_name
+            )
+            if delta > 0:
+                stats.increase_counter(MetricName.LAZY_SPILL, delta, (event,))
+        self._lazy_spill_snapshot = replace(spill)
 
         if self._interval_load_blocks_completed:
             stats.increase_counter(
@@ -1540,6 +1656,9 @@ class SimpleCPUOffloadScheduler:
         )
         self.boundary_store_stats = undrained
         self._boundary_stats_snapshot = BoundaryStoreStats()
+        self._spill_shortfall = 0
+        self._held_since = None
+        self._holding = True
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions

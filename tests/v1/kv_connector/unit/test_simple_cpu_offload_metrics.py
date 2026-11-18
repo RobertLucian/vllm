@@ -38,6 +38,7 @@ from vllm.v1.simple_kv_offload.metrics import (
 )
 
 SAVE_OUTCOMES = MetricName.SAVE_OUTCOMES
+LAZY_SPILL = MetricName.LAZY_SPILL
 LOAD_BLOCKS = MetricName.LOAD_BLOCKS
 USED_BLOCKS = MetricName.USED_BLOCKS
 PENDING_STORE_BLOCKS = MetricName.PENDING_STORE_BLOCKS
@@ -187,6 +188,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
     defs = prom._defs
     assert set(defs) == {
         SAVE_OUTCOMES,
+        LAZY_SPILL,
         LOAD_BLOCKS,
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
@@ -196,6 +198,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
     # generator); they must stay in sync with the emission-side constants.
     assert {m.kwargs["name"] for m in defs.values()} == {
         SAVE_OUTCOMES,
+        LAZY_SPILL,
         LOAD_BLOCKS,
         USED_BLOCKS,
         PENDING_STORE_BLOCKS,
@@ -210,6 +213,7 @@ def test_prom_metrics_registers_tier1_metrics() -> None:
         "engine",
         "outcome",
     ]
+    assert defs[LAZY_SPILL].kwargs["labelnames"] == ["model_name", "engine", "event"]
     assert defs[LOAD_BLOCKS].kwargs["labelnames"] == ["model_name", "engine"]
     assert defs[INFO].kwargs["labelnames"] == [
         "model_name",

@@ -1403,6 +1403,97 @@ def test_lazy_walk_does_not_offload_past_eviction_window() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 2g: Lazy spill guard
+# ---------------------------------------------------------------------------
+@pytest.mark.cpu_test
+def test_lazy_guard_evicts_uncopied_blocks_only_when_nothing_else_is_free() -> None:
+    """Lazy: allocations take uncached or stored free blocks before cached
+    blocks the CPU pool does not hold; those go last, and are counted."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    cached = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=4), 4)
+    # At the queue front, ahead of every uncached block.
+    gpu_pool.free_blocks(cached, evict_first=True)
+
+    taken = gpu_pool.get_new_blocks(gpu_pool.get_num_free_blocks() - 4)
+    assert all(block.block_hash is not None for block in cached)
+    assert not {b.block_id for b in taken} & {b.block_id for b in cached}
+    assert sched.lazy_spill_stats.unspilled_evicted_blocks == 0
+
+    lost = gpu_pool.get_new_blocks(2)
+    assert sched.lazy_spill_stats.unspilled_evicted_blocks == 2
+    gpu_pool.free_blocks(taken + lost)
+
+
+@pytest.mark.cpu_test
+def test_lazy_walk_skips_blocks_whose_key_ends_inside_the_block() -> None:
+    """Lazy: a block cached under a key that ends inside it (a hybrid frontier
+    checkpoint) is never looked up in the CPU pool, so it is not stored."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    whole = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=2), 2)
+    (partial,) = gpu_pool.get_new_blocks(1)
+    gpu_pool.cache_block_under_key(
+        partial, make_block_hash_with_group_id(b"frontier", 0), BLOCK_SIZE // 2
+    )
+    gpu_pool.free_blocks(whole + [partial], evict_first=True)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert sorted(meta.store_gpu_blocks) == sorted(b.block_id for b in whole)
+    assert not sched.needs_spill(partial)
+
+
+@pytest.mark.cpu_test
+def test_lazy_walk_stores_what_held_allocations_need() -> None:
+    """Lazy: past target_free, the walk stores as many blocks as the
+    allocations it held back in the last step lacked."""
+    fix = make_scheduler(num_cpu_blocks=64, num_gpu_blocks=64, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    target = sched._target_free
+    num_blocks = 3 * target
+    cached = _allocate_gpu_blocks(
+        gpu_pool, make_request(num_blocks=num_blocks), num_blocks
+    )
+    gpu_pool.free_blocks(cached, evict_first=True)
+
+    sched.on_allocation_held(2 * target)
+    assert sched.has_pending_block_frees()
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert len(meta.store_gpu_blocks) == 2 * target
+    assert not sched.has_pending_block_frees()
+    assert sched.lazy_spill_stats.held_allocations == 1
+
+
+@pytest.mark.cpu_test
+def test_lazy_guard_lets_held_allocations_go_after_waiting_too_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lazy: allocations held for more than 10 s get one step in which the
+    guard evicts uncopied blocks."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    sched = fix.scheduler
+    now = [1000.0]
+    monkeypatch.setattr(
+        "vllm.v1.simple_kv_offload.manager.time", Mock(monotonic=lambda: now[0])
+    )
+    sched.on_allocation_held(4)
+    sched.build_connector_meta(make_scheduler_output({}))
+    assert sched.holding
+
+    now[0] += 11.0
+    sched.on_allocation_held(4)
+    sched.build_connector_meta(make_scheduler_output({}))
+    assert not sched.holding
+    assert sched.lazy_spill_stats.guard_releases == 1
+
+    sched.build_connector_meta(make_scheduler_output({}))
+    assert sched.holding
+
+
+# ---------------------------------------------------------------------------
 # Test 3: LRU eviction order
 # ---------------------------------------------------------------------------
 def test_lru_eviction_order() -> None:

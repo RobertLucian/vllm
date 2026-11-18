@@ -23,6 +23,7 @@ class MetricName:
     """Metric names for SimpleCPUOffloadConnector."""
 
     SAVE_OUTCOMES = "vllm:simple_kv_offload_save_outcomes_total"
+    LAZY_SPILL = "vllm:simple_kv_offload_lazy_spill_total"
     LOAD_BLOCKS = "vllm:simple_kv_offload_load_blocks_total"
     USED_BLOCKS = "vllm:simple_kv_offload_used_blocks"
     PENDING_STORE_BLOCKS = "vllm:simple_kv_offload_pending_store_blocks"
@@ -39,6 +40,15 @@ OUTCOME_TO_FIELD = {
     "dropped_not_hashed": "dropped_not_hashed",
     "skipped_already_cached": "skipped_already_cached",
     "skipped_in_flight": "skipped_in_flight",
+}
+
+# event label value -> LazySpillStats field name.
+LAZY_SPILL_EVENT_TO_FIELD = {
+    "stored_blocks": "stored_blocks",
+    "held_allocations": "held_allocations",
+    "unspilled_evicted_blocks": "unspilled_evicted_blocks",
+    "guard_releases": "guard_releases",
+    "cpu_evicted_blocks": "cpu_evicted_blocks",
 }
 
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]
@@ -191,6 +201,17 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             ),
             labelnames=self._labelnames + ["outcome"],
         )
+        self._counter_lazy_spill = self._counter_cls(
+            name="vllm:simple_kv_offload_lazy_spill_total",
+            documentation=(
+                "Lazy mode's spill guard, by event: GPU blocks stored as "
+                "they neared eviction, steps an admission waited for them, "
+                "blocks evicted without a copy (should stay 0), times a held "
+                "admission was let go, and cached CPU blocks evicted to "
+                "store new ones."
+            ),
+            labelnames=self._labelnames + ["event"],
+        )
         self._counter_load_blocks = self._counter_cls(
             name="vllm:simple_kv_offload_load_blocks_total",
             documentation=(
@@ -236,6 +257,7 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
 
         self._defs: dict[str, PromMetricT] = {
             MetricName.SAVE_OUTCOMES: self._counter_save_outcomes,
+            MetricName.LAZY_SPILL: self._counter_lazy_spill,
             MetricName.LOAD_BLOCKS: self._counter_load_blocks,
             MetricName.USED_BLOCKS: self._gauge_used_blocks,
             MetricName.PENDING_STORE_BLOCKS: self._gauge_pending_store_blocks,
@@ -243,6 +265,7 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
         }
         self._num_label_values: dict[str, int] = {
             MetricName.SAVE_OUTCOMES: 1,
+            MetricName.LAZY_SPILL: 1,
             MetricName.LOAD_BLOCKS: 0,
             MetricName.USED_BLOCKS: 0,
             MetricName.PENDING_STORE_BLOCKS: 0,

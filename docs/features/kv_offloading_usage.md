@@ -541,6 +541,32 @@ selects disk slots and is checked against `disk_capacity_bytes`. Omitting
 `num_cpu_blocks` preserves automatic per-worker sizing. This option applies
 to `SimpleCPUOffloadConnector`, separately from `OffloadingConnector` above.
 
+## Lazy `SimpleCPUOffloadConnector`: a tier that extends the GPU pool
+
+With `"lazy_offload": true`, `SimpleCPUOffloadConnector` stores a block only as
+it nears eviction, so the CPU pool adds to the GPU pool's capacity instead of
+mirroring it. The connector then sets a spill guard on the GPU block pool: a
+cached block that a CPU lookup could restore leaves the GPU only once the CPU
+pool holds it.
+
+- Allocations take free blocks that are uncached, or already stored, first.
+- A request whose new blocks would evict uncopied blocks waits a step, and the
+  next step stores what it lacked. A resume that loads many blocks at once from
+  the CPU pool is such a request.
+- Stores follow the GPU pool's eviction order, including a
+  `prefix_cache_eviction="gds"` policy's.
+- Requests that wait longer than 10 s, or a CPU pool with no block to store
+  into, release the guard for one step.
+
+`vllm:simple_kv_offload_lazy_spill_total` counts the events by its `event`
+label: `stored_blocks`, `held_allocations`, `guard_releases`,
+`cpu_evicted_blocks`, and `unspilled_evicted_blocks` (blocks evicted without a
+copy, which should stay 0).
+
+For hybrid models, a session evicted tail first can end with its first
+full-attention pages on the GPU and its recurrent states on the CPU only. Lazy
+mode resumes such a session from the GPU pages plus a CPU hit past them.
+
 ## Chunked-local attention with `SimpleCPUOffloadConnector`
 
 For chunked-local attention, CPU cache reuse requires the GPU-local prefix to

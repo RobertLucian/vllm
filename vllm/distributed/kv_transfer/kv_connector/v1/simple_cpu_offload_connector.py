@@ -103,6 +103,14 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         return True
 
     @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        # Lazy stores leave a session split across tiers: the GPU evicts its
+        # tail first, so its first full-attention pages outlive the recurrent
+        # states, which only the CPU pool still holds. A local hit at the
+        # full-attention depth plus a CPU hit past it restores the session.
+        return self._lazy_offload
+
+    @property
     def requires_kv_delivery(self) -> bool:
         # Runs as kv_both, but is a best-effort cache: a dropped save is just a
         # future cache miss, so opt out of the producer-role default.
@@ -148,6 +156,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("num_cpu_blocks must be a positive integer")
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        self._lazy_offload = lazy_offload
 
         kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
         if kv_offload_backend not in VALID_KV_OFFLOAD_BACKENDS:
@@ -355,6 +364,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.scheduler_manager is not None:
             return self.scheduler_manager.build_connector_meta(scheduler_output)
         return SimpleCPUOffloadMetadata()
+
+    def has_pending_block_frees(self) -> bool:
+        # Lazy mode: an allocation held for stores goes ahead next step.
+        return (
+            self.scheduler_manager is not None
+            and self.scheduler_manager.has_pending_block_frees()
+        )
 
     def update_connector_output(
         self,

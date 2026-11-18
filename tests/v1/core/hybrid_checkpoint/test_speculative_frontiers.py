@@ -31,6 +31,8 @@ COMPRESSION_RATIO = 4
 # The ring holds two compressed groups: a step stores its drafts' rows before
 # acceptance is known.
 RING = 8
+# GreedyDual-Size prefill cost (seconds per token, per token per 100k context).
+COST = (1.862e-5, 3.33e-6)
 
 
 @pytest.fixture(autouse=True)
@@ -61,10 +63,13 @@ def make_engine(
     fault: Fault | None = None,
     ring: int = RING,
     kv_transfer_config: KVTransferConfig | None = None,
+    eviction: str = "lru",
+    max_num_batched_tokens: int = 1024,
 ) -> Engine:
     scheduler = make_hybrid_scheduler(
         block_size=BLOCK,
         num_blocks=num_blocks,
+        max_num_batched_tokens=max_num_batched_tokens,
         ring=ring,
         ring_compression_ratio=COMPRESSION_RATIO,
         speculative_config=speculative_config(),
@@ -72,6 +77,8 @@ def make_engine(
         async_scheduling=async_scheduling,
         mamba_frontier_checkpoint=True,
         kv_transfer_config=kv_transfer_config,
+        prefix_cache_eviction=eviction,
+        prefill_cost_coefficients=COST if eviction == "gds" else None,
     )
     device = Device(
         scheduler, num_drafts=DRAFTS, truncate=truncate, accept=accept, fault=fault
@@ -274,6 +281,78 @@ def test_sessions_resume_through_the_cpu_tier(async_scheduling: bool, lazy: bool
     counts = engine.device.counts
     assert counts["store_checks"] > 0 and counts["loads"] > 0, counts
     assert checkpoints(engine).frontiers.num_hits > 0
+
+
+@pytest.mark.parametrize("eviction", ["lru", "gds"])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_the_lazy_cpu_tier_evicts_no_block_it_could_restore(
+    async_scheduling: bool, eviction: str, monkeypatch: pytest.MonkeyPatch
+):
+    """Lazy SimpleCPU offloading extends the GPU pool: sessions rotate through
+    a pool that holds about three of them. No cached block a CPU lookup could
+    restore leaves the GPU before the CPU pool holds it; a resume that needs
+    more blocks than are safe to evict waits for the stores. Every resume
+    goes at least as deep as with an eager CPU tier, which mirrors every
+    block it computes."""
+
+    def rotation_engine(lazy: bool) -> Engine:
+        return make_engine(
+            async_scheduling=async_scheduling,
+            num_blocks=90,
+            ring=0,
+            kv_transfer_config=simple_cpu_connector(4000, lazy=lazy),
+            eviction=eviction,
+            max_num_batched_tokens=256,
+        )
+
+    def rotate(engine: Engine) -> list[int]:
+        """Six sessions, three turns each, one session after another; returns
+        the computed tokens each later turn was admitted with."""
+        rng = random.Random(5)
+        tokens = {s: prompt(s, rng.randrange(1000, 1400)) for s in range(6)}
+        resumed = []
+        for turn in range(3):
+            for s in range(6):
+                request_id = f"l{s}t{turn}"
+                engine.add(request_id, tokens[s], rng.choice((17, 90)))
+                engine.run(request_id)
+                if turn:
+                    resumed.append(engine.admissions[request_id][-1])
+                tokens[s] = list(engine.requests[request_id].all_token_ids) + prompt(
+                    2000 + 10 * s + turn, rng.randrange(10, 90)
+                )
+        return resumed
+
+    engine = rotation_engine(lazy=True)
+    pool = engine.scheduler.kv_cache_manager.block_pool
+    guard = pool.spill_guard
+    assert guard is not None
+    # A short lead: a load from the CPU tier needs more blocks than the walk
+    # keeps free or stored ahead of it.
+    guard._target_free = 4
+    lost: list[int] = []
+    evict = pool._maybe_evict_cached_block
+
+    def checked_evict(block) -> bool:
+        # A block a request holds can lose a key (an unwritten state), not
+        # leave the GPU.
+        if guard.holding and guard.needs_spill(block):
+            lost.append(block.block_id)
+        return evict(block)
+
+    monkeypatch.setattr(pool, "_maybe_evict_cached_block", checked_evict)
+    resumed = rotate(engine)
+    assert_clean(engine)
+    assert not lost
+    stats = guard.lazy_spill_stats
+    assert stats.unspilled_evicted_blocks == 0, stats
+    assert stats.stored_blocks > 0 and stats.held_allocations > 0, stats
+    assert engine.device.counts["loads"] > 0
+    mirrored = rotate(rotation_engine(lazy=False))
+    assert all(lazy >= eager for lazy, eager in zip(resumed, mirrored)), (
+        resumed,
+        mirrored,
+    )
 
 
 @pytest.mark.parametrize("fault", ["skip_gather", "no_conv_shift"])

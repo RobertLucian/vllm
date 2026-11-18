@@ -34,6 +34,11 @@ pinned blocks last, those of the waiting queue's back first: its head, the
 next request admitted, keeps its hit longest. A new unit whose score is below
 every other unit's when its blocks are first free is released at once while
 the pool has no keyless free block.
+
+With a spill guard on the pool (a slower tier that copies blocks only as they
+near eviction), a unit whose blocks the tier could restore but does not hold
+yet is set aside until it does, and the tier copies blocks in the order
+`peek_eviction_order` gives.
 """
 
 import heapq
@@ -146,6 +151,10 @@ class GreedyDualSizeEviction:
         self._gone: dict[BlockHash, BlockHash | None] = {}
         self._removed_units: list[RecoveryUnit] = []
         self._parked: dict[BlockHash, RecoveryUnit] = {}
+        # Units and orphans next in line whose blocks a lazily filled tier
+        # must copy first (the pool's spill guard), in the order they came up.
+        self._spilling: dict[BlockHash, RecoveryUnit] = {}
+        self._spilling_orphans: dict[int, KVCacheBlock] = {}
         # Units not yet admitted: blocks not free, or path unknown.
         self._fresh: set[BlockHash] = set()
         # Ids of the blocks with a live orphan entry.
@@ -183,6 +192,7 @@ class GreedyDualSizeEviction:
 
     def unit_used(self, unit: RecoveryUnit) -> None:
         if unit.key in self.units:
+            self._spilling.pop(unit.key, None)
             self._use(unit)
             self._push(unit)
 
@@ -256,6 +266,7 @@ class GreedyDualSizeEviction:
             if not needed and self._orphan(block):
                 self._push_orphan(block)
         for key, unit in released.items():
+            self._spilling.pop(key, None)
             self._use(unit)
             if not self._free(unit):
                 continue
@@ -263,6 +274,45 @@ class GreedyDualSizeEviction:
             self._push(unit)
             if key in self._fresh and unit.path:
                 self._admit(unit)
+
+    def peek_eviction_order(self, num_blocks: int) -> list[KVCacheBlock]:
+        """The free blocks the next allocations of `num_blocks` blocks would
+        take as far as the current scores tell, without evicting: keyless
+        blocks at the queue front, the units waiting to be spilled, then free
+        unpinned units and orphans by score."""
+        out: list[KVCacheBlock] = []
+        seen: set[int] = set()
+
+        def take(blocks: Iterable[KVCacheBlock]) -> None:
+            for block in blocks:
+                if block.ref_cnt == 0 and block.block_id not in seen:
+                    seen.add(block.block_id)
+                    out.append(block)
+
+        queue = self.pool.free_block_queue
+        for block in queue.iter_blocks_after(None):
+            if len(out) >= num_blocks or self._keyed(block):
+                break
+            take((block,))
+        take(self._spilling_orphans.values())
+        for unit in self._spilling.values():
+            if len(out) >= num_blocks:
+                return out
+            take(self._victims(unit))
+        # Each live entry frees at least one block.
+        for entry in heapq.nsmallest(2 * num_blocks + 16, self.heap):
+            if len(out) >= num_blocks:
+                break
+            if not self._live(entry):
+                continue
+            ref = entry[2]
+            if isinstance(ref, KVCacheBlock):
+                take((ref,))
+                continue
+            unit = self.units[ref]
+            if self._free(unit) and not self.pinned(unit):
+                take(self._victims(unit))
+        return out
 
     def prepare_eviction(self, num_blocks: int) -> None:
         """Before `num_blocks` blocks leave the front of the free queue."""
@@ -333,6 +383,7 @@ class GreedyDualSizeEviction:
         self._gone[key] = self._resolve(unit)
         unit.version = -1
         self._parked.pop(key, None)
+        self._spilling.pop(key, None)
         self._fresh.discard(key)
         self.paths.pop(key, None)
         self._removed_units.append(unit)
@@ -591,6 +642,25 @@ class GreedyDualSizeEviction:
         blocks = self._state_blocks(unit)
         return bool(blocks) and all(b.ref_cnt == 0 for b in blocks)
 
+    def _victims(self, unit: RecoveryUnit) -> list[KVCacheBlock]:
+        """The blocks evicting `unit` frees: its free state blocks, then its
+        free exclusive pages, deepest first. A frontier's page cached under a
+        key of its own as well is not freed."""
+        kept = {b.block_id for b in self._shared_pages(unit)}
+        return [
+            b
+            for b in self._state_blocks(unit) + self._exclusive(unit)
+            if b.ref_cnt == 0 and b.block_id not in kept
+        ]
+
+    def _unspilled(self, unit: RecoveryUnit) -> list[KVCacheBlock]:
+        """The blocks evicting `unit` now would lose: those the pool's spill
+        guard holds back until a slower tier holds a copy."""
+        guard = self.pool.spill_guard
+        if guard is None:
+            return []
+        return [b for b in self._victims(unit) if guard.needs_spill(b)]
+
     def pinned(self, unit: RecoveryUnit) -> bool:
         """Whether a waiting request's hit holds `unit`'s state blocks."""
         pinned = self._pinned_blocks
@@ -615,6 +685,10 @@ class GreedyDualSizeEviction:
             return
         low = self._lowest(unit.key)
         if low is not None and self._score(unit) < low:
+            if self._unspilled(unit):
+                # Next in line, once a copy exists.
+                self._spilling[unit.key] = unit
+                return
             self._to_front(self._evict(unit))
 
     def _lowest(self, exclude: BlockHash) -> _Score | None:
@@ -672,6 +746,12 @@ class GreedyDualSizeEviction:
                 heapq.heappop(heap)
                 self._orphans.discard(ref.block_id)
                 if self._orphan(ref):
+                    guard = self.pool.spill_guard
+                    if guard is not None and guard.needs_spill(ref):
+                        if guard.holding:
+                            self._spilling_orphans[ref.block_id] = ref
+                            continue
+                        guard.on_unspilled_eviction([ref])
                     self.pool._maybe_evict_cached_block(ref)
                     return [ref]
                 continue
@@ -688,6 +768,14 @@ class GreedyDualSizeEviction:
             if not self._free(unit) or self.pinned(unit):
                 self._parked[ref] = unit
                 continue
+            lost = self._unspilled(unit)
+            if lost:
+                guard = self.pool.spill_guard
+                assert guard is not None
+                if guard.holding:
+                    self._spilling[ref] = unit
+                    continue
+                guard.on_unspilled_eviction(lost)
             if not self.leaf_last or unit.tier == _LEAF:
                 self.clock = max(self.clock, now[-1])
             blocks = self._evict(unit)
@@ -701,12 +789,7 @@ class GreedyDualSizeEviction:
         deepest first. Returns the freed blocks. A frontier's page cached under
         a key of its own as well keeps that key and is not freed."""
         shared = self._shared_pages(unit)
-        kept = {b.block_id for b in shared}
-        blocks = [
-            b
-            for b in self._state_blocks(unit) + self._exclusive(unit)
-            if b.ref_cnt == 0 and b.block_id not in kept
-        ]
+        blocks = self._victims(unit)
         self._drop(unit, orphans=False)
         for b in shared:
             assert b.block_hash is not None
@@ -793,6 +876,20 @@ class GreedyDualSizeEviction:
             elif self._free(unit) and not self.pinned(unit):
                 del self._parked[key]
                 self._push(unit)
+        for key, unit in list(self._spilling.items()):
+            if units.get(key) is not unit:
+                del self._spilling[key]
+            elif not self._unspilled(unit):
+                # Copied (or its copies in flight hold its blocks): back to
+                # its score.
+                del self._spilling[key]
+                self._push(unit)
+        guard = self.pool.spill_guard
+        for block_id, block in list(self._spilling_orphans.items()):
+            if guard is None or not guard.needs_spill(block):
+                del self._spilling_orphans[block_id]
+                if self._orphan(block):
+                    self._push_orphan(block)
         for key in list(self._fresh):
             fresh = units.get(key)
             if fresh is None:
@@ -828,6 +925,8 @@ class GreedyDualSizeEviction:
         self._gone.clear()
         self._removed_units.clear()
         self._parked.clear()
+        self._spilling.clear()
+        self._spilling_orphans.clear()
         self._fresh.clear()
         self._orphans.clear()
         self._recent.clear()
