@@ -77,8 +77,14 @@ def make_engine(
         async_scheduling=async_scheduling,
         mamba_frontier_checkpoint=True,
         kv_transfer_config=kv_transfer_config,
-        prefix_cache_eviction=eviction,
-        prefill_cost_coefficients=COST if eviction == "gds" else None,
+        prefix_cache_eviction="lru" if eviction == "lru" else "gds",
+        # "gds-reload": reloading a state from a lower tier costs a tenth of
+        # prefilling it.
+        prefill_cost_coefficients={
+            "lru": None,
+            "gds": COST,
+            "gds-reload": (*COST, COST[0] / 10),
+        }[eviction],
     )
     device = Device(
         scheduler, num_drafts=DRAFTS, truncate=truncate, accept=accept, fault=fault
@@ -283,7 +289,7 @@ def test_sessions_resume_through_the_cpu_tier(async_scheduling: bool, lazy: bool
     assert checkpoints(engine).frontiers.num_hits > 0
 
 
-@pytest.mark.parametrize("eviction", ["lru", "gds"])
+@pytest.mark.parametrize("eviction", ["lru", "gds", "gds-reload"])
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_the_lazy_cpu_tier_evicts_no_block_it_could_restore(
     async_scheduling: bool, eviction: str, monkeypatch: pytest.MonkeyPatch

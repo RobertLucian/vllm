@@ -102,6 +102,12 @@ seconds: `d` seconds per token, plus `e` seconds per token per 100,000 tokens of
 
 With a hash unit finer than the block, a frontier's fallback is its graph parent or the deepest block-boundary unit before it. It is not a state at a hash-unit boundary inside its own block, so its gain counts from there.
 
+With a slower KV tier under the pool (`BlockPool.lower_tier`, set by the SimpleCPU offloading connector), an evicted unit may be loaded back instead of prefilled. `prefill_cost_coefficients=(d, e, r)` adds `r`, the seconds per token of that load. A block-boundary unit whose state blocks the tier restores then has gain `r * (num_tokens - fallback)`:
+- in lazy mode, every block-boundary unit, as the tier stores each restorable block before it leaves;
+- in eager mode, those whose states the tier holds, rescored when a store completes (`lower_tier_stored`).
+
+A frontier ends inside a block, which no tier lookup restores, so it keeps its prefill gain. GreedyDual-Size thus gives up bulk context to the tier before the exact ends of sessions. Without `r` the tier changes no score. Fit `r` from the time to load `n` tokens back from the tier.
+
 ## KV connectors
 
 Frontier checkpoints run with a KV connector whose `kv_role` is `"kv_both"` and whose `kv_load_failure_policy` is `"recompute"`. Under `"fail"`, a request whose load failed would finish with a computed length over blocks the load did not write, where no frontier may be cut.

@@ -343,11 +343,14 @@ class CacheConfig:
       blocks it frees`, `L` being the score of the last eviction before the
       state's last use; the lowest score goes first. Requires
       `mamba_frontier_checkpoint` and `prefill_cost_coefficients`."""
-    prefill_cost_coefficients: tuple[float, float] | None = None
-    """The prefill cost model of "gds" eviction, `(d, e)`: prefilling
-    positions `[a, b)` takes `d * (b - a) + e * (b^2 - a^2) / 200000`
-    seconds, i.e. `d` seconds per token plus `e` seconds per token per
-    100,000 tokens of context. Only the ratio `e / d` changes the order."""
+    prefill_cost_coefficients: tuple[float, ...] | None = None
+    """The prefill cost model of "gds" eviction, `(d, e)` or `(d, e, r)`:
+    prefilling positions `[a, b)` takes `d * (b - a) + e * (b^2 - a^2) /
+    200000` seconds, i.e. `d` seconds per token plus `e` seconds per token per
+    100,000 tokens of context. With a KV connector whose CPU pool can restore
+    evicted block-boundary states, `r` is the seconds per token to load one
+    back from it; without `r` every evicted state counts as prefilled again.
+    Only the ratios of the coefficients change the order."""
     prefix_cache_leaf_last: bool = False
     """With "gds" eviction, evict every inner state before any leaf. A state
     with a deeper cached state on its path (the block-boundary state under a
@@ -559,11 +562,22 @@ class CacheConfig:
                 "prefix_cache_leaf_idle_seconds requires prefix_cache_leaf_last"
             )
         if self.prefill_cost_coefficients is not None:
-            per_token, per_token_per_100k = self.prefill_cost_coefficients
+            coefficients = self.prefill_cost_coefficients
+            if len(coefficients) not in (2, 3):
+                raise ValueError(
+                    "prefill_cost_coefficients are (d, e) or (d, e, r), "
+                    f"got {coefficients}"
+                )
+            per_token, per_token_per_100k = coefficients[:2]
             if not (per_token > 0 and per_token_per_100k >= 0):
                 raise ValueError(
                     "prefill_cost_coefficients (d, e) need d > 0 and e >= 0, "
-                    f"got {self.prefill_cost_coefficients}"
+                    f"got {coefficients}"
+                )
+            if len(coefficients) == 3 and not coefficients[2] >= 0:
+                raise ValueError(
+                    "prefill_cost_coefficients (d, e, r) need r >= 0, "
+                    f"got {coefficients}"
                 )
         return self
 

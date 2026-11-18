@@ -837,7 +837,7 @@ class EngineArgs:
     prefix_cache_leaf_idle_seconds: float | None = (
         CacheConfig.prefix_cache_leaf_idle_seconds
     )
-    prefill_cost_coefficients: tuple[float, float] | None = (
+    prefill_cost_coefficients: tuple[float, ...] | None = (
         CacheConfig.prefill_cost_coefficients
     )
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len

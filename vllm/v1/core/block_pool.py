@@ -54,6 +54,20 @@ class CachedBlockEvictionPolicy(Protocol):
         take, by the current order, without changing it."""
         ...
 
+    def lower_tier_stored(self, keys: list[BlockHashWithGroupId]) -> None:
+        """The pool's lower tier now holds copies of the blocks of `keys`."""
+        ...
+
+
+class LowerKVTier(Protocol):
+    """A slower tier under the pool (a KV connector's CPU pool) from which
+    evicted blocks can be loaded back."""
+
+    def restores(self, block: KVCacheBlock) -> bool:
+        """Whether the cached `block` can be loaded back from the tier once it
+        is evicted: the tier holds a copy, or takes one before it leaves."""
+        ...
+
 
 class SpillGuard(Protocol):
     """Holds back the eviction of cached blocks that a slower tier could
@@ -231,7 +245,9 @@ class BlockPool:
         ) = None
         # None keeps the free queue's LRU order.
         self.eviction_policy: CachedBlockEvictionPolicy | None = None
-        # Set by a tier that copies blocks only as they near eviction.
+        # Set by a slower tier under the pool, and by one that copies blocks
+        # only as they near eviction.
+        self.lower_tier: LowerKVTier | None = None
         self.spill_guard: SpillGuard | None = None
 
     def get_cached_block(

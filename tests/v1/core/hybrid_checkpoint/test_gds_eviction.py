@@ -42,7 +42,7 @@ def fast_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_scheduler(
-    cost: tuple[float, float] | None = COST,
+    cost: tuple[float, ...] | None = COST,
     num_blocks: int = 40,
     max_num_batched_tokens: int = 1024,
 ) -> Scheduler:
@@ -113,6 +113,60 @@ def test_eviction_keeps_the_states_that_save_the_most_prefill_per_block(
 
     assert cached_units(scheduler) == units
     assert admitted_at(scheduler, next_turn(scheduler, "long-1", long)) == long_hit
+
+
+class WholeBlockTier:
+    """A lower KV tier that loads back every block cached under a key of
+    whole blocks, as a lazy CPU tier does once it has stored them."""
+
+    def __init__(self) -> None:
+        self.stored: set[int] | None = None
+
+    def restores(self, block) -> bool:
+        num_tokens = block.block_hash_num_tokens
+        whole = num_tokens is not None and num_tokens % BLOCK == 0
+        return whole and (self.stored is None or block.block_id in self.stored)
+
+
+def test_a_lower_tier_keeps_frontiers_over_the_states_it_restores():
+    """Reloading a block-boundary state from a lower tier costs a fraction of
+    prefilling it, so GreedyDual-Size gives those up before frontiers, which
+    no tier restores: the filler's frontier survives the pressure that evicts
+    it without the tier."""
+
+    def survivors(cost: tuple[float, ...], tier: WholeBlockTier | None):
+        scheduler = make_scheduler(cost)
+        scheduler.kv_cache_manager.block_pool.lower_tier = tier
+        finished_sessions(scheduler)
+        run(scheduler, add_request(scheduler, "filler", prompt(3, 600), max_tokens=1))
+        return {u for u in cached_units(scheduler) if u[1]}
+
+    unaware = survivors(COST, None)
+    reloading = survivors((*COST, COST[0] / 10), WholeBlockTier())
+    assert unaware < reloading, (unaware, reloading)
+    # Without `r`, the tier changes nothing.
+    assert survivors(COST, WholeBlockTier()) == unaware
+
+
+def test_a_state_the_lower_tier_stores_is_scored_as_a_reload_at_once():
+    scheduler = make_scheduler((*COST, COST[0] / 10))
+    tier = WholeBlockTier()
+    tier.stored = set()
+    pool = scheduler.kv_cache_manager.block_pool
+    pool.lower_tier = tier
+    finished_sessions(scheduler)
+    policy = pool.eviction_policy
+    assert isinstance(policy, eviction.GreedyDualSizeEviction)
+    unit = next(u for u in policy.units.values() if not u.frontier)
+    before = policy._score(unit)
+
+    blocks = policy._state_blocks(unit)
+    tier.stored = {b.block_id for b in blocks}
+    policy.lower_tier_stored([b.block_hash for b in blocks])
+    after = policy._score(unit)
+    assert after < before
+    # Pushed at the lower score: the heap's lowest live entry is no higher.
+    assert policy._lowest(b"") is not None and policy._lowest(b"") <= after
 
 
 @pytest.mark.usefixtures("fast_clock")
@@ -394,6 +448,8 @@ def test_an_idle_leaf_ranks_as_inner(monkeypatch: pytest.MonkeyPatch):
         ),
         ({"prefill_cost_coefficients": (0.0, 1e-6)}, "need d > 0 and e >= 0"),
         ({"prefill_cost_coefficients": (1e-5, -1e-6)}, "need d > 0 and e >= 0"),
+        ({"prefill_cost_coefficients": (1e-5, 1e-6, -1e-6)}, "need r >= 0"),
+        ({"prefill_cost_coefficients": (1e-5,)}, r"are \(d, e\) or \(d, e, r\)"),
     ],
 )
 def test_invalid_eviction_configurations_are_refused(kwargs, match):

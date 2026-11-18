@@ -11,13 +11,18 @@ class PrefillCostModel:
     plus `per_token_per_100k` seconds per token per 100,000 tokens of
     position, the attention term that grows with context.
 
+    With a slower KV tier under the GPU pool (a KV connector's CPU pool),
+    `reload_per_token` is the seconds per token to load a unit back from it
+    instead; None prefills every evicted unit again.
+
     GreedyDual-Size ranks units by `stamp + gain / size` with `stamp`
-    itself a past score, so scaling both coefficients by a constant does not
-    change the eviction order; only their ratio matters.
+    itself a past score, so scaling every coefficient by a constant does not
+    change the eviction order; only their ratios matter.
     """
 
     per_token: float
     per_token_per_100k: float
+    reload_per_token: float | None = None
 
     def seconds(self, a: int, b: int) -> float:
         if b <= a:
@@ -25,3 +30,7 @@ class PrefillCostModel:
         return (b - a) * self.per_token + self.per_token_per_100k * (
             b * b - a * a
         ) / 2e5
+
+    def reload_seconds(self, a: int, b: int) -> float:
+        assert self.reload_per_token is not None
+        return max(0, b - a) * self.reload_per_token

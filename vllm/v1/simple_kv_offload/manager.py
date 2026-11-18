@@ -403,10 +403,22 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        gpu_block_pool.lower_tier = self
         if self._lazy_mode:
             # Lazy stores extend the GPU pool instead of mirroring it: a block
             # the CPU pool could restore leaves the GPU only once stored.
             gpu_block_pool.spill_guard = self
+
+    def restores(self, block: "KVCacheBlock") -> bool:
+        """LowerKVTier: whether the CPU pool can load the cached GPU `block`
+        back once it is evicted. Lazy mode stores every such block before it
+        leaves (the spill guard); eager mode holds what it stored."""
+        if block.block_hash is None or block.is_null or not self._restorable(block):
+            return False
+        if self._lazy_mode:
+            return True
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        return cached.get_one_block(block.block_hash) is not None
 
     @property
     def holding(self) -> bool:
@@ -1274,6 +1286,7 @@ class SimpleCPUOffloadScheduler:
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
 
         assert self._gpu_block_pool is not None
+        stored: list[BlockHashWithGroupId] = []
         for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
             gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
             primary_hash = gpu_block.block_hash
@@ -1282,6 +1295,7 @@ class SimpleCPUOffloadScheduler:
                 # blocks when one of them is evicted, also from a block being
                 # copied. Its copy then backs no key: free it uncached.
                 continue
+            stored.append(primary_hash)
             self.cpu_block_pool._insert_block_hash(
                 primary_hash,
                 cpu_block,
@@ -1364,6 +1378,11 @@ class SimpleCPUOffloadScheduler:
                             ),
                         )
                     )
+
+        policy = self._gpu_block_pool.eviction_policy
+        if policy is not None and stored and not self._lazy_mode:
+            # Lazy mode counts every restorable block as stored already.
+            policy.lower_tier_stored(stored)
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache.
         # Lazy stores come from the GPU eviction end; return them there.

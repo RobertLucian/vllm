@@ -521,7 +521,30 @@ class GreedyDualSizeEviction:
         base = self.units[fallback].num_tokens if fallback is not None else 0
         if unit.num_tokens <= base:
             return 0.0
+        if self._reloads(unit):
+            return self.cost.reload_seconds(base, unit.num_tokens)
         return max(0.0, self.cost.seconds(base, unit.num_tokens))
+
+    def _reloads(self, unit: RecoveryUnit) -> bool:
+        """Whether the pool's lower tier can load `unit` back once it is
+        evicted, which then costs a reload instead of a prefill. A frontier
+        ends inside a block, which no tier lookup restores."""
+        tier = self.pool.lower_tier
+        if tier is None or self.cost.reload_per_token is None or unit.frontier:
+            return False
+        blocks = self._state_blocks(unit)
+        return bool(blocks) and all(tier.restores(b) for b in blocks)
+
+    def lower_tier_stored(self, keys: list[BlockHashWithGroupId]) -> None:
+        """The lower tier now holds the blocks of `keys`: a unit whose state
+        it can restore costs a reload from now (its score drops: pushed now)."""
+        if self.cost.reload_per_token is None:
+            return
+        for grouped in keys:
+            if get_group_id(grouped) in self.mamba:
+                unit = self.units.get(get_block_hash(grouped))
+                if unit is not None:
+                    self._push(unit)
 
     def _score(self, unit: RecoveryUnit) -> _Score:
         score = unit.stamp + self._gain(unit) / self._size(unit)
