@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
     MambaSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
@@ -69,6 +70,22 @@ def mock_connector(
         kv_role=kv_role,
         kv_load_failure_policy=kv_load_failure_policy,
         kv_connector_extra_config={"matched_tokens": matched_tokens, "is_async": False},
+    )
+
+
+def simple_cpu_connector(num_cpu_blocks: int, lazy: bool = False) -> KVTransferConfig:
+    """The SimpleCPU offloading connector with a CPU pool of `num_cpu_blocks`,
+    storing every computed block (eager) or only blocks about to be evicted
+    (lazy)."""
+    return KVTransferConfig(
+        kv_connector="SimpleCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_load_failure_policy="recompute",
+        kv_connector_extra_config={
+            "num_cpu_blocks": num_cpu_blocks,
+            "cpu_bytes_to_use": 1 << 40,
+            "lazy_offload": lazy,
+        },
     )
 
 
@@ -159,8 +176,22 @@ def make_hybrid_scheduler(
                 ),
             )
         )
+    tensors = []
+    if kv_transfer_config is not None:
+        # One backing allocation that every group overlays, as on the GPU: a
+        # connector sizes its own pool from it.
+        page = max(group.kv_cache_spec.page_size_bytes for group in groups)
+        tensors = [
+            KVCacheTensor(
+                size=page * num_blocks,
+                layers=list(group.layer_names),
+                layer_stride=page * num_blocks,
+                block_stride=page,
+            )
+            for group in groups
+        ]
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        num_blocks=num_blocks, kv_cache_tensors=tensors, kv_cache_groups=groups
     )
     register_all_kvcache_specs(vllm_config)
     # The checkpoint features need Model Runner V2, which CPU builds select

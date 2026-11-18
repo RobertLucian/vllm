@@ -49,10 +49,19 @@ def check_speculative_config(vllm_config: "VllmConfig") -> str | None:
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         # More than one step of a request may be in flight.
         return "pipeline parallel size 1 under speculative decoding"
-    if vllm_config.kv_transfer_config is not None:
+    if (transfer := vllm_config.kv_transfer_config) is not None:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
         # A finished request's state may wait for a later step's draft-column
         # gather when a connector reads it.
-        return "no KV connector under speculative decoding"
+        connector_cls = KVConnectorFactory.get_connector_class(transfer)
+        if not connector_cls.supports_spec_frontier_checkpoints(transfer):
+            return (
+                "a KV connector that supports frontier checkpoints under "
+                "speculative decoding (SimpleCPUOffloadConnector), or none"
+            )
     return None
 
 

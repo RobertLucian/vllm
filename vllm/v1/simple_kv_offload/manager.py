@@ -674,6 +674,7 @@ class SimpleCPUOffloadScheduler:
             if (
                 bhash is not None
                 and not node.is_null
+                and self._restorable(node)
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
                 gpu_ids.append(node.block_id)
@@ -688,6 +689,16 @@ class SimpleCPUOffloadScheduler:
             cpu_ids = []
 
         return gpu_ids, cpu_ids, [], None
+
+    def _restorable(self, block: "KVCacheBlock") -> bool:
+        """Whether a lazy CPU lookup can serve this cached block: it walks
+        whole blocks only, so a key that ends inside its group's block (a
+        fine-grained hit's partial page, or a hybrid frontier checkpoint)
+        would only take CPU space."""
+        assert block.block_hash is not None
+        num_tokens = block.block_hash_num_tokens
+        group_size = self.group_block_sizes[get_group_id(block.block_hash)]
+        return num_tokens is not None and num_tokens % group_size == 0
 
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -1150,7 +1161,11 @@ class SimpleCPUOffloadScheduler:
         for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
             gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
             primary_hash = gpu_block.block_hash
-            assert primary_hash is not None
+            if primary_hash is None:
+                # Hybrid state checkpoints drop a unit's keys from all of its
+                # blocks when one of them is evicted, also from a block being
+                # copied. Its copy then backs no key: free it uncached.
+                continue
             self.cpu_block_pool._insert_block_hash(
                 primary_hash,
                 cpu_block,

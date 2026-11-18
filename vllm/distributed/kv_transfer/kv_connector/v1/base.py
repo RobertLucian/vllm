@@ -201,6 +201,20 @@ class KVConnectorBase_V1(ABC):
         """Whether the connector supports core lookahead hashing."""
         return False
 
+    @classmethod
+    def supports_spec_frontier_checkpoints(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Whether frontier checkpoints may run with this connector under
+        speculative decoding.
+
+        A finished request's exact recurrent state may wait for the next step's
+        draft-column gather, and a decode-boundary state for its copy into a
+        scratch block. A capable connector never reads a Mamba state block
+        before the step that runs that gather or copy, in stream order.
+        """
+        return False
+
     @property
     def requires_kv_delivery(self) -> bool:
         """Whether this connector hands off KV that must be reliably delivered.

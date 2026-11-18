@@ -108,6 +108,8 @@ Frontier checkpoints run with a KV connector whose `kv_role` is `"kv_both"` and 
 
 The scheduler shows a connector only the block-aligned part of a local hit that ends inside a block, and lets a longer external hit replace the rest. A frontier hit is such a hit. When the connector's hit is longer, the frontier's partial page, state and ring block are dropped from the request's hit. The request then resumes at the state the load ends with. This applies to the native CPU offloading connector (`--kv-offloading-size`) like any other connector.
 
+Under speculative decoding a finished request's state may still wait for a gather or a copy that the next step runs, so a connector must declare that it never reads a Mamba state block before that step (`KVConnectorBase_V1.supports_spec_frontier_checkpoints`). The SimpleCPU offloading connector does. In eager mode it skips `align`-mode Mamba groups and drops a finishing request's boundary-state hand-offs. In lazy mode it takes only free blocks, which a pending gather or copy still holds. Its workers launch stores after the step's forward. Lazy mode also skips a cached block whose key ends inside its group's block, a frontier for instance: lazy lookups walk whole blocks only. When a unit's keys are dropped from a block while it is being copied, the copy is freed uncached.
+
 ## Speculative decoding
 
 Under speculative decoding a finished request's computed-token count does not say where its exact state is: a verify step writes one state column per draft position, and under asynchronous scheduling one more step of the request may be in flight when it finishes. `speculative.SpeculativeFrontiers` keeps each request's last completed step (its device start, its query length, whether it verified drafts, and the tokens the device sampled and the scheduler kept), which the scheduler records in `update_from_output`. When the request finishes, it resolves where the exact state is:
@@ -140,7 +142,7 @@ With speculative decoding it also requires:
 - `speculative_config.truncate_acceptance_at_stop`;
 - no EAGLE block drop (`disable_eagle_block_drop` for drafters that need it, such as MTP and EAGLE);
 - pipeline parallel size 1;
-- no KV connector;
+- no KV connector, or one that declares `supports_spec_frontier_checkpoints` (the SimpleCPU offloading connector);
 - indexer rings that only the decode path reads (`resume_catchup="decode"`).
 
 It is refused with ReplaySSM, KV cache events, and decode or prefill context parallelism.

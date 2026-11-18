@@ -20,6 +20,11 @@ violations.
 
 `Engine` drives a scheduler with a `Device`; under asynchronous scheduling
 it applies each step's output one step late, as the engine core does.
+
+With the SimpleCPU offloading connector, the device also plays its worker: a
+step's loads copy CPU blocks in after the copy-on-write copies, its stores copy
+GPU blocks out after the forward, and both complete within the step. A stored
+Mamba block must hold the position it is cached under, like a cached one.
 """
 
 from collections import Counter
@@ -37,8 +42,12 @@ from vllm.v1.core.kv_cache_utils import get_group_id, get_request_block_hasher
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request
+from vllm.v1.simple_kv_offload.metadata import (
+    SimpleCPUOffloadMetadata,
+    SimpleCPUOffloadWorkerMetadata,
+)
 
 EOS = 2
 # A stop token id the target model samples only where a test asks for it.
@@ -82,6 +91,8 @@ class Device:
     # Request -> the token sampled at `eos_at`, when it is not EOS.
     stop_token: dict[str, int] = field(default_factory=dict)
     blocks: dict[int, _Block] = field(default_factory=dict)
+    # CPU block id -> the state the connector stored there.
+    cpu: dict[int, _Block] = field(default_factory=dict)
     requests: dict[str, _Request] = field(default_factory=dict)
     violations: list[dict] = field(default_factory=list)
     counts: Counter[str] = field(default_factory=Counter)
@@ -208,6 +219,15 @@ class Device:
         for copy in output.kv_cache_block_copies or ():
             src = self._block(copy.src_block_id)
             self.blocks[copy.dst_block_id] = _Block(src.rec, src.conv, src.span)
+        transfers = output.kv_connector_metadata
+        if not isinstance(transfers, SimpleCPUOffloadMetadata):
+            transfers = None
+        # Connector loads into the blocks of requests that wait for them.
+        if transfers is not None:
+            for gpu, cpu in zip(transfers.load_gpu_blocks, transfers.load_cpu_blocks):
+                self.counts["loads"] += 1
+                stored = self.cpu.get(cpu, _Block())
+                self.blocks[gpu] = _Block(stored.rec, stored.conv, stored.span)
         # 4. Pre-copy, 5. forward, 6. after sampling; per request.
         for request_id, num_tokens in output.num_scheduled_tokens.items():
             state = self.requests[request_id]
@@ -253,6 +273,13 @@ class Device:
                 state.computed = start + accepted
             else:
                 self._prefill(state, start, num_tokens, first)
+        # 7. Connector stores, after the forward.
+        if transfers is not None:
+            for gpu, cpu in zip(transfers.store_gpu_blocks, transfers.store_cpu_blocks):
+                self.counts["stores"] += 1
+                self._check_state(step, gpu, "store")
+                state = self._block(gpu)
+                self.cpu[cpu] = _Block(state.rec, state.conv, state.span)
 
     def _verify(
         self, state: _Request, start: int, num_tokens: int, first: int, accepted: int
@@ -306,30 +333,35 @@ class Device:
 
     def check_cached(self, step: int) -> None:
         """Every cached Mamba state holds the position it is cached under."""
+        for block in self.scheduler.kv_cache_manager.block_pool.blocks:
+            self._check_state(step, block.block_id, "cached")
+
+    def _check_state(self, step: int, block_id: int, kind: str) -> None:
+        """A cached Mamba block holds the position it is cached under."""
         pool = self.scheduler.kv_cache_manager.block_pool
-        for block in pool.blocks:
-            if block.is_null or block.block_hash is None:
-                continue
-            keys = {
-                block.block_hash,
-                *pool.cached_block_hashes_by_block.get(block.block_id, ()),
-            }
-            if not any(get_group_id(key) in self.mamba_groups for key in keys):
-                continue
-            claimed = block.block_hash_num_tokens
-            if claimed is None:
-                continue
-            self.counts["cached_checks"] += 1
-            state = self._block(block.block_id)
-            if state.rec != claimed or state.conv != claimed:
-                self._violate(
-                    "cached",
-                    step=step,
-                    block=block.block_id,
-                    claimed=claimed,
-                    rec=state.rec,
-                    conv=state.conv,
-                )
+        block = pool.blocks[block_id]
+        if block.is_null or block.block_hash is None:
+            return
+        keys = {
+            block.block_hash,
+            *pool.cached_block_hashes_by_block.get(block.block_id, ()),
+        }
+        if not any(get_group_id(key) in self.mamba_groups for key in keys):
+            return
+        claimed = block.block_hash_num_tokens
+        if claimed is None:
+            return
+        self.counts[f"{kind}_checks"] += 1
+        state = self._block(block.block_id)
+        if state.rec != claimed or state.conv != claimed:
+            self._violate(
+                kind,
+                step=step,
+                block=block.block_id,
+                claimed=claimed,
+                rec=state.rec,
+                conv=state.conv,
+            )
 
 
 class Engine:
@@ -393,6 +425,7 @@ class Engine:
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
+            kv_connector_output=self._transfers_done(output),
         )
         if self.async_scheduling:
             previous, self._pending = self._pending, (output, model_output)
@@ -412,6 +445,22 @@ class Engine:
             self.scheduler.update_draft_token_ids(DraftTokenIds(proposing, drafts))
         self.step_no += 1
         return bool(output.num_scheduled_tokens)
+
+    @staticmethod
+    def _transfers_done(output: SchedulerOutput) -> KVConnectorOutput | None:
+        """The connector's worker report: the step's loads and stores done."""
+        transfers = output.kv_connector_metadata
+        if not isinstance(transfers, SimpleCPUOffloadMetadata):
+            return None
+        stores = {transfers.store_event: 1} if transfers.store_event >= 0 else {}
+        return KVConnectorOutput(
+            finished_recving=set(
+                transfers.load_event_to_reqs.get(transfers.load_event, ())
+            ),
+            kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
+                completed_store_events=stores
+            ),
+        )
 
     def flush(self) -> None:
         if self._pending is not None:

@@ -13,7 +13,7 @@ import random
 
 import pytest
 
-from vllm.config import SpeculativeConfig
+from vllm.config import KVTransferConfig, SpeculativeConfig
 from vllm.utils.hashing import sha256
 from vllm.v1.core.hybrid_checkpoint.speculative import MAX_MIRRORED_STOP_TOKEN_IDS
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -21,7 +21,7 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_STOP_TOKEN_IDS
 
 from .spec_device import STOP, Device, Engine, Fault
-from .utils import make_hybrid_scheduler, mock_connector, prompt
+from .utils import make_hybrid_scheduler, mock_connector, prompt, simple_cpu_connector
 
 pytestmark = pytest.mark.cpu_test
 
@@ -59,16 +59,19 @@ def make_engine(
     truncate: bool = True,
     accept=default_accept,
     fault: Fault | None = None,
+    ring: int = RING,
+    kv_transfer_config: KVTransferConfig | None = None,
 ) -> Engine:
     scheduler = make_hybrid_scheduler(
         block_size=BLOCK,
         num_blocks=num_blocks,
-        ring=RING,
+        ring=ring,
         ring_compression_ratio=COMPRESSION_RATIO,
         speculative_config=speculative_config(),
         num_speculative_blocks=DRAFTS,
         async_scheduling=async_scheduling,
         mamba_frontier_checkpoint=True,
+        kv_transfer_config=kv_transfer_config,
     )
     device = Device(
         scheduler, num_drafts=DRAFTS, truncate=truncate, accept=accept, fault=fault
@@ -244,6 +247,35 @@ def test_concurrent_sessions_under_pool_pressure():
     assert manager.frontiers.num_published > 0 and manager.frontiers.num_hits > 0
 
 
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_sessions_resume_through_the_cpu_tier(async_scheduling: bool, lazy: bool):
+    """With SimpleCPU offloading, sessions overflow a small GPU pool into the
+    CPU tier and come back from it. Every state the connector stores, every
+    state a loaded request reads and every cached state holds its position."""
+    rng = random.Random(23)
+    engine = make_engine(
+        async_scheduling=async_scheduling,
+        num_blocks=180,
+        ring=0,
+        kv_transfer_config=simple_cpu_connector(2000, lazy=lazy),
+    )
+    tokens = {s: prompt(s, rng.randrange(200, 1400)) for s in range(10)}
+    for turn in range(3):
+        request_ids = [f"c{s}t{turn}" for s in range(10)]
+        for s, request_id in enumerate(request_ids):
+            engine.add(request_id, tokens[s], rng.choice((17, 90, 200)))
+        engine.run(*request_ids)
+        for s, request_id in enumerate(request_ids):
+            tokens[s] = list(engine.requests[request_id].all_token_ids) + prompt(
+                1000 + 10 * s + turn, rng.randrange(10, 90)
+            )
+    assert_clean(engine)
+    counts = engine.device.counts
+    assert counts["store_checks"] > 0 and counts["loads"] > 0, counts
+    assert checkpoints(engine).frontiers.num_hits > 0
+
+
 @pytest.mark.parametrize("fault", ["skip_gather", "no_conv_shift"])
 def test_device_faults_are_detected(fault: Fault):
     """A gather skipped or applied without the window shift leaves a published
@@ -316,7 +348,7 @@ def test_resume_inside_an_open_group_catches_up_to_the_group_not_the_ring():
     [
         (
             dict(kv_transfer_config=mock_connector(BLOCK)),
-            "needs no KV connector under speculative decoding",
+            "needs a KV connector that supports frontier checkpoints",
         ),
         (
             dict(resume_catchup="prefill"),

@@ -88,6 +88,20 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> bool:
         return True
 
+    @classmethod
+    def supports_spec_frontier_checkpoints(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        # No store reads a Mamba state before its gather or copy has run:
+        # - Eager stores skip align-mode Mamba groups (not positionally stable)
+        #   and drop a finishing request's boundary-state hand-offs.
+        # - The lazy walk takes only free blocks. A gather or copy holds its
+        #   blocks until the step that runs it is scheduled, and past that
+        #   step's completion when frees are deferred.
+        # - Workers launch stores after the step's forward, ordered behind the
+        #   gathers and copies on the compute stream.
+        return True
+
     @property
     def requires_kv_delivery(self) -> bool:
         # Runs as kv_both, but is a best-effort cache: a dropped save is just a
