@@ -450,11 +450,74 @@ def test_an_idle_leaf_ranks_as_inner(monkeypatch: pytest.MonkeyPatch):
         ({"prefill_cost_coefficients": (1e-5, -1e-6)}, "need d > 0 and e >= 0"),
         ({"prefill_cost_coefficients": (1e-5, 1e-6, -1e-6)}, "need r >= 0"),
         ({"prefill_cost_coefficients": (1e-5,)}, r"are \(d, e\) or \(d, e, r\)"),
+        (
+            {"prefix_cache_eviction": "gdsf", "prefill_cost_coefficients": COST},
+            "requires mamba_frontier_checkpoint",
+        ),
+        (
+            {"prefix_cache_eviction": "gdsf", "mamba_frontier_checkpoint": True},
+            "requires prefill_cost_coefficients",
+        ),
+        ({"prefix_cache_frequency_half_life_seconds": 0.0}, "greater than 0"),
     ],
 )
 def test_invalid_eviction_configurations_are_refused(kwargs, match):
     with pytest.raises(ValueError, match=match):
         CacheConfig(**kwargs)
+
+
+def test_gdsf_weights_a_state_by_its_resumes_until_they_decay(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GreedyDual-Size-Frequency: each request that resumes at a unit adds
+    one to its weight `1 + f`; `f` halves every half-life (in four steps), and
+    the heap is rebuilt at the lowered scores."""
+    now = [1_000_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    scheduler = make_hybrid_scheduler(
+        block_size=BLOCK,
+        num_blocks=40,
+        max_num_batched_tokens=1024,
+        ring=0,
+        mamba_frontier_checkpoint=True,
+        prefix_cache_eviction="gdsf",
+        prefill_cost_coefficients=COST,
+        prefix_cache_leaf_last=True,
+        prefix_cache_frequency_half_life_seconds=100.0,
+    )
+    long, _ = finished_sessions(scheduler)
+    checkpoints = scheduler.mamba_checkpoints
+    assert checkpoints is not None
+    policy = checkpoints.eviction
+    assert isinstance(policy, eviction.GreedyDualSizeEviction)
+    unit = max(policy.units.values(), key=lambda u: u.num_tokens)
+    assert unit.freq == 0.0
+
+    def weight() -> float:
+        return policy._score(unit)[-1] - unit.stamp
+
+    once = weight()
+    for _ in range(3):
+        policy.unit_used(unit)
+    assert unit.freq == 3.0
+    assert weight() == pytest.approx(4 * once)
+
+    now[0] += 100.0
+    policy.new_step()
+    assert unit.freq == pytest.approx(1.5)
+    assert weight() == pytest.approx(2.5 * once)
+    current = [e for e in policy.heap if e[2] == unit.key and policy._live(e)]
+    assert len(current) == 1
+    assert current[0][0][-1] == pytest.approx(policy._score(unit)[-1])
+
+    now[0] += 1000.0
+    policy.new_step()
+    assert unit.freq < 0.01
+    # A resume through the scheduler counts too: the next turn resumes at the
+    # long session's frontier.
+    before = unit.freq
+    run(scheduler, next_turn(scheduler, "long-1", long))
+    assert unit.key not in policy.units or unit.freq >= before + 1.0
 
 
 def test_evicting_a_frontier_keeps_the_page_key_of_a_finer_hash_unit():

@@ -175,7 +175,7 @@ def is_known_kv_cache_dtype(name: str) -> bool:
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
-PrefixCacheEviction = Literal["lru", "gds"]
+PrefixCacheEviction = Literal["lru", "gds", "gdsf"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -342,7 +342,13 @@ class CacheConfig:
       pages only it needs. A state's score is `L + prefill seconds it saves /
       blocks it frees`, `L` being the score of the last eviction before the
       state's last use; the lowest score goes first. Requires
-      `mamba_frontier_checkpoint` and `prefill_cost_coefficients`."""
+      `mamba_frontier_checkpoint` and `prefill_cost_coefficients`.
+    - "gdsf": GreedyDual-Size-Frequency, "gds" with the prefill seconds
+      weighted by `1 + f`, `f` the requests that resumed at the state, halved
+      every `prefix_cache_frequency_half_life_seconds`: a state many requests
+      resume at outlives one that is used once, until it goes stale."""
+    prefix_cache_frequency_half_life_seconds: float = Field(default=600.0, gt=0)
+    """With "gdsf" eviction, the half-life of a state's resume count."""
     prefill_cost_coefficients: tuple[float, ...] | None = None
     """The prefill cost model of "gds" eviction, `(d, e)` or `(d, e, r)`:
     prefilling positions `[a, b)` takes `d * (b - a) + e * (b^2 - a^2) /
@@ -476,6 +482,7 @@ class CacheConfig:
             "prefill_cost_coefficients",
             "prefix_cache_leaf_last",
             "prefix_cache_leaf_idle_seconds",
+            "prefix_cache_frequency_half_life_seconds",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
@@ -541,18 +548,21 @@ class CacheConfig:
 
     @model_validator(mode="after")
     def _validate_prefix_cache_eviction(self) -> "CacheConfig":
-        if self.prefix_cache_eviction == "gds":
+        policy = self.prefix_cache_eviction
+        if policy in ("gds", "gdsf"):
             if not self.mamba_frontier_checkpoint:
                 raise ValueError(
-                    'prefix_cache_eviction="gds" requires mamba_frontier_checkpoint'
+                    f'prefix_cache_eviction="{policy}" requires '
+                    "mamba_frontier_checkpoint"
                 )
             if self.prefill_cost_coefficients is None:
                 raise ValueError(
-                    'prefix_cache_eviction="gds" requires prefill_cost_coefficients'
+                    f'prefix_cache_eviction="{policy}" requires '
+                    "prefill_cost_coefficients"
                 )
         elif self.prefix_cache_leaf_last:
             raise ValueError(
-                'prefix_cache_leaf_last requires prefix_cache_eviction="gds"'
+                'prefix_cache_leaf_last requires prefix_cache_eviction="gds" or "gdsf"'
             )
         if (
             self.prefix_cache_leaf_idle_seconds is not None

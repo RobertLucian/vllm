@@ -837,6 +837,9 @@ class EngineArgs:
     prefix_cache_leaf_idle_seconds: float | None = (
         CacheConfig.prefix_cache_leaf_idle_seconds
     )
+    prefix_cache_frequency_half_life_seconds: float = (
+        CacheConfig.prefix_cache_frequency_half_life_seconds
+    )
     prefill_cost_coefficients: tuple[float, ...] | None = (
         CacheConfig.prefill_cost_coefficients
     )
@@ -1494,6 +1497,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--prefix-cache-leaf-idle-seconds",
             **cache_kwargs["prefix_cache_leaf_idle_seconds"],
+        )
+        cache_group.add_argument(
+            "--prefix-cache-frequency-half-life-seconds",
+            **cache_kwargs["prefix_cache_frequency_half_life_seconds"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2399,6 +2406,9 @@ class EngineArgs:
             prefill_cost_coefficients=self.prefill_cost_coefficients,
             prefix_cache_leaf_last=self.prefix_cache_leaf_last,
             prefix_cache_leaf_idle_seconds=self.prefix_cache_leaf_idle_seconds,
+            prefix_cache_frequency_half_life_seconds=(
+                self.prefix_cache_frequency_half_life_seconds
+            ),
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

@@ -174,6 +174,8 @@ class HybridCheckpointManager:
         eviction_leaf_last: GreedyDual-Size evicts inner units before leaves.
         eviction_leaf_idle_s: With `eviction_leaf_last`, a leaf unused this
             long ranks as inner.
+        eviction_frequency_half_life_s: GreedyDual-Size-Frequency: weight a
+            unit's prefill seconds by its resume count, halved this often.
         speculative_decoding: Whether requests verify draft tokens.
 
     """
@@ -186,6 +188,7 @@ class HybridCheckpointManager:
         eviction_cost: PrefillCostModel | None,
         eviction_leaf_last: bool = False,
         eviction_leaf_idle_s: float | None = None,
+        eviction_frequency_half_life_s: float | None = None,
         speculative_decoding: bool = False,
     ) -> None:
         pages, states, rings = layout_groups(coordinator, speculative_decoding)
@@ -222,6 +225,7 @@ class HybridCheckpointManager:
                 waiting,
                 leaf_last=eviction_leaf_last,
                 leaf_idle_s=eviction_leaf_idle_s,
+                frequency_half_life_s=eviction_frequency_half_life_s,
             )
             # Blocks of a dropped frontier are reused before any cached block.
             self.frontiers.reclaim = True

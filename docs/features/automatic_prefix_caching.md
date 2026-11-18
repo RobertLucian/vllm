@@ -71,6 +71,7 @@ In multi-turn and agentic workloads, each turn's prompt extends the previous tur
 
 - `--mamba-frontier-checkpoint` caches a finished request's state at its exact end and at the last block boundary its output crossed. The next turn resumes where the previous one stopped.
 - `--prefix-cache-eviction gds` evicts cached states by the prefill time they save per block, instead of least recently used first. It needs `--prefill-cost-coefficients D E`, the model's prefill cost: `D` seconds per token plus `E` seconds per token per 100,000 tokens of context. Only the ratio `E / D` changes the order.
+- `--prefix-cache-eviction gdsf` (GreedyDual-Size-Frequency) also weights each state by the number of requests that resumed at it, a count that halves every `--prefix-cache-frequency-half-life-seconds` (default 600). A prefix many sessions start from outlives a state used once, until it goes stale.
 
 ```bash
 vllm serve <hybrid-model> \

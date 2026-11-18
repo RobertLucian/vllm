@@ -500,7 +500,8 @@ class Scheduler(SchedulerInterface):
                 enable_kv_cache_events=self.enable_kv_cache_events,
             )
             eviction_cost = None
-            if self.cache_config.prefix_cache_eviction == "gds":
+            policy = self.cache_config.prefix_cache_eviction
+            if policy in ("gds", "gdsf"):
                 coefficients = self.cache_config.prefill_cost_coefficients
                 assert coefficients is not None
                 eviction_cost = PrefillCostModel(*coefficients)
@@ -511,6 +512,11 @@ class Scheduler(SchedulerInterface):
                 eviction_cost=eviction_cost,
                 eviction_leaf_last=self.cache_config.prefix_cache_leaf_last,
                 eviction_leaf_idle_s=self.cache_config.prefix_cache_leaf_idle_seconds,
+                eviction_frequency_half_life_s=(
+                    self.cache_config.prefix_cache_frequency_half_life_seconds
+                    if policy == "gdsf"
+                    else None
+                ),
                 speculative_decoding=vllm_config.speculative_config is not None,
             )
             self.kv_cache_manager.checkpoints = self.mamba_checkpoints

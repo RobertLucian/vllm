@@ -36,6 +36,8 @@ class RecoveryUnit:
     # time of the last use.
     tier: int = -1
     used_at: float = 0.0
+    # GreedyDual-Size-Frequency: the resumes at this unit, decayed.
+    freq: float = 0.0
 
     @property
     def is_branch_point(self) -> bool:

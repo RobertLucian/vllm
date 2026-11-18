@@ -39,6 +39,11 @@ With a spill guard on the pool (a slower tier that copies blocks only as they
 near eviction), a unit whose blocks the tier could restore but does not hold
 yet is set aside until it does, and the tier copies blocks in the order
 `peek_eviction_order` gives.
+
+GreedyDual-Size-Frequency (`prefix_cache_eviction="gdsf"`) weights a unit's
+gain by `1 + f`, `f` the requests that resumed at it. Every quarter of the
+half-life `f` shrinks by 2^(-1/4) and the heap is rebuilt at the lower scores,
+so a unit popular long ago stops outliving the ones in use now.
 """
 
 import heapq
@@ -79,6 +84,8 @@ _PIN_UNITS = 1 << 18
 _PIN_REFRESH_S = 0.5
 # Leaf-last tiers, lowest first.
 _DEAD, _INNER, _LEAF = 0, 1, 2
+# GreedyDual-Size-Frequency: decay steps per half-life of the resume counts.
+_DECAY_STEPS = 4
 
 # (score, sequence, unit key or orphan block); the score is (score,), or
 # (tier, score) with leaf-last tiers. A unit's entry is current while the
@@ -105,6 +112,9 @@ class GreedyDualSizeEviction:
             `L` rises only when a leaf goes.
         leaf_idle_s: With `leaf_last`, a leaf (not a branch point) unused
             for this many seconds ranks as inner.
+        frequency_half_life_s: GreedyDual-Size-Frequency: a unit's gain is
+            weighted by `1 + f`, `f` the requests that resumed at it, halved
+            every this many seconds (decayed in four steps per half-life).
 
     """
 
@@ -118,10 +128,19 @@ class GreedyDualSizeEviction:
         *,
         leaf_last: bool = False,
         leaf_idle_s: float | None = None,
+        frequency_half_life_s: float | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.leaf_last = leaf_last
         self._demote_s = leaf_idle_s if leaf_last else None
+        # Frequency decay: every quarter half-life, resume counts shrink by
+        # 2^(-1/4) and the heap is rebuilt at the lower scores.
+        self._decay_every = (
+            frequency_half_life_s / _DECAY_STEPS
+            if frequency_half_life_s is not None
+            else None
+        )
+        self._decayed_at = time.monotonic()
         # leaf_idle_s: (time of a use, unit key), oldest first.
         self._recent: deque[tuple[float, BlockHash]] = deque()
         self.pool = coordinator.block_pool
@@ -191,8 +210,11 @@ class GreedyDualSizeEviction:
             self._recheck(self.units.get(unit.parent))
 
     def unit_used(self, unit: RecoveryUnit) -> None:
+        """A request resumed at `unit` (counted once per request)."""
         if unit.key in self.units:
             self._spilling.pop(unit.key, None)
+            if self._decay_every is not None:
+                unit.freq += 1.0
             self._use(unit)
             self._push(unit)
 
@@ -547,7 +569,10 @@ class GreedyDualSizeEviction:
                     self._push(unit)
 
     def _score(self, unit: RecoveryUnit) -> _Score:
-        score = unit.stamp + self._gain(unit) / self._size(unit)
+        gain = self._gain(unit)
+        if self._decay_every is not None:
+            gain *= 1.0 + unit.freq
+        score = unit.stamp + gain / self._size(unit)
         if not self.leaf_last:
             return (score,)
         unit.tier = self._tier(unit)
@@ -851,7 +876,32 @@ class GreedyDualSizeEviction:
     # Per step.
     def new_step(self) -> None:
         self._refresh_pins()
+        self._decay()
         self.settle()
+
+    def _decay(self) -> None:
+        """GreedyDual-Size-Frequency: shrink every resume count, so a unit
+        that many requests resumed at long ago stops outliving current ones.
+        Scores only rise between decays (the heap's lazy rule), so the heap is
+        rebuilt at the lowered scores here."""
+        if self._decay_every is None:
+            return
+        now = time.monotonic()
+        steps = int((now - self._decayed_at) // self._decay_every)
+        if steps <= 0:
+            return
+        self._decayed_at += steps * self._decay_every
+        factor = 0.5 ** (min(steps, 64) / _DECAY_STEPS)
+        if not any(unit.freq for unit in self.units.values()):
+            return
+        for unit in self.units.values():
+            unit.freq *= factor
+        heap = [entry for entry in self.heap if isinstance(entry[2], KVCacheBlock)]
+        for unit in self.units.values():
+            unit.version = next(self._seq)
+            heap.append((self._score(unit), unit.version, unit.key))
+        heapq.heapify(heap)
+        self.heap = heap
 
     def _refresh_pins(self) -> None:
         """Pin the blocks the waiting requests' prefix hits read."""
