@@ -49,6 +49,7 @@ LAZY_SPILL_EVENT_TO_FIELD = {
     "unspilled_evicted_blocks": "unspilled_evicted_blocks",
     "guard_releases": "guard_releases",
     "cpu_evicted_blocks": "cpu_evicted_blocks",
+    "uncopied_evicted_blocks": "uncopied_evicted_blocks",
 }
 
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]

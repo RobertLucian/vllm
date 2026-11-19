@@ -166,6 +166,10 @@ class LazySpillStats:
     guard_releases: int = 0
     # Cached CPU blocks evicted to store new ones.
     cpu_evicted_blocks: int = 0
+    # Free blocks the CPU pool could restore that lost their GPU keys
+    # without a copy on any path: an allocation, a released or dropped
+    # hybrid state unit. Includes unspilled_evicted_blocks.
+    uncopied_evicted_blocks: int = 0
 
 
 class SimpleCPUOffloadScheduler:
@@ -297,11 +301,12 @@ class SimpleCPUOffloadScheduler:
         self._spill_shortfall = 0
         self._held_since: float | None = None
         self._holding = True
-        # Boundary pages (`_boundary_page`) copied without a reference, so
-        # they keep their place in the eviction order: GPU block id -> its key
-        # when the copy started. The guard holds them back like any uncopied
-        # block; a page that changed hands mid-copy backs no CPU key. Once
-        # copied, a page still leaves only in eviction order (`keeps_order`).
+        # Boundary siblings (`_boundary_siblings`) copied without a reference,
+        # so they keep their place in the eviction order: GPU block id -> its
+        # key when the copy started. The guard holds them back like any
+        # uncopied block; a block that changed hands mid-copy backs no CPU key.
+        # Once copied, a sibling still leaves only in eviction order
+        # (`keeps_order`).
         self._unpinned_stores: dict[int, BlockHashWithGroupId] = {}
         self._early_pages: dict[int, BlockHashWithGroupId] = {}
         self.lazy_spill_stats = LazySpillStats()
@@ -448,9 +453,9 @@ class SimpleCPUOffloadScheduler:
         return cached.get_one_block(block.block_hash) is None
 
     def keeps_order(self, block: "KVCacheBlock") -> bool:
-        """SpillGuard: whether `block` is a boundary page copied ahead of its
-        turn. Leaving ahead of the uncopied pages before it would split its
-        session around a page neither tier serves from."""
+        """SpillGuard: whether `block` is a boundary sibling copied ahead of
+        its turn. Leaving ahead of the uncopied blocks before it would split
+        its session around a block neither tier serves from."""
         return (
             block.block_hash is not None
             and self._early_pages.get(block.block_id) == block.block_hash
@@ -478,18 +483,33 @@ class SimpleCPUOffloadScheduler:
 
     def on_evicted(self, block: "KVCacheBlock") -> None:
         """SpillGuard: the GPU drops `block`, so its CPU copy is now the only
-        one: it moves to the CPU pool's most recently used end. The CPU's LRU
-        order is otherwise its store order, and a block stored long ago but
-        hit on the GPU since (lazy mode never refreshes the CPU on GPU hits)
-        would be the next the CPU evicts, losing a session from both tiers."""
+        one: it moves to the CPU pool's most recently used end, with the
+        copies of its boundary siblings (the CPU serves the boundary only
+        whole). The CPU's LRU order is otherwise its store order, and a block
+        stored long ago but hit on the GPU since (lazy mode never refreshes
+        the CPU on GPU hits) would be the next the CPU evicts, losing a
+        session from both tiers."""
         assert block.block_hash is not None
         self._early_pages.pop(block.block_id, None)
-        cpu_block = self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
-            block.block_hash
-        )
-        if cpu_block is not None and cpu_block.ref_cnt == 0:
-            self.cpu_block_pool.touch([cpu_block])
-            self.cpu_block_pool.free_blocks([cpu_block])
+        cpu = self.cpu_block_pool.cached_block_hash_to_block
+        if (
+            cpu.get_one_block(block.block_hash) is None
+            and not block.ref_cnt
+            and not block.is_null
+            and self._restorable(block)
+        ):
+            self.lazy_spill_stats.uncopied_evicted_blocks += 1
+        block_hash = get_block_hash(block.block_hash)
+        copies = []
+        for group_id in self.prefix_cacheable_group_ids:
+            cpu_block = cpu.get_one_block(
+                make_block_hash_with_group_id(block_hash, group_id)
+            )
+            if cpu_block is not None and cpu_block.ref_cnt == 0:
+                copies.append(cpu_block)
+        if copies:
+            self.cpu_block_pool.touch(copies)
+            self.cpu_block_pool.free_blocks(copies)
 
     def _update_holding(self, num_cpu_free: int) -> None:
         """Hold back uncopied blocks unless allocations have waited for stores
@@ -828,8 +848,9 @@ class SimpleCPUOffloadScheduler:
                 continue
             gpu_ids.append(node.block_id)
             chosen.add(node.block_id)
-            page = self._boundary_page(node)
-            if page is not None and page.block_id not in chosen:
+            for page in self._boundary_siblings(node):
+                if page.block_id in chosen:
+                    continue
                 assert page.block_hash is not None
                 pages.append(page.block_id)
                 chosen.add(page.block_id)
@@ -854,39 +875,66 @@ class SimpleCPUOffloadScheduler:
 
         return gpu_ids + pages, cpu_ids, [], None
 
-    def _boundary_page(self, block: "KVCacheBlock") -> "KVCacheBlock | None":
-        """The full-attention page ending where the state `block` holds sits,
-        when the CPU pool does not hold it yet. A state's full-attention pages
-        can stay on the GPU after the state leaves it; the scheduler then
-        resumes one block before the state
-        (`supports_divergent_local_hybrid_hits`), which a CPU lookup serves
-        only if it holds that block's page with the state. The page may still
-        be in use (a running request freed the state as it moved on): a
-        cached full-attention page is full, and no longer written."""
+    def describe_residency(self, request: "Request") -> str | None:
+        """Debugging: per group, where each of the request's block hashes is
+        cached: B in both tiers, G the GPU only, C the CPU only, . neither
+        (lower case: the GPU block is in use). None when nothing is."""
+        assert self._gpu_block_pool is not None
+        gpu = self._gpu_block_pool.cached_block_hash_to_block
+        cpu = self.cpu_block_pool.cached_block_hash_to_block
+        lines = []
+        cached = False
+        for group_id in range(len(self.group_block_sizes)):
+            marks = []
+            for block_hash in request.block_hashes:
+                key = make_block_hash_with_group_id(block_hash, group_id)
+                on_gpu = gpu.get_one_block(key)
+                in_cpu = cpu.get_one_block(key) is not None
+                mark = "BG"[not in_cpu] if on_gpu is not None else "C."[not in_cpu]
+                if on_gpu is not None and on_gpu.ref_cnt:
+                    mark = mark.lower()
+                cached |= mark != "."
+                marks.append(mark)
+            lines.append(f"g{group_id} {''.join(marks)}")
+        return " | ".join(lines) if cached else None
+
+    def _boundary_siblings(self, block: "KVCacheBlock") -> list["KVCacheBlock"]:
+        """The GPU blocks of the other groups keyed by `block`'s hash (the
+        full-attention page ending where a state sits, the other Mamba groups'
+        states there) that the CPU pool does not hold yet. A CPU lookup serves
+        a boundary only with all of them, while the eviction order can take
+        one group's block long before another's: the scheduler then combines
+        the GPU's full-attention pages with the CPU's states
+        (`supports_divergent_local_hybrid_hits`), which needs the CPU pool to
+        hold the boundary whole. A full-attention page may still be in use (a
+        running request freed a state as it moved on): a cached page is full
+        and no longer written. A state in use may not be written yet."""
         assert block.block_hash is not None and self._gpu_block_pool is not None
         group_id = get_group_id(block.block_hash)
-        spec = self.cpu_kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-        if (
-            not isinstance(spec, MambaSpec)
-            or self.group_block_sizes[group_id] != self.fa_block_size
-        ):
-            return None
-        page = self._gpu_block_pool.cached_block_hash_to_block.get_one_block(
-            make_block_hash_with_group_id(
-                get_block_hash(block.block_hash), self.fa_gidx
-            )
-        )
-        if (
-            page is None
-            or page.block_id in self._unpinned_stores
-            or not self._restorable(page)
-            or self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
-                page.block_hash
-            )
-            is not None
-        ):
-            return None
-        return page
+        if self.group_block_sizes[group_id] != self.fa_block_size:
+            return []
+        gpu = self._gpu_block_pool.cached_block_hash_to_block
+        cpu = self.cpu_block_pool.cached_block_hash_to_block
+        block_hash = get_block_hash(block.block_hash)
+        siblings = []
+        for sibling_group in self.prefix_cacheable_group_ids:
+            if (
+                sibling_group == group_id
+                or self.group_block_sizes[sibling_group] != self.fa_block_size
+            ):
+                continue
+            key = make_block_hash_with_group_id(block_hash, sibling_group)
+            sibling = gpu.get_one_block(key)
+            if (
+                sibling is None
+                or sibling.block_id in self._unpinned_stores
+                or (sibling.ref_cnt and sibling_group != self.fa_gidx)
+                or not self._restorable(sibling)
+                or cpu.get_one_block(key) is not None
+            ):
+                continue
+            siblings.append(sibling)
+        return siblings
 
     def _restorable(self, block: "KVCacheBlock") -> bool:
         """Whether a lazy CPU lookup can serve this cached block: it walks

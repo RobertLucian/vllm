@@ -408,12 +408,24 @@ class KVCacheManager:
             request.block_hashes, max_cache_hit_length
         )
         num_local = per_group_hits[fa_group_id]
-        if num_local <= reconciled[1] or any(hit > num_local for hit in per_group_hits):
-            # Not deeper than the reconciled hit, or a lagging group hit deeper
-            # than full attention (its full-attention blocks were evicted).
+        deeper = any(hit > num_local for hit in per_group_hits)
+        # A lagging group hit deeper than full attention (its full-attention
+        # blocks were evicted). A lazy CPU tier holds what the GPU evicted,
+        # and the states there with it (`SpillGuard`): the hit resumes from
+        # the full-attention pages, the connector loading the rest.
+        resumes_past = deeper and (
+            self.block_pool.spill_guard is not None
+            and all(
+                num_local % manager.block_size == 0
+                for manager in coordinator.single_type_managers
+            )
+        )
+        if num_local <= reconciled[1] or (deeper and not resumes_past):
             return *reconciled, False
 
         blocks = self.create_kv_cache_blocks(computed)
+        if deeper:
+            blocks = self.truncate_computed_blocks(blocks, num_local)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, True
 

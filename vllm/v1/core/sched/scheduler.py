@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -87,6 +88,9 @@ from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Debugging: log long prompts that resume well short of their end.
+_DEBUG_RESIDENCY = os.environ.get("VLLM_SIMPLE_CPU_DEBUG") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -393,6 +397,7 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        self._logged_poor_resumes: set[str] = set()
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -687,6 +692,47 @@ class Scheduler(SchedulerInterface):
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _log_poor_resume(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        lookups: list[tuple[int, int | None]],
+        hit_diverged: bool,
+    ) -> None:
+        """Debugging (VLLM_SIMPLE_CPU_DEBUG=1): a long prompt resumed well
+        short of its end, with the lookups behind it and where its blocks
+        are cached."""
+        block_size = self.block_size
+        if (
+            request.num_tokens < 32 * block_size
+            or num_computed_tokens >= request.num_tokens - 4 * block_size
+            or request.request_id in self._logged_poor_resumes
+        ):
+            return
+        self._logged_poor_resumes.add(request.request_id)
+        manager = self.kv_cache_manager
+        guard = manager.block_pool.spill_guard
+        if not hasattr(guard, "describe_residency"):
+            return
+        residency = guard.describe_residency(request)  # type: ignore[union-attr]
+        if residency is None:
+            # Cached nowhere: a new prompt, not a resume.
+            return
+        _, per_group = manager.coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, request.num_tokens - 1
+        )
+        logger.warning(
+            "Poor resume %s: %d tokens, %d computed; GPU hits per group %s, "
+            "diverged %s; connector lookups (local, external) %s; %s",
+            request.request_id,
+            request.num_tokens,
+            num_computed_tokens,
+            per_group,
+            hit_diverged,
+            lookups,
+            residency,
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -1214,6 +1260,7 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
+                        lookups = [(block_aligned_local, ext_tokens)]
                         if request.skip_reading_external_kv:
                             ext_tokens, load_kv_async = 0, False
                         elif (
@@ -1231,6 +1278,7 @@ class Scheduler(SchedulerInterface):
                                     request, stepped_back
                                 )
                             )
+                            lookups.append((stepped_back, ext_tokens))
                             if ext_tokens:
                                 new_computed_blocks = (
                                     self.kv_cache_manager.truncate_computed_blocks(
@@ -1316,6 +1364,10 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if _DEBUG_RESIDENCY and self.connector is not None:
+                        self._log_poor_resume(
+                            request, num_computed_tokens, lookups, hit_diverged
+                        )
                     if self.mamba_checkpoints is not None:
                         self.mamba_checkpoints.admitted(
                             request,
