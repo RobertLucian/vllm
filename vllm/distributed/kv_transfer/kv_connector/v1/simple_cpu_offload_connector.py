@@ -82,6 +82,10 @@ def _find_simple_cpu_offload_connector(
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
 
+    # A subclass's scheduler-side manager, and whether it always runs lazy.
+    scheduler_manager_cls: type[SimpleCPUOffloadScheduler] = SimpleCPUOffloadScheduler
+    always_lazy = False
+
     @classmethod
     def supports_lookahead_block_hashes(
         cls, kv_transfer_config: "KVTransferConfig"
@@ -155,7 +159,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             raise ValueError("num_cpu_blocks must be a positive integer")
 
-        lazy_offload = bool(extra_config.get("lazy_offload", False))
+        lazy_offload = self.always_lazy or bool(extra_config.get("lazy_offload", False))
         self._lazy_offload = lazy_offload
 
         kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
@@ -239,7 +243,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             aligned_num_cpu_blocks = (
                 vllm_config.cache_config.simple_cpu_offload_num_blocks
             )
-            self.scheduler_manager = SimpleCPUOffloadScheduler(
+            self.scheduler_manager = self.scheduler_manager_cls(
                 vllm_config,
                 kv_cache_config,
                 cpu_capacity_per_rank,
@@ -250,6 +254,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 use_page_cache=use_page_cache if disk_mode else False,
                 num_cpu_blocks=num_cpu_blocks,
                 aligned_num_cpu_blocks=aligned_num_cpu_blocks,
+                **self._scheduler_manager_kwargs(extra_config),
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
@@ -264,6 +269,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 num_cpu_blocks=num_cpu_blocks,
                 cpu_hugepage_size=cpu_hugepage_size,
             )
+
+    def _scheduler_manager_kwargs(self, extra_config: dict[str, Any]) -> dict[str, Any]:
+        """Extra constructor arguments of `scheduler_manager_cls`."""
+        return {}
 
     # --- Worker-side methods ---
 

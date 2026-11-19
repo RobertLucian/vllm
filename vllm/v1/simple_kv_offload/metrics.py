@@ -55,6 +55,17 @@ LAZY_SPILL_EVENT_TO_FIELD = {
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]
 
 
+class TieredMetricName:
+    """Metric names for TieredCPUOffloadConnector, beside SimpleCPU's."""
+
+    RESTORES = "vllm:tiered_kv_restores_total"
+    RESUMES = "vllm:tiered_kv_resumes_total"
+    RESUME_RECOMPUTE_TOKENS = "vllm:tiered_kv_resume_recompute_tokens_total"
+    RESUMES_BY_RECOMPUTE = "vllm:tiered_kv_resumes_by_recompute_total"
+    RAM_FRONTIERS = "vllm:tiered_kv_ram_frontiers"
+    RAM_EVICTIONS = "vllm:tiered_kv_ram_evictions_total"
+
+
 class _MetricType:
     """Type tags embedded in the serialized stats payload."""
 
@@ -306,3 +317,85 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
                     raise AssertionError(
                         f"Unknown metric type '{type_str}' for key: {key}"
                     )
+
+
+class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
+    """SimpleCPU's metrics plus TieredCPUOffloadConnector's restores, resumes
+    and RAM tier."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        definitions: list[tuple[str, str, str, list[str]]] = [
+            (
+                TieredMetricName.RESTORES,
+                _MetricType.COUNTER,
+                (
+                    "RAM -> VRAM restores, by event: started, completed, blocks "
+                    "and exact-end states loaded, steps a restore waited for the "
+                    "spill guard or the pin cap, requests that gave up waiting, "
+                    "pins that timed out, and restores whose request left first."
+                ),
+                ["event"],
+            ),
+            (
+                TieredMetricName.RESUMES,
+                _MetricType.COUNTER,
+                (
+                    "Admitted requests that extend a finished request's end, by "
+                    "the tier they resumed from (gpu, ram, cold)."
+                ),
+                ["tier"],
+            ),
+            (
+                TieredMetricName.RESUME_RECOMPUTE_TOKENS,
+                _MetricType.COUNTER,
+                (
+                    "Tokens such resumes recomputed that the finished request "
+                    "had already processed, by tier."
+                ),
+                ["tier"],
+            ),
+            (
+                TieredMetricName.RESUMES_BY_RECOMPUTE,
+                _MetricType.COUNTER,
+                (
+                    "Such resumes that recomputed at most `le` already processed "
+                    "tokens (cumulative buckets), by tier."
+                ),
+                ["tier", "le"],
+            ),
+            (
+                TieredMetricName.RAM_EVICTIONS,
+                _MetricType.COUNTER,
+                "Blocks the RAM tier evicted, by the kind of unit they held.",
+                ["kind"],
+            ),
+            (
+                TieredMetricName.RAM_FRONTIERS,
+                _MetricType.GAUGE,
+                "Exact-end states the RAM tier holds whole.",
+                [],
+            ),
+        ]
+        for name, kind, documentation, extra_labels in definitions:
+            if kind == _MetricType.COUNTER:
+                metric = self._counter_cls(
+                    name=name,
+                    documentation=documentation,
+                    labelnames=self._labelnames + extra_labels,
+                )
+            else:
+                metric = self._gauge_cls(
+                    name=name,
+                    documentation=documentation,
+                    labelnames=self._labelnames + extra_labels,
+                    multiprocess_mode="mostrecent",
+                )
+            self._defs[name] = metric
+            self._num_label_values[name] = len(extra_labels)

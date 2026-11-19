@@ -168,6 +168,28 @@ class FrontierIndex:
         self.num_published += 1
         return key
 
+    def adopt(
+        self,
+        key: BlockHash,
+        anchor: BlockHash | None,
+        num_tokens: int,
+        suffix: tuple[int, ...],
+        blocks: dict[int, KVCacheBlock],
+    ) -> bool:
+        """Index a frontier that a slower tier restored into `blocks` (group
+        id -> block, one per group the frontier was published with). False if
+        the key is indexed already."""
+        if key in self.entries:
+            return False
+        for group_id, block in blocks.items():
+            self.pool.cache_block_under_key(
+                block, make_block_hash_with_group_id(key, group_id), num_tokens
+            )
+        self.entries[key] = _Frontier(key, anchor, num_tokens, suffix, dict(blocks))
+        by_length = self._index.setdefault(anchor, {}).setdefault(num_tokens, {})
+        by_length.setdefault(suffix, []).append(key)
+        return True
+
     def _frontier_blocks(
         self, request: "Request", num_tokens: int, exact: ExactState | None
     ) -> tuple[dict[int, KVCacheBlock], StateGather | None] | None:

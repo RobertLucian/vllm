@@ -86,8 +86,10 @@ class SimpleCPUOffloadWorker:
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
         self._pending_store_event_indices: set[int] = set()
-        # Completed store events to report via build_connector_worker_meta
+        # Completed store events, and load events no request waits for, to
+        # report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+        self._completed_load_events: dict[int, int] = {}
 
     def register_kv_caches(
         self,
@@ -367,6 +369,8 @@ class SimpleCPUOffloadWorker:
                 )
                 if req_ids:
                     finished_recving.update(req_ids)
+                else:
+                    self._completed_load_events[j] = 1
 
         if self._pending_store_event_indices:
             store_wm = self._poll_stream_events(is_store=True)
@@ -377,13 +381,16 @@ class SimpleCPUOffloadWorker:
         return None, finished_recving or None
 
     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:
-        """Return completed store events since the last call."""
-        if not self._completed_store_events:
+        """Return completed store events, and completed load events no request
+        waits for, since the last call."""
+        if not self._completed_store_events and not self._completed_load_events:
             return None
         meta = SimpleCPUOffloadWorkerMetadata(
             completed_store_events=self._completed_store_events,
+            completed_load_events=self._completed_load_events,
         )
         self._completed_store_events = {}
+        self._completed_load_events = {}
         return meta
 
     def handle_preemptions(

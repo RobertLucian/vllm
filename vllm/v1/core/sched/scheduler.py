@@ -1700,6 +1700,10 @@ class Scheduler(SchedulerInterface):
                         if did_prefix_cache_lookup
                         else request.num_computed_tokens,
                     )
+                # A connector that measures resumes (TieredCPUOffloadConnector).
+                observe_admission = getattr(self.connector, "observe_admission", None)
+                if observe_admission is not None and did_prefix_cache_lookup:
+                    observe_admission(request, num_computed_tokens)
 
                 if load_kv_async:
                     # If loading async, allocate memory and put request

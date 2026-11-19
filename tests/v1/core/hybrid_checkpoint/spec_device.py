@@ -453,12 +453,17 @@ class Engine:
         if not isinstance(transfers, SimpleCPUOffloadMetadata):
             return None
         stores = {transfers.store_event: 1} if transfers.store_event >= 0 else {}
+        waiting = transfers.load_event_to_reqs.get(transfers.load_event, ())
+        # A load no request waits for (a restore into the prefix cache).
+        loads = (
+            {transfers.load_event: 1}
+            if transfers.load_event >= 0 and not waiting
+            else {}
+        )
         return KVConnectorOutput(
-            finished_recving=set(
-                transfers.load_event_to_reqs.get(transfers.load_event, ())
-            ),
+            finished_recving=set(waiting),
             kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
-                completed_store_events=stores
+                completed_store_events=stores, completed_load_events=loads
             ),
         )
 

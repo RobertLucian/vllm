@@ -438,9 +438,14 @@ class SimpleCPUOffloadScheduler:
         return self._holding
 
     def needs_spill(self, block: "KVCacheBlock") -> bool:
-        """SpillGuard: whether the free cached GPU `block` is one a CPU lookup
-        could restore and the CPU pool does not hold yet. A page no GPU state
-        needs any more still counts: it is the prefix of states the CPU pool
+        """SpillGuard: whether evicting the free cached GPU `block` now would
+        lose what a CPU lookup could restore."""
+        return self._uncopied(block)
+
+    def _uncopied(self, block: "KVCacheBlock") -> bool:
+        """Whether the free cached GPU `block` is one a CPU lookup could
+        restore and the CPU pool does not hold yet. A page no GPU state needs
+        any more still counts: it is the prefix of states the CPU pool
         holds."""
         if (
             block.block_hash is None
@@ -846,8 +851,11 @@ class SimpleCPUOffloadScheduler:
                 or not self.needs_spill(node)
             ):
                 continue
-            gpu_ids.append(node.block_id)
-            chosen.add(node.block_id)
+            # A block the CPU pool holds may still be held back for its
+            # siblings (a unit that leaves the GPU whole).
+            if self._uncopied(node):
+                gpu_ids.append(node.block_id)
+                chosen.add(node.block_id)
             for page in self._boundary_siblings(node):
                 if page.block_id in chosen:
                     continue

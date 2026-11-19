@@ -39,21 +39,29 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
 
 @dataclass
 class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker -> Scheduler metadata for completed store events.
+    """Worker -> Scheduler metadata for completed store events, and for
+    completed load events that no request waits for (a tiered connector's
+    restores into the GPU prefix cache).
 
-    Each worker reports {event_idx: 1} for newly completed stores.
+    Each worker reports {event_idx: 1} for newly completed events.
     `aggregate()` sums counts across workers within a step.
     The scheduler-side manager accumulates across steps and processes
-    a store completion only when count reaches `world_size`.
+    a completion only when count reaches `world_size`.
     """
 
     completed_store_events: dict[int, int]
+    completed_load_events: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
     ) -> "KVConnectorWorkerMetadata":
         assert isinstance(other, SimpleCPUOffloadWorkerMetadata)
-        merged = dict(self.completed_store_events)
+        stores = dict(self.completed_store_events)
         for k, v in other.completed_store_events.items():
-            merged[k] = merged.get(k, 0) + v
-        return SimpleCPUOffloadWorkerMetadata(completed_store_events=merged)
+            stores[k] = stores.get(k, 0) + v
+        loads = dict(self.completed_load_events)
+        for k, v in other.completed_load_events.items():
+            loads[k] = loads.get(k, 0) + v
+        return SimpleCPUOffloadWorkerMetadata(
+            completed_store_events=stores, completed_load_events=loads
+        )

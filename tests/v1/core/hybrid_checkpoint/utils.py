@@ -89,6 +89,24 @@ def simple_cpu_connector(num_cpu_blocks: int, lazy: bool = False) -> KVTransferC
     )
 
 
+def tiered_cpu_connector(
+    num_cpu_blocks: int, ram_eviction: str = "lru"
+) -> KVTransferConfig:
+    """The tiered connector: a RAM pool of `num_cpu_blocks` that extends VRAM,
+    restoring into the GPU prefix cache before each lookup."""
+    return KVTransferConfig(
+        kv_connector="TieredCPUOffloadConnector",
+        kv_role="kv_both",
+        kv_load_failure_policy="recompute",
+        kv_connector_extra_config={
+            "num_cpu_blocks": num_cpu_blocks,
+            "cpu_bytes_to_use": 1 << 40,
+            "ram_eviction": ram_eviction,
+            "prefill_cost_coefficients": [1.862e-5, 3.33e-6],
+        },
+    )
+
+
 def make_hybrid_scheduler(
     block_size: int = 64,
     num_blocks: int = 200,
