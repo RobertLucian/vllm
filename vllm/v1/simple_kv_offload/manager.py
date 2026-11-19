@@ -297,6 +297,13 @@ class SimpleCPUOffloadScheduler:
         self._spill_shortfall = 0
         self._held_since: float | None = None
         self._holding = True
+        # Boundary pages (`_boundary_page`) copied without a reference, so
+        # they keep their place in the eviction order: GPU block id -> its key
+        # when the copy started. The guard holds them back like any uncopied
+        # block; a page that changed hands mid-copy backs no CPU key. Once
+        # copied, a page still leaves only in eviction order (`keeps_order`).
+        self._unpinned_stores: dict[int, BlockHashWithGroupId] = {}
+        self._early_pages: dict[int, BlockHashWithGroupId] = {}
         self.lazy_spill_stats = LazySpillStats()
         self._lazy_spill_snapshot = LazySpillStats()
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
@@ -440,6 +447,15 @@ class SimpleCPUOffloadScheduler:
         cached = self.cpu_block_pool.cached_block_hash_to_block
         return cached.get_one_block(block.block_hash) is None
 
+    def keeps_order(self, block: "KVCacheBlock") -> bool:
+        """SpillGuard: whether `block` is a boundary page copied ahead of its
+        turn. Leaving ahead of the uncopied pages before it would split its
+        session around a page neither tier serves from."""
+        return (
+            block.block_hash is not None
+            and self._early_pages.get(block.block_id) == block.block_hash
+        )
+
     def on_allocation_held(self, num_blocks: int) -> None:
         """SpillGuard: the next walk also stores `num_blocks` blocks."""
         self._spill_shortfall += num_blocks
@@ -467,6 +483,7 @@ class SimpleCPUOffloadScheduler:
         hit on the GPU since (lazy mode never refreshes the CPU on GPU hits)
         would be the next the CPU evicts, losing a session from both tiers."""
         assert block.block_hash is not None
+        self._early_pages.pop(block.block_id, None)
         cpu_block = self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
             block.block_hash
         )
@@ -796,32 +813,80 @@ class SimpleCPUOffloadScheduler:
             else gpu_pool.free_block_queue.iter_blocks_after(None)
         )
         gpu_ids: list[int] = []
+        pages: list[int] = []
+        chosen: set[int] = set()
         for covered, node in enumerate(order):
-            if len(gpu_ids) >= num_cpu_free or (
-                covered >= self._target_free and len(gpu_ids) >= shortfall
+            if len(chosen) >= num_cpu_free or (
+                covered >= self._target_free and len(chosen) >= shortfall
             ):
                 break
-            if self.needs_spill(node):
-                gpu_ids.append(node.block_id)
+            if (
+                node.block_id in chosen
+                or node.block_id in self._unpinned_stores
+                or not self.needs_spill(node)
+            ):
+                continue
+            gpu_ids.append(node.block_id)
+            chosen.add(node.block_id)
+            page = self._boundary_page(node)
+            if page is not None and page.block_id not in chosen:
+                assert page.block_hash is not None
+                pages.append(page.block_id)
+                chosen.add(page.block_id)
+                self._unpinned_stores[page.block_id] = page.block_hash
 
         # Batch-allocate CPU blocks.
-        if gpu_ids:
-            self.lazy_spill_stats.stored_blocks += len(gpu_ids)
+        if chosen:
+            self.lazy_spill_stats.stored_blocks += len(chosen)
             self.lazy_spill_stats.cpu_evicted_blocks += sum(
                 1
                 for block in itertools.islice(
-                    cpu_pool.free_block_queue.iter_blocks_after(None), len(gpu_ids)
+                    cpu_pool.free_block_queue.iter_blocks_after(None), len(chosen)
                 )
                 if block.block_hash is not None
             )
-            cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            cpu_blocks = cpu_pool.get_new_blocks(len(chosen))
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             # Touch GPU blocks to prevent eviction during async copy.
             gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
         else:
             cpu_ids = []
 
-        return gpu_ids, cpu_ids, [], None
+        return gpu_ids + pages, cpu_ids, [], None
+
+    def _boundary_page(self, block: "KVCacheBlock") -> "KVCacheBlock | None":
+        """The full-attention page ending where the state `block` holds sits,
+        when the CPU pool does not hold it yet. A state's full-attention pages
+        can stay on the GPU after the state leaves it; the scheduler then
+        resumes one block before the state
+        (`supports_divergent_local_hybrid_hits`), which a CPU lookup serves
+        only if it holds that block's page with the state. The page may still
+        be in use (a running request freed the state as it moved on): a
+        cached full-attention page is full, and no longer written."""
+        assert block.block_hash is not None and self._gpu_block_pool is not None
+        group_id = get_group_id(block.block_hash)
+        spec = self.cpu_kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+        if (
+            not isinstance(spec, MambaSpec)
+            or self.group_block_sizes[group_id] != self.fa_block_size
+        ):
+            return None
+        page = self._gpu_block_pool.cached_block_hash_to_block.get_one_block(
+            make_block_hash_with_group_id(
+                get_block_hash(block.block_hash), self.fa_gidx
+            )
+        )
+        if (
+            page is None
+            or page.block_id in self._unpinned_stores
+            or not self._restorable(page)
+            or self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                page.block_hash
+            )
+            is not None
+        ):
+            return None
+        return page
 
     def _restorable(self, block: "KVCacheBlock") -> bool:
         """Whether a lazy CPU lookup can serve this cached block: it walks
@@ -1301,9 +1366,18 @@ class SimpleCPUOffloadScheduler:
 
         assert self._gpu_block_pool is not None
         stored: list[BlockHashWithGroupId] = []
+        pinned: list[int] = []
         for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
             gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
             primary_hash = gpu_block.block_hash
+            unpinned_key = self._unpinned_stores.pop(gpu_block_id, None)
+            if unpinned_key is None:
+                pinned.append(gpu_block_id)
+            elif primary_hash != unpinned_key:
+                # Evicted (and maybe reused) while copied without a reference.
+                continue
+            else:
+                self._early_pages[gpu_block_id] = unpinned_key
             if primary_hash is None:
                 # Hybrid state checkpoints drop a unit's keys from all of its
                 # blocks when one of them is evicted, also from a block being
@@ -1402,7 +1476,7 @@ class SimpleCPUOffloadScheduler:
         # Lazy stores come from the GPU eviction end; return them there.
         self.cpu_block_pool.free_blocks(cpu_blocks)
         self._gpu_block_pool.free_blocks(
-            (self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids),
+            (self._gpu_block_pool.blocks[bid] for bid in pinned),
             evict_first=self._lazy_mode,
         )
 
@@ -1412,7 +1486,9 @@ class SimpleCPUOffloadScheduler:
         self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
-            self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
+            self._gpu_block_pool.blocks[bid]
+            for bid in transfer.gpu_block_ids
+            if self._unpinned_stores.pop(bid, None) is None
         )
 
     def has_pending_stores(self) -> bool:

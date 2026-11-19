@@ -84,6 +84,13 @@ class SpillGuard(Protocol):
         """Whether evicting the free cached `block` now would lose it."""
         ...
 
+    def keeps_order(self, block: KVCacheBlock) -> bool:
+        """Whether the free cached `block`, which needs no spill, still leaves
+        only in eviction order, not ahead of blocks held back: a page copied
+        ahead of its turn, which the tier restores only with the pages after
+        it."""
+        ...
+
     def on_allocation_held(self, num_blocks: int) -> None:
         """An allocation waits for `num_blocks` more blocks to be spilled."""
         ...
@@ -851,7 +858,7 @@ class BlockPool:
         for block in queue.iter_blocks_after(None):
             if len(safe) == num_blocks:
                 break
-            if guard.needs_spill(block):
+            if guard.needs_spill(block) or (held and guard.keeps_order(block)):
                 held = True
             else:
                 safe.append(block)
@@ -861,10 +868,11 @@ class BlockPool:
             queue.remove(block)
         queue.prepend_n(safe)
         if len(safe) < num_blocks:
-            lost = itertools.islice(
+            taken = itertools.islice(
                 queue.iter_blocks_after(None), len(safe), num_blocks
             )
-            guard.on_unspilled_eviction(list(lost))
+            if lost := [block for block in taken if guard.needs_spill(block)]:
+                guard.on_unspilled_eviction(lost)
 
     def num_spill_safe_free_blocks(
         self, limit: int, exclude: Iterable[KVCacheBlock] = ()
@@ -876,10 +884,15 @@ class BlockPool:
             return min(limit, self.get_num_free_blocks())
         skip = {block.block_id for block in exclude}
         count = 0
+        held = False
         for block in self.free_block_queue.iter_blocks_after(None):
             if count >= limit:
                 break
-            if block.block_id not in skip and not guard.needs_spill(block):
+            if block.block_id in skip:
+                continue
+            if guard.needs_spill(block) or (held and guard.keeps_order(block)):
+                held = True
+            else:
                 count += 1
         return count
 

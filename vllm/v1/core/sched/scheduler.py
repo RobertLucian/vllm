@@ -1216,6 +1216,30 @@ class Scheduler(SchedulerInterface):
                         )
                         if request.skip_reading_external_kv:
                             ext_tokens, load_kv_async = 0, False
+                        elif (
+                            hit_diverged
+                            and ext_tokens == 0
+                            and block_aligned_local >= self.block_size
+                        ):
+                            # The full-attention pages reach the hit's end
+                            # locally, but the Mamba state there is only in the
+                            # connector's tier: resume one block earlier, so the
+                            # connector loads that block's pages with the state.
+                            stepped_back = block_aligned_local - self.block_size
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, stepped_back
+                                )
+                            )
+                            if ext_tokens:
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.truncate_computed_blocks(
+                                        new_computed_blocks, stepped_back
+                                    )
+                                )
+                                num_new_local_computed_tokens = stepped_back
+                                block_aligned_local = stepped_back
+                                partial_tail = 0
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because

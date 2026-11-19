@@ -363,6 +363,65 @@ def test_the_lazy_cpu_tier_evicts_no_block_it_could_restore(
     )
 
 
+@pytest.mark.parametrize("eviction", ["lru", "gdsf-reload"])
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_concurrent_resumes_split_across_the_lazy_cpu_tier(
+    async_scheduling: bool, eviction: str
+):
+    """Six sessions overflow the GPU pool and then resume at once. The loads
+    of the first evict the states of a session whose full-attention pages all
+    stay on the GPU; it resumes one block before its state, the CPU pool
+    supplying that block's pages with the state. Every resume reaches the
+    last block boundary it reaches with an eager CPU tier (the CPU pool does
+    not restore frontiers)."""
+
+    def resume_all(lazy: bool) -> list[int]:
+        engine = make_engine(
+            async_scheduling=async_scheduling,
+            num_blocks=90,
+            ring=0,
+            kv_transfer_config=simple_cpu_connector(400, lazy=lazy),
+            eviction=eviction,
+            max_num_batched_tokens=256,
+        )
+        # Stale sessions fill the GPU pool and the CPU pool's oldest blocks.
+        for s in range(8):
+            engine.add(f"a{s}", prompt(100 + s, 1300), 17)
+            engine.run(f"a{s}")
+        for s in range(8):
+            tokens = list(engine.requests[f"a{s}"].all_token_ids) + prompt(200 + s, 40)
+            engine.add(f"a{s}r", tokens, 17)
+            engine.run(f"a{s}r")
+        tokens = {}
+        for pair in range(3):
+            built = []
+            for s in (2 * pair, 2 * pair + 1):
+                engine.add(f"b{s}", prompt(300 + s, 1100), 17 if s % 2 else 40)
+                built.append(f"b{s}")
+            engine.run(*built)
+            for s in (2 * pair, 2 * pair + 1):
+                tokens[s] = list(engine.requests[f"b{s}"].all_token_ids) + prompt(
+                    400 + s, 40
+                )
+        resumed = []
+        for s in (3, 1, 4, 0, 5, 2):
+            engine.add(f"b{s}r", tokens[s], 17)
+            resumed.append(f"b{s}r")
+        engine.run(*resumed)
+        assert_clean(engine)
+        guard = engine.scheduler.kv_cache_manager.block_pool.spill_guard
+        if lazy:
+            assert guard is not None
+            assert guard.lazy_spill_stats.unspilled_evicted_blocks == 0
+        return [engine.admissions[f"b{s}r"][-1] for s in range(6)]
+
+    lazy, eager = resume_all(lazy=True), resume_all(lazy=False)
+    assert all(
+        lazy_hit >= eager_hit - eager_hit % BLOCK
+        for lazy_hit, eager_hit in zip(lazy, eager)
+    ), (lazy, eager)
+
+
 @pytest.mark.parametrize("fault", ["skip_gather", "no_conv_shift"])
 def test_device_faults_are_detected(fault: Fault):
     """A gather skipped or applied without the window shift leaves a published
