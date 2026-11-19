@@ -11,7 +11,8 @@ resume (the last boundaries before a finished request's prompt end and end,
 and points several continuations share) and every `ram_state_spacing_blocks`
 blocks: a state takes a page of RAM per Mamba group, as much as the attention
 pages of a whole block, and one between those saves at most the tokens to the
-next.
+next. With `prune_gpu_states` the GPU releases those others on a finished
+request's chain too, instead of holding them until its LRU order reaches them.
 
 RAM -> VRAM ("promote, then hit"): before a waiting request's next lookup,
 the connector finds the deepest point the request can resume at with blocks
@@ -229,6 +230,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         prefill_cost_coefficients: tuple[float, ...] | None = None,
         frequency_half_life_s: float = 600.0,
         ram_state_spacing_blocks: int = 8,
+        prune_gpu_states: bool = True,
         **kwargs: Any,
     ) -> None:
         kwargs["lazy_offload"] = True
@@ -254,6 +256,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._state_spacing = ram_state_spacing_blocks * self.block_size
         # Block-boundary states RAM keeps besides the spaced ones.
         self._floors: OrderedDict[BlockHash, None] = OrderedDict()
+        # The GPU keeps the same block-boundary states of a finished request's
+        # chain; the others go when it finishes (`_prune_gpu_states`).
+        self.prune_gpu_states = prune_gpu_states
+        self.num_gpu_states_pruned = 0
+        self._gpu_states_pruned_snapshot = 0
         self._kv_cache_manager: KVCacheManager | None = None
         # Exact-end states in RAM, and the ends finished requests reached:
         # their ends and their prompts' (the session each belongs to).
@@ -874,6 +881,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._admitted_from_ram.discard(request_id)
         parent = self._resumed_from.pop(request_id, None)
         self._keep_floors(request)
+        self._prune_gpu_states(request)
         key = self._remember_end(request)
         if key is not None and self.ram_policy is not None:
             self.ram_policy.add_session(
@@ -895,6 +903,49 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 self._floors.move_to_end(key)
         while len(self._floors) > _MAX_SEEN_ENDS:
             self._floors.popitem(last=False)
+
+    def _prune_gpu_states(self, request: "Request") -> None:
+        """Release the block-boundary states on a finished request's chain
+        that RAM would not keep either (`_thinned`): its next turn resumes at
+        its end, and each takes a block per Mamba group until the GPU's LRU
+        order reaches it, which ranks them by age across sessions, not by use.
+        Kept: spaced states, floors, branch points, states in use or where a
+        waiting request resumes, and blocks that carry another key."""
+        checkpoints = self._checkpoints
+        pool = self._gpu_block_pool
+        if not self.prune_gpu_states or checkpoints is None or pool is None:
+            return
+        graph = checkpoints.graph
+        hashes, per_block = request.block_hashes, self.units_per_block
+        waiting = set(checkpoints._resume.values())
+        gpu = pool.cached_block_hash_to_block
+        for i in range(1, _end(request) // self.block_size + 1):
+            if i * per_block > len(hashes):
+                break
+            if not (i * self.block_size) % self._state_spacing:
+                continue
+            key = hashes[i * per_block - 1]
+            unit = graph.units.get(key)
+            if (
+                unit is None
+                or unit.frontier
+                or unit.is_branch_point
+                or key in self._floors
+                or checkpoints.held(key)
+                or checkpoints._needed(key, waiting)
+            ):
+                continue
+            blocks = [
+                block
+                for group_id in self.mamba_gids
+                for block in gpu.get_all_blocks(
+                    make_block_hash_with_group_id(key, group_id)
+                )
+            ]
+            if any(pool.cached_block_hashes_by_block.get(b.block_id) for b in blocks):
+                continue
+            checkpoints.release(key)
+            self.num_gpu_states_pruned += sum(b.block_hash is None for b in blocks)
 
     def _session_units(self, request: "Request") -> list[tuple[int, BlockHash]]:
         """The hash units a finished request's session owns: its block
@@ -1095,6 +1146,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             dict(resumes.counts), dict(resumes.tokens), dict(resumes.buckets)
         )
         stats.set_gauge(TieredMetricName.RAM_FRONTIERS, len(self.ram_frontiers.entries))
+        pruned = self.num_gpu_states_pruned - self._gpu_states_pruned_snapshot
+        if pruned > 0:
+            stats.increase_counter(TieredMetricName.GPU_STATES_PRUNED, pruned, ())
+        self._gpu_states_pruned_snapshot = self.num_gpu_states_pruned
         if self.ram_policy is not None:
             current, previous = self.ram_policy.stats, self._ram_evictions_snapshot
             for kind, field_name in (

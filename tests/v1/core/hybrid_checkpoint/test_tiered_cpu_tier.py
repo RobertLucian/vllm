@@ -288,3 +288,65 @@ def test_resumes_are_measured_by_tier():
     assert stats.counts.get("ram", 0) > 0, stats
     assert stats.tokens.get("ram", 0) == 0, stats
     assert stats.buckets["ram", "0"] == stats.counts["ram"]
+
+
+def _boundary_states(engine: Engine, request_id: str) -> list[int]:
+    """The block boundaries of `request_id`'s chain whose state the GPU holds
+    in every Mamba group."""
+    scheduler = engine.scheduler
+    request = engine.requests[request_id]
+    tier = manager(engine) if scheduler.connector is not None else None
+    checkpoints = scheduler.kv_cache_manager.checkpoints
+    assert checkpoints is not None
+    per_block = BLOCK // scheduler.hash_block_size
+    held = []
+    for i in range(1, len(request.block_hashes) // per_block + 1):
+        key = request.block_hashes[i * per_block - 1]
+        if checkpoints.complete(key):
+            held.append(i)
+    assert tier is None or tier.num_gpu_states_pruned >= 0
+    return held
+
+
+def test_a_finished_session_keeps_only_its_resume_states_on_the_gpu():
+    """The GPU holds a state at the block boundaries its prefill chunks ended
+    at. Once the request finishes, it keeps those RAM would keep (every 8th
+    block, the last boundaries before its prompt end and its end) and
+    releases the rest; a GPU without the tier keeps them all. The next turn
+    still resumes at the exact end."""
+    engine = make_engine(False, BLOCK, num_blocks=400)
+    roomy = roomy_engine(False, BLOCK)
+    tokens = prompt(11, 1500)
+    for e in (engine, roomy):
+        e.add("p0", tokens, 40)
+        e.run("p0")
+    prompt_floor, end_floor = 1500 // BLOCK, (1500 + 39) // BLOCK
+    kept = {8, 16, prompt_floor, end_floor}
+    assert _boundary_states(engine, "p0") == sorted(kept)
+    assert set(_boundary_states(roomy, "p0")) - kept
+    assert manager(engine).num_gpu_states_pruned > 0
+    nxt = list(engine.requests["p0"].all_token_ids) + prompt(12, 40)
+    for e in (engine, roomy):
+        e.add("p1", nxt, 17)
+        e.run("p1")
+    assert engine.admissions["p1"][0] == roomy.admissions["p1"][0]
+    assert_nothing_lost(engine)
+
+
+def test_a_turn_that_diverges_mid_session_resumes_at_the_nearest_kept_state():
+    """A turn that parts from the session 1,300 tokens in (an edited earlier
+    message) resumes at the last kept state before that, 16 blocks in, where
+    a GPU that keeps every state resumes at the last one it cached before."""
+    engine = make_engine(False, BLOCK, num_blocks=400)
+    roomy = roomy_engine(False, BLOCK)
+    tokens = prompt(13, 1500)
+    for e in (engine, roomy):
+        e.add("d0", tokens, 40)
+        e.run("d0")
+    before = max(b for b in _boundary_states(roomy, "d0") if b * BLOCK <= 1300)
+    for e in (engine, roomy):
+        e.add("d1", tokens[:1300] + prompt(14, 60), 17)
+        e.run("d1")
+    assert roomy.admissions["d1"][0] == before * BLOCK > 16 * BLOCK
+    assert engine.admissions["d1"][0] == 16 * BLOCK
+    assert_nothing_lost(engine)

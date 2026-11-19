@@ -64,6 +64,7 @@ class TieredMetricName:
     RESUMES_BY_RECOMPUTE = "vllm:tiered_kv_resumes_by_recompute_total"
     RAM_FRONTIERS = "vllm:tiered_kv_ram_frontiers"
     RAM_EVICTIONS = "vllm:tiered_kv_ram_evictions_total"
+    GPU_STATES_PRUNED = "vllm:tiered_kv_gpu_states_pruned_total"
 
 
 class _MetricType:
@@ -380,6 +381,15 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                 TieredMetricName.RAM_FRONTIERS,
                 _MetricType.GAUGE,
                 "Exact-end states the RAM tier holds whole.",
+                [],
+            ),
+            (
+                TieredMetricName.GPU_STATES_PRUNED,
+                _MetricType.COUNTER,
+                (
+                    "Blocks of block-boundary states the GPU released when a "
+                    "request finished: states between its resume points."
+                ),
                 [],
             ),
         ]
