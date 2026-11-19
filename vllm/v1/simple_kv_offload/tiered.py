@@ -254,6 +254,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._seen_ends = _EndIndex()
         self._seen_order: OrderedDict[BlockHash, None] = OrderedDict()
         self._session_of: dict[BlockHash, BlockHash] = {}
+        # Each end's tokens past its last hash unit.
+        self._seen_tails: dict[BlockHash, tuple[int, ...]] = {}
         # Restores: by request, queued for the next load event, by event.
         self._restores: dict[str, _Restore] = {}
         self._unsent: list[_Restore] = []
@@ -982,16 +984,22 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         start = max(h * unit, num_tokens - _SUFFIX)
         suffix = tuple(request.all_token_ids[start:num_tokens])
         self._seen_ends.add(_Unit(key, anchor, num_tokens, suffix, ()))
+        self._seen_tails[key] = tuple(request.all_token_ids[h * unit : num_tokens])
         self._seen_order[key] = None
         while len(self._seen_order) > _MAX_SEEN_ENDS:
             oldest, _ = self._seen_order.popitem(last=False)
             self._seen_ends.remove(oldest)
+            self._seen_tails.pop(oldest, None)
             self._session_of.pop(oldest, None)
         return key
 
     def _seen_end(self, request: "Request") -> tuple[int, BlockHash | None]:
-        """The longest end (or prompt end) a finished request reached that
-        `request` extends, and its session's key."""
+        """How far `request` shares an end (or prompt end) a finished request
+        reached, and that end's session's key: the end it extends, or else
+        the deepest end whose hash unit it shares, up to where they part. A
+        reasoning model's next turn parts from the previous prompt a few
+        tokens before its end: that prompt ended with the generation prefix,
+        which the next turn renders without."""
         frontiers = None if self._checkpoints is None else self._checkpoints.frontiers
         if frontiers is None or not self._seen_ends.entries:
             return 0, None
@@ -1012,6 +1020,22 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 key = frontier_key(frontiers.hash_fn, request, num_tokens, unit)
                 if key in keys:
                     return num_tokens, self._session_of.get(key, key)
+            # No end here that it extends: the one it shares most of.
+            best, best_key = -1, None
+            ours = tokens[h * unit : h * unit + unit]
+            for by_suffix in lengths.values():
+                for keys in by_suffix.values():
+                    for key in keys:
+                        tail = self._seen_tails.get(key, ())
+                        shared = 0
+                        for mine, theirs in zip(ours, tail):
+                            if mine != theirs:
+                                break
+                            shared += 1
+                        if shared > best:
+                            best, best_key = shared, key
+            if best_key is not None:
+                return h * unit + best, self._session_of.get(best_key, best_key)
         return 0, None
 
     def observe_admission(self, request: "Request", num_computed_tokens: int) -> None:

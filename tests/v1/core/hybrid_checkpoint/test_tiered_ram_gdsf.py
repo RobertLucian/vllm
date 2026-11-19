@@ -67,6 +67,27 @@ def test_frequency_follows_a_session_into_ram_and_back():
     assert_nothing_lost(engine)
 
 
+def test_a_turn_that_parts_from_the_last_prompt_is_its_sessions_resume():
+    """A reasoning model's next turn drops the reasoning, and its history
+    renders the last prompt's generation prefix differently: it parts from
+    that prompt a few tokens before its end. It still counts as that
+    session's resume, recomputing from the prompt's tail state only, and
+    the session's next turn inherits the count."""
+    engine = make_engine(False, BLOCK // 4, ram_eviction="gdsf")
+    tokens = prompt(3, 1000)
+    engine.add("t0", tokens, 40)
+    engine.run("t0")
+    engine.add("t1", tokens[:-3] + prompt(4, 60), 17)
+    engine.run("t1")
+    stats = manager(engine).resume_stats
+    assert stats.counts == {"gpu": 1}, stats
+    assert stats.tokens["gpu"] < BLOCK // 4, stats
+    policy = gdsf(engine)
+    assert policy.sessions[next(reversed(policy.sessions))].freq == pytest.approx(
+        1.0, rel=0.05
+    )
+
+
 def hot_and_cold(engine: Engine, seed: int, *, rounds: int = 6) -> int:
     """Nine sessions, three of them resumed every round and the rest every
     third, long and short contexts. Returns the tokens their resumes
