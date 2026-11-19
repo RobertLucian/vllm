@@ -232,7 +232,27 @@ class SchedulerConfig:
 
     A deferred step carries no prefill at all, including chunks of an
     already-admitted prompt, so a long prompt can take up to N times as many
-    steps to finish prefilling."""
+    steps to finish prefilling. With `low_priority_prefill_tokens_per_step`,
+    requests of priority 0 or less still prefill on deferred steps."""
+
+    reserved_priority_slots: int = Field(default=0, ge=0)
+    """Under the "priority" policy, running slots (of `max_num_active_seqs`,
+    or `max_num_seqs`) only requests of priority 0 or less may take: other
+    requests are admitted while more than this many slots are free. 0 (the
+    default) reserves none."""
+
+    low_priority_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Under the "priority" policy, while a request of priority 0 or less
+    waits or prefills: the prefill tokens a step gives all other requests
+    together (their decodes are not capped), and those urgent requests also
+    prefill on the steps `prefill_schedule_interval` defers. Running requests
+    are scheduled in priority order under that policy either way. 0 (the
+    default) caps nothing."""
+
+    priority_long_prefill_token_threshold: int = Field(default=0, ge=0)
+    """Under the "priority" policy, `long_prefill_token_threshold` for
+    requests of priority 0 or less. 0 (the default) applies
+    `long_prefill_token_threshold` to them too."""
 
     cache_aware_admission_window: int = Field(default=0, ge=0)
     """Look-ahead window for cache-aware admission. Within the first N waiting
@@ -339,6 +359,9 @@ class SchedulerConfig:
             "scheduler_reserve_full_isl",
             "watermark",
             "prefill_schedule_interval",
+            "reserved_priority_slots",
+            "low_priority_prefill_tokens_per_step",
+            "priority_long_prefill_token_threshold",
             "async_scheduling",
             "stream_interval",
         }
@@ -400,6 +423,13 @@ class SchedulerConfig:
             raise ValueError(
                 f"max_num_active_seqs ({self.max_num_active_seqs}) cannot be "
                 f"greater than max_num_seqs ({self.max_num_seqs})."
+            )
+
+        num_slots = self.max_num_active_seqs or self.max_num_seqs
+        if self.reserved_priority_slots >= num_slots:
+            raise ValueError(
+                f"reserved_priority_slots ({self.reserved_priority_slots}) must "
+                f"leave other requests a running slot (of {num_slots})."
             )
 
         if self.max_num_batched_tokens > self.max_num_seqs * max_model_len:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import bisect
 import itertools
 import os
 import time
@@ -236,6 +237,24 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Requests of priority 0 or less under the priority policy (chats
+        # beside agents): the running slots kept for them, the cap on the
+        # others' prefill tokens while they wait or prefill, and their own
+        # long-prefill threshold.
+        by_priority = self.policy == SchedulingPolicy.PRIORITY
+        self.reserved_priority_slots = (
+            self.scheduler_config.reserved_priority_slots if by_priority else 0
+        )
+        self.low_priority_prefill_tokens = (
+            self.scheduler_config.low_priority_prefill_tokens_per_step
+            if by_priority
+            else 0
+        )
+        self.urgent_long_prefill_threshold = (
+            self.scheduler_config.priority_long_prefill_token_threshold
+            if by_priority
+            else 0
+        )
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # Waiting requests that hold KV blocks are always drained before
@@ -844,6 +863,18 @@ class Scheduler(SchedulerInterface):
             long_prefill_token_threshold = max(
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
+        urgent_long_prefill_threshold = (
+            max(self.urgent_long_prefill_threshold, long_prefill_token_threshold)
+            if long_prefill_token_threshold > 0
+            else 0
+        )
+        # While a request of priority 0 or less waits or prefills, the others
+        # share this many prefill tokens, and its own prefill is not deferred.
+        low_prefill_left: int | None = (
+            self.low_priority_prefill_tokens
+            if self.low_priority_prefill_tokens and self._urgent_demand()
+            else None
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -878,7 +909,12 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if defer_prefills and request.is_prefill_chunk:
+            urgent = request.priority <= 0 and self.policy == SchedulingPolicy.PRIORITY
+            if (
+                defer_prefills
+                and request.is_prefill_chunk
+                and not (urgent and low_prefill_left is not None)
+            ):
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
                 req_index += 1
@@ -900,8 +936,13 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = long_prefill_token_threshold
+            threshold = (
+                urgent_long_prefill_threshold
+                if urgent
+                else long_prefill_token_threshold
+            )
+            if 0 < threshold < num_new_tokens:
+                num_new_tokens = threshold
             if (
                 self.mamba_checkpoints is not None
                 and self.mamba_checkpoints.speculative is None
@@ -914,6 +955,12 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            capped = (
+                low_prefill_left is not None and not urgent and request.is_prefill_chunk
+            )
+            if capped:
+                assert low_prefill_left is not None
+                num_new_tokens = min(num_new_tokens, low_prefill_left)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1079,6 +1126,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if capped:
+                assert low_prefill_left is not None
+                low_prefill_left -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1195,6 +1245,19 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                urgent = (
+                    request.priority <= 0 and self.policy == SchedulingPolicy.PRIORITY
+                )
+
+                if (
+                    not loads_only
+                    and not urgent
+                    and num_running
+                    >= self.max_num_active_reqs - self.reserved_priority_slots
+                ):
+                    # The running slots left are kept for urgent requests.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1458,7 +1521,11 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                elif (
+                    defer_prefills
+                    and num_computed_tokens < request.num_tokens - 1
+                    and not (urgent and low_prefill_left is not None)
+                ):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
@@ -1500,8 +1567,13 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
-                        num_new_tokens = long_prefill_token_threshold
+                    threshold = (
+                        urgent_long_prefill_threshold
+                        if urgent
+                        else long_prefill_token_threshold
+                    )
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1516,6 +1588,17 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    capped = (
+                        low_prefill_left is not None
+                        and not urgent
+                        and num_computed_tokens < request.num_tokens - 1
+                    )
+                    if capped:
+                        assert low_prefill_left is not None
+                        if not low_prefill_left:
+                            skip_request(request_queue)
+                            continue
+                        num_new_tokens = min(num_new_tokens, low_prefill_left)
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1526,6 +1609,11 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            if capped:
+                                # Its chunk does not fit the cap; an urgent
+                                # request in another queue may still.
+                                skip_request(request_queue)
+                                continue
                             break
                         if (
                             pad_spec_decode
@@ -1735,7 +1823,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
-                self.running.append(request)
+                if self.policy == SchedulingPolicy.PRIORITY:
+                    # Running requests are scheduled in priority order.
+                    bisect.insort(self.running, request)
+                else:
+                    self.running.append(request)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -3194,6 +3286,13 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+    def _urgent_demand(self) -> bool:
+        """A request of priority 0 or less waits or prefills (the waiting
+        queue keeps the most urgent at its head)."""
+        if any(r.priority <= 0 and r.is_prefill_chunk for r in self.running):
+            return True
+        return bool(self.waiting) and self.waiting.peek_request().priority <= 0
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

@@ -720,6 +720,13 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    reserved_priority_slots: int = SchedulerConfig.reserved_priority_slots
+    low_priority_prefill_tokens_per_step: int = (
+        SchedulerConfig.low_priority_prefill_tokens_per_step
+    )
+    priority_long_prefill_token_threshold: int = (
+        SchedulerConfig.priority_long_prefill_token_threshold
+    )
     cache_aware_admission_window: int = SchedulerConfig.cache_aware_admission_window
     cache_aware_admission_threshold: float = (
         SchedulerConfig.cache_aware_admission_threshold
@@ -1869,6 +1876,18 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--reserved-priority-slots",
+            **scheduler_kwargs["reserved_priority_slots"],
+        )
+        scheduler_group.add_argument(
+            "--low-priority-prefill-tokens-per-step",
+            **scheduler_kwargs["low_priority_prefill_tokens_per_step"],
+        )
+        scheduler_group.add_argument(
+            "--priority-long-prefill-token-threshold",
+            **scheduler_kwargs["priority_long_prefill_token_threshold"],
+        )
+        scheduler_group.add_argument(
             "--cache-aware-admission-window",
             **scheduler_kwargs["cache_aware_admission_window"],
         )
@@ -2763,6 +2782,13 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            reserved_priority_slots=self.reserved_priority_slots,
+            low_priority_prefill_tokens_per_step=(
+                self.low_priority_prefill_tokens_per_step
+            ),
+            priority_long_prefill_token_threshold=(
+                self.priority_long_prefill_token_threshold
+            ),
             cache_aware_admission_window=self.cache_aware_admission_window,
             cache_aware_admission_threshold=self.cache_aware_admission_threshold,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
