@@ -93,6 +93,11 @@ class SpillGuard(Protocol):
         was left."""
         ...
 
+    def on_evicted(self, block: KVCacheBlock) -> None:
+        """The cached `block` loses its keys here: a copy the tier holds is now
+        the only one."""
+        ...
+
 
 class BlockHashToBlockMap:
     """Cache of blocks that are used for prefix caching, from block hash to
@@ -919,6 +924,8 @@ class BlockPool:
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
+        if self.spill_guard is not None and block.block_hash is not None:
+            self.spill_guard.on_evicted(block)
 
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:

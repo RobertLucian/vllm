@@ -460,6 +460,20 @@ class SimpleCPUOffloadScheduler:
             "event=unspilled_evicted_blocks)."
         )
 
+    def on_evicted(self, block: "KVCacheBlock") -> None:
+        """SpillGuard: the GPU drops `block`, so its CPU copy is now the only
+        one: it moves to the CPU pool's most recently used end. The CPU's LRU
+        order is otherwise its store order, and a block stored long ago but
+        hit on the GPU since (lazy mode never refreshes the CPU on GPU hits)
+        would be the next the CPU evicts, losing a session from both tiers."""
+        assert block.block_hash is not None
+        cpu_block = self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+            block.block_hash
+        )
+        if cpu_block is not None and cpu_block.ref_cnt == 0:
+            self.cpu_block_pool.touch([cpu_block])
+            self.cpu_block_pool.free_blocks([cpu_block])
+
     def _update_holding(self, num_cpu_free: int) -> None:
         """Hold back uncopied blocks unless allocations have waited for stores
         too long or the CPU pool has no block to store into."""

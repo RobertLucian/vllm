@@ -1468,6 +1468,38 @@ def test_lazy_walk_stores_what_held_allocations_need() -> None:
 
 
 @pytest.mark.cpu_test
+def test_lazy_eviction_makes_the_cpu_copy_the_most_recent() -> None:
+    """Lazy: once the GPU drops a stored block, its CPU copy is the only one
+    and moves to the CPU LRU's most recent end. Kept in store order instead, a
+    block stored long ago and hit on the GPU since would be the CPU's next
+    eviction: the session would be gone from both tiers."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    cpu_pool = sched.cpu_block_pool
+    blocks = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=3), 3)
+    gpu_pool.free_blocks(blocks, evict_first=True)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert sorted(meta.store_gpu_blocks) == sorted(b.block_id for b in blocks)
+    simulate_store_completion(sched, meta.store_event)
+    cached = cpu_pool.cached_block_hash_to_block
+    first = cached.get_one_block(blocks[0].block_hash)
+    assert first is not None
+
+    def cpu_order() -> list[int]:
+        return [
+            b.block_id
+            for b in cpu_pool.free_block_queue.iter_blocks_after(None)
+            if b.block_hash is not None
+        ]
+
+    assert cpu_order()[-1] != first.block_id
+    gpu_pool._maybe_evict_cached_block(blocks[0])
+    assert cpu_order()[-1] == first.block_id
+    assert cached.get_one_block(first.block_hash) is first
+
+
+@pytest.mark.cpu_test
 def test_lazy_guard_lets_held_allocations_go_after_waiting_too_long(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
