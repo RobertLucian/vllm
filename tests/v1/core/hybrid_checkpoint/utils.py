@@ -90,7 +90,7 @@ def simple_cpu_connector(num_cpu_blocks: int, lazy: bool = False) -> KVTransferC
 
 
 def tiered_cpu_connector(
-    num_cpu_blocks: int, ram_eviction: str = "lru"
+    num_cpu_blocks: int, ram_eviction: str = "lru", ram_state_spacing_blocks: int = 8
 ) -> KVTransferConfig:
     """The tiered connector: a RAM pool of `num_cpu_blocks` that extends VRAM,
     restoring into the GPU prefix cache before each lookup."""
@@ -103,6 +103,7 @@ def tiered_cpu_connector(
             "cpu_bytes_to_use": 1 << 40,
             "ram_eviction": ram_eviction,
             "prefill_cost_coefficients": [1.862e-5, 3.33e-6],
+            "ram_state_spacing_blocks": ram_state_spacing_blocks,
         },
     )
 

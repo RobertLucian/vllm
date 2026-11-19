@@ -6,7 +6,12 @@ VRAM -> RAM: the GPU prefix cache evicts least recently used first; the lazy
 walk of `SimpleCPUOffloadScheduler` copies every block a lookup can use before
 the GPU may drop it, including the blocks of exact-end and prompt-tail states
 (keys that end inside a block), each with the other groups' blocks under the
-same keys.
+same keys. Recurrent states at block boundaries are copied only where sessions
+resume (the last boundaries before a finished request's prompt end and end,
+and points several continuations share) and every `ram_state_spacing_blocks`
+blocks: a state takes a page of RAM per Mamba group, as much as the attention
+pages of a whole block, and one between those saves at most the tokens to the
+next.
 
 RAM -> VRAM ("promote, then hit"): before a waiting request's next lookup,
 the connector finds the deepest point the request can resume at with blocks
@@ -25,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.v1.core.hybrid_checkpoint.cost import PrefillCostModel
 from vllm.v1.core.hybrid_checkpoint.frontier import _SUFFIX
 from vllm.v1.core.hybrid_checkpoint.keys import frontier_key
 from vllm.v1.core.kv_cache_utils import (
@@ -43,6 +49,10 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadWorkerMetadata,
 )
 from vllm.v1.simple_kv_offload.metrics import SimpleCPUOffloadStats, TieredMetricName
+from vllm.v1.simple_kv_offload.ram_policy import (
+    RamEvictionStats,
+    RamGreedyDualSizeFrequency,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.hybrid_checkpoint.manager import HybridCheckpointManager
@@ -62,7 +72,8 @@ _PIN_TIMEOUT_S = 30.0
 # A request waits at most this long for room to restore into, then resumes
 # from the GPU alone.
 _MAX_RESTORE_WAIT_S = 10.0
-# Finished requests' ends remembered to measure resumes against.
+# Finished requests' ends remembered to measure resumes against, and the
+# block-boundary states RAM keeps as their resume points.
 _MAX_SEEN_ENDS = 65536
 # Upper bounds of the recompute buckets (tokens recomputed that a resume had
 # already seen).
@@ -210,6 +221,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         ram_eviction: str = "lru",
         prefill_cost_coefficients: tuple[float, ...] | None = None,
         frequency_half_life_s: float = 600.0,
+        ram_state_spacing_blocks: int = 8,
         **kwargs: Any,
     ) -> None:
         kwargs["lazy_offload"] = True
@@ -219,8 +231,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 f"ram_eviction must be one of {RAM_EVICTION_POLICIES}, "
                 f"got {ram_eviction!r}"
             )
-        if ram_eviction == "gdsf":
-            raise NotImplementedError("ram_eviction='gdsf' is not implemented yet")
+        if ram_state_spacing_blocks < 1:
+            raise ValueError("ram_state_spacing_blocks must be at least 1")
         self.ram_eviction = ram_eviction
         self.prefill_cost_coefficients = prefill_cost_coefficients
         self.frequency_half_life_s = frequency_half_life_s
@@ -230,12 +242,18 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             for g in self.prefix_cacheable_group_ids
             if isinstance(groups[g].kv_cache_spec, MambaSpec)
         ]
+        self._mamba_gid_set = set(self.mamba_gids)
         self.units_per_block = self.block_size // self.hash_block_size
+        self._state_spacing = ram_state_spacing_blocks * self.block_size
+        # Block-boundary states RAM keeps besides the spaced ones.
+        self._floors: OrderedDict[BlockHash, None] = OrderedDict()
         self._kv_cache_manager: KVCacheManager | None = None
-        # Exact-end states in RAM, and the ends finished requests reached.
+        # Exact-end states in RAM, and the ends finished requests reached:
+        # their ends and their prompts' (the session each belongs to).
         self.ram_frontiers = _EndIndex()
         self._seen_ends = _EndIndex()
         self._seen_order: OrderedDict[BlockHash, None] = OrderedDict()
+        self._session_of: dict[BlockHash, BlockHash] = {}
         # Restores: by request, queued for the next load event, by event.
         self._restores: dict[str, _Restore] = {}
         self._unsent: list[_Restore] = []
@@ -253,6 +271,30 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self.resume_stats = _ResumeStats()
         self._resume_snapshot = _ResumeStats()
         self.cpu_block_pool.key_removal_listener = self._ram_keys_removed
+        # Request -> the session end it resumed, which its own session
+        # inherits the frequency of.
+        self._resumed_from: dict[str, BlockHash] = {}
+        self.ram_policy: RamGreedyDualSizeFrequency | None = None
+        if ram_eviction == "gdsf":
+            if not prefill_cost_coefficients or len(prefill_cost_coefficients) < 2:
+                raise ValueError(
+                    "ram_eviction='gdsf' needs prefill_cost_coefficients [D, E]"
+                )
+            self.ram_policy = RamGreedyDualSizeFrequency(
+                self.cpu_block_pool,
+                cost=PrefillCostModel(*prefill_cost_coefficients[:2]),
+                page_group_id=self.fa_gidx,
+                state_group_ids=[
+                    g for g in self.prefix_cacheable_group_ids if g != self.fa_gidx
+                ],
+                block_size=self.block_size,
+                half_life_s=frequency_half_life_s,
+                on_gpu=self._on_gpu,
+            )
+            self.cpu_block_pool.eviction_policy = self.ram_policy
+            # The policy ranks RAM; a GPU eviction does not refresh it.
+            self.refresh_cpu_on_gpu_eviction = False
+        self._ram_evictions_snapshot = RamEvictionStats()
 
     # ------------------------------------------------------------------
     # Binding
@@ -273,10 +315,46 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     # ------------------------------------------------------------------
     # VRAM -> RAM
 
+    def _on_gpu(self, key: BlockHashWithGroupId) -> bool:
+        pool = self._gpu_block_pool
+        return (
+            pool is not None
+            and pool.cached_block_hash_to_block.get_one_block(key) is not None
+        )
+
     def _restorable(self, block: KVCacheBlock) -> bool:
         """Every key a lookup can use is restored, including keys that end
-        inside a block (exact-end and prompt-tail states)."""
-        return block.block_hash is not None
+        inside a block (exact-end and prompt-tail states), except states
+        between resume points (module docstring)."""
+        return block.block_hash is not None and not self._thinned(block)
+
+    def _thinned(self, block: KVCacheBlock) -> bool:
+        """Whether `block` is a block-boundary state RAM does not keep: not a
+        spaced one, not the last boundary before a finished request's prompt
+        end or end, and not a point several continuations share."""
+        assert block.block_hash is not None
+        num_tokens = block.block_hash_num_tokens
+        if (
+            get_group_id(block.block_hash) not in self._mamba_gid_set
+            or num_tokens is None
+            or num_tokens % self.block_size
+            or not num_tokens % self._state_spacing
+        ):
+            return False
+        checkpoints = self._checkpoints
+        pool = self._gpu_block_pool
+        if (
+            checkpoints is None
+            or pool is None
+            # Another key (an exact-end state at a boundary).
+            or pool.cached_block_hashes_by_block.get(block.block_id)
+        ):
+            return False
+        block_hash = get_block_hash(block.block_hash)
+        if block_hash in self._floors:
+            return False
+        unit = checkpoints.graph.units.get(block_hash)
+        return unit is None or not unit.is_branch_point
 
     def needs_spill(self, block: KVCacheBlock) -> bool:
         """SpillGuard: also a block of an exact-end state whose other blocks
@@ -345,6 +423,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     or sibling.block_id in self._unpinned_stores
                     or (sibling.ref_cnt and sibling_group != self.fa_gidx)
                     or cpu.get_one_block(key) is not None
+                    or self._thinned(sibling)
                 ):
                     continue
                 siblings[sibling.block_id] = sibling
@@ -374,6 +453,15 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     if entry is not None:
                         stored.append(entry)
         super()._process_store_completion(gpu_block_ids, cpu_block_ids, block_meta)
+        if self.ram_policy is not None:
+            cpu_pool = self.cpu_block_pool
+            keys: list[BlockHashWithGroupId] = []
+            for block_id in cpu_block_ids:
+                block = cpu_pool.blocks[block_id]
+                if block.block_hash is not None:
+                    keys.append(block.block_hash)
+                    keys.extend(cpu_pool.cached_block_hashes_by_block.get(block_id, ()))
+            self.ram_policy.stored(keys, cpu_block_ids)
         cpu = self.cpu_block_pool.cached_block_hash_to_block
         for entry in stored:
             if entry.key in self.ram_frontiers.entries:
@@ -775,8 +863,65 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._waiting_since.pop(request_id, None)
         self._observed.discard(request_id)
         self._admitted_from_ram.discard(request_id)
-        self._remember_end(request)
+        parent = self._resumed_from.pop(request_id, None)
+        self._keep_floors(request)
+        key = self._remember_end(request)
+        if key is not None and self.ram_policy is not None:
+            self.ram_policy.add_session(
+                key,
+                request.num_computed_tokens,
+                self._session_units(request),
+                parent,
+            )
         return super().request_finished(request, block_ids)
+
+    def _keep_floors(self, request: "Request") -> None:
+        """RAM keeps the states at the last block boundaries before a finished
+        request's prompt end and end: its next turn resumes there when the
+        states inside those blocks are gone."""
+        hashes, per_block = request.block_hashes, self.units_per_block
+        end = request.num_computed_tokens
+        for last in {min(end, request.num_prompt_tokens), end}:
+            k = last // self.block_size
+            if k and k * per_block <= len(hashes):
+                key = hashes[k * per_block - 1]
+                self._floors[key] = None
+                self._floors.move_to_end(key)
+        while len(self._floors) > _MAX_SEEN_ENDS:
+            self._floors.popitem(last=False)
+
+    def _session_units(self, request: "Request") -> list[tuple[int, BlockHash]]:
+        """The hash units a finished request's session owns: its block
+        boundaries (pages and the states there), the hash units inside the
+        last blocks of its prompt and of its end (partial pages, the prompt
+        tail's state), and its exact-end state."""
+        unit, block_size = self.hash_block_size, self.block_size
+        hashes = request.block_hashes
+        end = request.num_computed_tokens
+        units = [
+            (i * block_size, hashes[i * self.units_per_block - 1])
+            for i in range(1, end // block_size + 1)
+            if i * self.units_per_block <= len(hashes)
+        ]
+        for last in {min(end, request.num_prompt_tokens), end}:
+            start = last // block_size * block_size
+            for position in range(start + unit, last + 1, unit):
+                if position // unit <= len(hashes):
+                    units.append((position, hashes[position // unit - 1]))
+        checkpoints = self._checkpoints
+        if checkpoints is not None and self._kv_cache_manager is not None:
+            managers = self._kv_cache_manager.coordinator.single_type_managers
+            entries = checkpoints.frontiers.entries
+            for group_id in self.mamba_gids:
+                for block in managers[group_id].req_to_blocks.get(
+                    request.request_id, ()
+                ):
+                    if block.block_hash is None:
+                        continue
+                    entry = entries.get(get_block_hash(block.block_hash))
+                    if entry is not None:
+                        units.append((entry.num_tokens, entry.key))
+        return units
 
     def reset(self) -> bool:
         for restore in list(self._restores.values()):
@@ -793,6 +938,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self._release(restore)
         self._unsent = []
         self.ram_frontiers.clear()
+        self._floors.clear()
+        if self.ram_policy is not None:
+            self.ram_policy.reset()
         self._waiting_since.clear()
         if self._restores_by_event:
             super().reset()
@@ -802,9 +950,21 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     # ------------------------------------------------------------------
     # Measurement: tokens a resume recomputes that it had already seen.
 
-    def _remember_end(self, request: "Request") -> None:
+    def _remember_end(self, request: "Request") -> BlockHash | None:
+        """Remember the end a finished request reached, and its prompt's end:
+        a reasoning model's next turn drops the reasoning, so it extends only
+        the prompt. Returns the end's key, its session's."""
+        end = request.num_computed_tokens
+        key = self._remember(request, end)
+        prompt = min(end, request.num_prompt_tokens)
+        if key is not None and prompt < end:
+            prompt_key = self._remember(request, prompt)
+            if prompt_key is not None:
+                self._session_of[prompt_key] = key
+        return key
+
+    def _remember(self, request: "Request", num_tokens: int) -> BlockHash | None:
         frontiers = None if self._checkpoints is None else self._checkpoints.frontiers
-        num_tokens = request.num_computed_tokens
         unit = self.hash_block_size
         if (
             frontiers is None
@@ -812,11 +972,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             or num_tokens // unit > len(request.block_hashes)
             or num_tokens > len(request.all_token_ids)
         ):
-            return
+            return None
         key = frontier_key(frontiers.hash_fn, request, num_tokens, unit)
         if key in self._seen_ends.entries:
             self._seen_order.move_to_end(key)
-            return
+            return key
         h = num_tokens // unit
         anchor = request.block_hashes[h - 1] if h else None
         start = max(h * unit, num_tokens - _SUFFIX)
@@ -826,12 +986,15 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         while len(self._seen_order) > _MAX_SEEN_ENDS:
             oldest, _ = self._seen_order.popitem(last=False)
             self._seen_ends.remove(oldest)
+            self._session_of.pop(oldest, None)
+        return key
 
-    def _seen_end(self, request: "Request") -> int:
-        """The longest end a finished request reached that `request` extends."""
+    def _seen_end(self, request: "Request") -> tuple[int, BlockHash | None]:
+        """The longest end (or prompt end) a finished request reached that
+        `request` extends, and its session's key."""
         frontiers = None if self._checkpoints is None else self._checkpoints.frontiers
         if frontiers is None or not self._seen_ends.entries:
-            return 0
+            return 0, None
         unit = self.hash_block_size
         hashes = request.block_hashes
         tokens = request.all_token_ids
@@ -844,11 +1007,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     continue
                 start = max(h * unit, num_tokens - _SUFFIX)
                 keys = lengths[num_tokens].get(tuple(tokens[start:num_tokens]))
-                if keys and (
-                    frontier_key(frontiers.hash_fn, request, num_tokens, unit) in keys
-                ):
-                    return num_tokens
-        return 0
+                if not keys:
+                    continue
+                key = frontier_key(frontiers.hash_fn, request, num_tokens, unit)
+                if key in keys:
+                    return num_tokens, self._session_of.get(key, key)
+        return 0, None
 
     def observe_admission(self, request: "Request", num_computed_tokens: int) -> None:
         """Record how many tokens the admitted request recomputes that a
@@ -859,9 +1023,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._observed.add(request_id)
         restored = request_id in self._admitted_from_ram
         self._admitted_from_ram.discard(request_id)
-        seen = self._seen_end(request)
-        if not seen:
+        seen, key = self._seen_end(request)
+        if key is None:
             return
+        # The session resumed, whichever tier holds it.
+        self._resumed_from[request_id] = key
+        if self.ram_policy is not None:
+            self.ram_policy.resumed(key)
         tier = "ram" if restored else "gpu" if num_computed_tokens else "cold"
         self.resume_stats.record(tier, max(0, seen - num_computed_tokens))
 
@@ -899,4 +1067,17 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             dict(resumes.counts), dict(resumes.tokens), dict(resumes.buckets)
         )
         stats.set_gauge(TieredMetricName.RAM_FRONTIERS, len(self.ram_frontiers.entries))
+        if self.ram_policy is not None:
+            current, previous = self.ram_policy.stats, self._ram_evictions_snapshot
+            for kind, field_name in (
+                ("orphan", "orphans"),
+                ("session", "session_blocks"),
+                ("dead", "dead"),
+            ):
+                delta = getattr(current, field_name) - getattr(previous, field_name)
+                if delta > 0:
+                    stats.increase_counter(
+                        TieredMetricName.RAM_EVICTIONS, delta, (kind,)
+                    )
+            self._ram_evictions_snapshot = replace(current, counts={})
         return stats

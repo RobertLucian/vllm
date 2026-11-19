@@ -41,6 +41,7 @@ def make_engine(
     *,
     num_blocks: int = 90,
     num_cpu_blocks: int | None = 400,
+    ram_eviction: str = "lru",
 ) -> Engine:
     """The tiered connector with a RAM pool of `num_cpu_blocks`, or (None) no
     connector."""
@@ -58,7 +59,9 @@ def make_engine(
         async_scheduling=async_scheduling,
         mamba_frontier_checkpoint=True,
         kv_transfer_config=(
-            None if num_cpu_blocks is None else tiered_cpu_connector(num_cpu_blocks)
+            None
+            if num_cpu_blocks is None
+            else tiered_cpu_connector(num_cpu_blocks, ram_eviction)
         ),
     )
     device = Device(scheduler, num_drafts=DRAFTS, truncate=True, accept=default_accept)
@@ -254,7 +257,8 @@ def _fuzz_case(engine: Engine, seed: int) -> list[int]:
             for request_id in ids:
                 s = int(request_id[1 : request_id.index("t")])
                 if turn:
-                    resumed.append(engine.admissions[request_id][-1])
+                    # Where it resumed, not where a preemption re-admitted it.
+                    resumed.append(engine.admissions[request_id][0])
                 tokens[s] = list(engine.requests[request_id].all_token_ids) + prompt(
                     seed * 1000 + 10 * s + turn, rng.randrange(8, 80)
                 )

@@ -175,6 +175,11 @@ class LazySpillStats:
 class SimpleCPUOffloadScheduler:
     """Scheduler-side manager for CPU offloading."""
 
+    # Lazy mode: a block the GPU drops moves its CPU copy to the CPU pool's
+    # most recently used end (`on_evicted`). Off when a CPU eviction policy
+    # other than LRU ranks the CPU pool.
+    refresh_cpu_on_gpu_eviction = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -504,6 +509,8 @@ class SimpleCPUOffloadScheduler:
             and self._restorable(block)
         ):
             self.lazy_spill_stats.uncopied_evicted_blocks += 1
+        if not self.refresh_cpu_on_gpu_eviction:
+            return
         block_hash = get_block_hash(block.block_hash)
         copies = []
         for group_id in self.prefix_cacheable_group_ids:

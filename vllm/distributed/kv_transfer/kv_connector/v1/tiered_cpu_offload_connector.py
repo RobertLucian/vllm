@@ -7,6 +7,8 @@ One connector owns everything that moves KV between VRAM and RAM:
   lru``, required).
 - How it leaves: copied to RAM before the GPU may drop it, with the other
   groups' blocks under the same keys (SimpleCPU's lazy walk and spill guard).
+  Recurrent states at block boundaries are copied only where sessions resume
+  and every ``ram_state_spacing_blocks`` blocks.
 - What leaves RAM: ``ram_eviction`` (``lru`` or ``gdsf``).
 - How it comes back: restored into the GPU prefix cache before the request's
   lookup, which then hits it like any GPU-resident prefix
@@ -15,7 +17,8 @@ One connector owns everything that moves KV between VRAM and RAM:
 Configuration (``kv_connector_extra_config``): SimpleCPU's ``cpu_bytes_to_use``
 / ``num_cpu_blocks``, plus ``ram_eviction``, ``prefill_cost_coefficients``
 (``[D, E]``, seconds per token and per token per 100k of context, used by
-``gdsf``) and ``frequency_half_life_seconds``.
+``gdsf``), ``frequency_half_life_seconds`` and ``ram_state_spacing_blocks``
+(default 8).
 """
 
 from typing import TYPE_CHECKING, Any
@@ -75,6 +78,9 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
             ),
             "frequency_half_life_s": float(
                 extra_config.get("frequency_half_life_seconds", 600.0)
+            ),
+            "ram_state_spacing_blocks": int(
+                extra_config.get("ram_state_spacing_blocks", 8)
             ),
         }
 
