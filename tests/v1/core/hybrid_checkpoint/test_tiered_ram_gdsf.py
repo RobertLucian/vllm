@@ -37,11 +37,12 @@ def gdsf(engine: Engine) -> RamGreedyDualSizeFrequency:
     return policy
 
 
-def test_frequency_follows_a_session_into_ram_and_back():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_frequency_follows_a_session_into_ram_and_back(async_scheduling: bool):
     """A session resumed three times on the GPU keeps that count once other
     sessions push it into RAM; resuming it from RAM counts a fourth, which
     its next turn inherits."""
-    engine = make_engine(False, BLOCK, ram_eviction="gdsf")
+    engine = make_engine(async_scheduling, BLOCK, ram_eviction="gdsf")
     policy = gdsf(engine)
     tokens = prompt(1, 1200)
     for turn in range(4):
@@ -67,13 +68,16 @@ def test_frequency_follows_a_session_into_ram_and_back():
     assert_nothing_lost(engine)
 
 
-def test_a_turn_that_parts_from_the_last_prompt_is_its_sessions_resume():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_a_turn_that_parts_from_the_last_prompt_is_its_sessions_resume(
+    async_scheduling: bool,
+):
     """A reasoning model's next turn drops the reasoning, and its history
     renders the last prompt's generation prefix differently: it parts from
     that prompt a few tokens before its end. It still counts as that
     session's resume, recomputing from the prompt's tail state only, and
     the session's next turn inherits the count."""
-    engine = make_engine(False, BLOCK // 4, ram_eviction="gdsf")
+    engine = make_engine(async_scheduling, BLOCK // 4, ram_eviction="gdsf")
     tokens = prompt(3, 1000)
     engine.add("t0", tokens, 40)
     engine.run("t0")
@@ -201,20 +205,27 @@ class TailChecker:
                     self.violations.append(("catalog", unit.key, group_id))
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("seed", [1, 2])
-def test_ram_drops_only_tails_and_whole_exact_end_states(seed: int):
+def test_ram_drops_only_tails_and_whole_exact_end_states(
+    seed: int, async_scheduling: bool
+):
     """More sessions than both tiers hold: every RAM eviction takes a
     session's deepest blocks first, and the RAM catalog's exact-end states
     stay whole."""
-    engine = make_engine(False, BLOCK // 4, num_cpu_blocks=110, ram_eviction="gdsf")
+    engine = make_engine(
+        async_scheduling, BLOCK // 4, num_cpu_blocks=110, ram_eviction="gdsf"
+    )
     checker = TailChecker(engine)
     hot_and_cold(engine, seed, rounds=4)
     assert_nothing_lost(engine)
     assert checker.evictions > 0
+    assert gdsf(engine).stats.sessions > 0, gdsf(engine).stats
     assert not checker.violations, checker.violations[:10]
 
 
-def test_gdsf_recomputes_fewer_tokens_than_lru():
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_gdsf_recomputes_fewer_tokens_than_lru(async_scheduling: bool):
     """The same oversubscribed sessions under RAM LRU and RAM GDSF: GDSF
     keeps the hot sessions and the long contexts, and recomputes at least
     15% fewer tokens."""
@@ -222,7 +233,12 @@ def test_gdsf_recomputes_fewer_tokens_than_lru():
     for policy in ("lru", "gdsf"):
         totals[policy] = sum(
             hot_and_cold(
-                make_engine(False, BLOCK // 4, num_cpu_blocks=160, ram_eviction=policy),
+                make_engine(
+                    async_scheduling,
+                    BLOCK // 4,
+                    num_cpu_blocks=160,
+                    ram_eviction=policy,
+                ),
                 seed,
             )
             for seed in (1, 2)

@@ -80,6 +80,13 @@ _MAX_SEEN_ENDS = 65536
 RECOMPUTE_BUCKETS = (0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384, 65536)
 
 
+def _end(request: "Request") -> int:
+    """The tokens a finished request processed. Under async scheduling its
+    computed count also holds the slots of the step still in flight (the
+    sampled token and the drafts after it), past the tokens it has."""
+    return min(request.num_computed_tokens, len(request.all_token_ids) - 1)
+
+
 @dataclass
 class RestoreStats:
     """Cumulative counters of RAM -> VRAM restores."""
@@ -870,10 +877,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         key = self._remember_end(request)
         if key is not None and self.ram_policy is not None:
             self.ram_policy.add_session(
-                key,
-                request.num_computed_tokens,
-                self._session_units(request),
-                parent,
+                key, _end(request), self._session_units(request), parent
             )
         return super().request_finished(request, block_ids)
 
@@ -882,7 +886,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         request's prompt end and end: its next turn resumes there when the
         states inside those blocks are gone."""
         hashes, per_block = request.block_hashes, self.units_per_block
-        end = request.num_computed_tokens
+        end = _end(request)
         for last in {min(end, request.num_prompt_tokens), end}:
             k = last // self.block_size
             if k and k * per_block <= len(hashes):
@@ -899,7 +903,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         tail's state), and its exact-end state."""
         unit, block_size = self.hash_block_size, self.block_size
         hashes = request.block_hashes
-        end = request.num_computed_tokens
+        end = _end(request)
         units = [
             (i * block_size, hashes[i * self.units_per_block - 1])
             for i in range(1, end // block_size + 1)
@@ -956,7 +960,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         """Remember the end a finished request reached, and its prompt's end:
         a reasoning model's next turn drops the reasoning, so it extends only
         the prompt. Returns the end's key, its session's."""
-        end = request.num_computed_tokens
+        end = _end(request)
         key = self._remember(request, end)
         prompt = min(end, request.num_prompt_tokens)
         if key is not None and prompt < end:
