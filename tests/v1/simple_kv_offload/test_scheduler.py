@@ -1525,6 +1525,78 @@ def test_lazy_guard_lets_held_allocations_go_after_waiting_too_long(
     assert sched.holding
 
 
+def _hybrid_boundary(lazy_fix: SchedulerFixture) -> tuple[KVCacheBlock, ...]:
+    """An attention page and a Mamba state cached under one block hash, an
+    uncached block, and every other block in use."""
+    gpu_pool = lazy_fix.gpu_block_pool
+    req = make_request(num_blocks=1)
+    (page,) = _allocate_gpu_blocks(gpu_pool, req, 1, group_id=0)
+    (state,) = _allocate_gpu_blocks(gpu_pool, req, 1, group_id=1)
+    (other,) = _allocate_gpu_blocks(gpu_pool, make_request(num_blocks=1), 1)
+    gpu_pool.get_new_blocks(gpu_pool.get_num_free_blocks())
+    return page, state, other
+
+
+@pytest.mark.cpu_test
+def test_lazy_walk_copies_boundary_siblings_in_their_place() -> None:
+    """Lazy, hybrid: a CPU lookup serves a boundary only with every group's
+    block there. Storing a state also copies the attention page under its hash
+    (in use here) without a reference, so the page keeps its place in the
+    eviction order; once copied, it still leaves only in that order, not ahead
+    of a block that is not copied yet."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        block_size=BLOCK_SIZE, dcp_world_size=1, lazy=True
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    page, state, uncopied = _hybrid_boundary(fix)
+    gpu_pool.free_blocks([state], evict_first=True)
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert sorted(meta.store_gpu_blocks) == sorted([state.block_id, page.block_id])
+    assert page.ref_cnt == 1
+    simulate_store_completion(sched, meta.store_event)
+    assert page.ref_cnt == 1
+    cached = sched.cpu_block_pool.cached_block_hash_to_block
+    assert cached.get_one_block(page.block_hash) is not None
+    assert sched.keeps_order(page) and not sched.keeps_order(state)
+
+    # Queue: the uncopied block, the stored state, the early-copied page.
+    gpu_pool.free_blocks([uncopied], evict_first=True)
+    gpu_pool.free_blocks([page])
+    assert gpu_pool.num_spill_safe_free_blocks(3) == 1
+    assert gpu_pool.get_new_blocks(1) == [state]
+    assert gpu_pool.get_new_blocks(1) == [uncopied]
+    assert sched.lazy_spill_stats.unspilled_evicted_blocks == 1
+    assert page.block_hash is not None
+
+
+@pytest.mark.cpu_test
+def test_lazy_boundary_sibling_changing_hands_mid_copy_backs_no_cpu_key() -> None:
+    """Lazy, hybrid: a boundary sibling copied without a reference can lose its
+    key mid-copy (a released hybrid state unit drops it); its copy then backs
+    no CPU key, and the eviction counts as one without a copy."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        block_size=BLOCK_SIZE, dcp_world_size=1, lazy=True
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    page, state, _ = _hybrid_boundary(fix)
+    gpu_pool.free_blocks([state], evict_first=True)
+    gpu_pool.free_blocks([page])
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert sorted(meta.store_gpu_blocks) == sorted([state.block_id, page.block_id])
+    key = page.block_hash
+    gpu_pool._maybe_evict_cached_block(page)
+    assert sched.lazy_spill_stats.uncopied_evicted_blocks == 1
+    simulate_store_completion(sched, meta.store_event)
+    cached = sched.cpu_block_pool.cached_block_hash_to_block
+    assert cached.get_one_block(key) is None
+    assert cached.get_one_block(state.block_hash) is not None
+    assert not sched.keeps_order(page)
+
+
 # ---------------------------------------------------------------------------
 # Test 3: LRU eviction order
 # ---------------------------------------------------------------------------
