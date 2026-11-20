@@ -88,6 +88,9 @@ class RamEvictionStats:
     sessions: int = 0
     session_blocks: int = 0
     dead: int = 0
+    # Blocks with a key the pool took in its own LRU order: none of the above
+    # could go (all in use).
+    unranked: int = 0
     retired: int = 0
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -365,7 +368,9 @@ class RamGreedyDualSizeFrequency:
     def prepare_eviction(self, num_blocks: int) -> None:
         """Move the next `num_blocks` victims to the free queue's front:
         blocks no session owns, then sessions' blocks nothing reads, then the
-        lowest-value sessions' exclusive blocks, deepest first."""
+        lowest-value sessions' exclusive blocks, deepest first, fresh copies
+        last. The pool takes any shortfall in its LRU order, live sessions'
+        blocks included (`RamEvictionStats.unranked`)."""
         self._decay()
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
@@ -400,10 +405,21 @@ class RamGreedyDualSizeFrequency:
                         break
             else:
                 self._take_sessions(take, victims, num_blocks)
+                if len(victims) < num_blocks:
+                    # Fresh copies too: the GPU copies such a block again, but
+                    # the pool's LRU order would take a live session's.
+                    fresh.clear()
+                    self._take_sessions(take, victims, num_blocks)
         moved = [b for b in victims if b.prev_free_block is not None]
         for block in moved:
             queue.remove(block)
         queue.prepend_n(moved)
+        if len(victims) < num_blocks:
+            chosen = {b.block_id for b in victims}
+            self.stats.unranked += sum(
+                block.block_hash is not None and block.block_id not in chosen
+                for block in itertools.islice(queue.iter_blocks_after(None), num_blocks)
+            )
         self._retire_pending(self.now())
 
     def _owned(self, block: KVCacheBlock) -> bool:

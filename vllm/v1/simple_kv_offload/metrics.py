@@ -65,6 +65,9 @@ class TieredMetricName:
     RAM_FRONTIERS = "vllm:tiered_kv_ram_frontiers"
     RAM_EVICTIONS = "vllm:tiered_kv_ram_evictions_total"
     GPU_STATES_PRUNED = "vllm:tiered_kv_gpu_states_pruned_total"
+    GPU_STATE_PRUNES = "vllm:tiered_kv_gpu_state_prunes_total"
+    GPU_STATE_BLOCKS = "vllm:tiered_kv_gpu_state_blocks"
+    RAM_STATES_DROPPED = "vllm:tiered_kv_ram_states_dropped_total"
 
 
 class _MetricType:
@@ -389,6 +392,30 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                 (
                     "Blocks of block-boundary states the GPU released when a "
                     "request finished: states between its resume points."
+                ),
+                [],
+            ),
+            (
+                TieredMetricName.GPU_STATE_PRUNES,
+                _MetricType.COUNTER,
+                (
+                    "Block-boundary states a finished request left on the GPU, "
+                    "by what happened to each: pruned, or why it stayed."
+                ),
+                ["outcome"],
+            ),
+            (
+                TieredMetricName.GPU_STATE_BLOCKS,
+                _MetricType.GAUGE,
+                "Cached recurrent-state blocks on the GPU, all Mamba groups.",
+                [],
+            ),
+            (
+                TieredMetricName.RAM_STATES_DROPPED,
+                _MetricType.COUNTER,
+                (
+                    "Blocks of block-boundary states RAM dropped once no live "
+                    "session resumed there."
                 ),
                 [],
             ),

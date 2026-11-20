@@ -6,13 +6,17 @@ VRAM -> RAM: the GPU prefix cache evicts least recently used first; the lazy
 walk of `SimpleCPUOffloadScheduler` copies every block a lookup can use before
 the GPU may drop it, including the blocks of exact-end and prompt-tail states
 (keys that end inside a block), each with the other groups' blocks under the
-same keys. Recurrent states at block boundaries are copied only where sessions
-resume (the last boundaries before a finished request's prompt end and end,
-and points several continuations share) and every `ram_state_spacing_blocks`
-blocks: a state takes a page of RAM per Mamba group, as much as the attention
-pages of a whole block, and one between those saves at most the tokens to the
-next. With `prune_gpu_states` the GPU releases those others on a finished
-request's chain too, instead of holding them until its LRU order reaches them.
+same keys. With `copy_ahead_blocks` the walk keeps that many blocks at the
+eviction end copied, so an allocation (a restore's most of all) rarely waits
+for a copy. Recurrent states at block boundaries are copied only where live
+sessions resume (`_keep_resume_points`: the last boundaries before the latest
+turn's prompt end and end, and before the prompt that began its tool loop),
+at points several continuations share, and every `ram_state_spacing_blocks`
+blocks if set: a state takes a page of RAM per Mamba group, as much as the
+attention pages of a whole block. When a turn supersedes the one it resumed,
+the states only the older turn resumed at leave both tiers. With
+`prune_gpu_states` the GPU also releases a finished request's other states,
+instead of holding them until its LRU order reaches them.
 
 RAM -> VRAM ("promote, then hit"): before a waiting request's next lookup,
 the connector finds the deepest point the request can resume at with blocks
@@ -79,8 +83,10 @@ _MIN_RESTORE_WAIT_S = 10.0
 _MAX_RESTORE_WAIT_S = 120.0
 _RESTORE_WAIT_SHARE = 0.5
 # Finished requests' ends remembered to measure resumes against, and the
-# block-boundary states RAM keeps as their resume points.
+# sessions whose resume points the tiers keep.
 _MAX_SEEN_ENDS = 65536
+# Steps a state stays pending for pruning while a request still holds it.
+_PRUNE_RETRY_STEPS = 64
 # Upper bounds of the recompute buckets (tokens recomputed that a resume had
 # already seen).
 RECOMPUTE_BUCKETS = (0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384, 65536)
@@ -237,8 +243,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         ram_eviction: str = "lru",
         prefill_cost_coefficients: tuple[float, ...] | None = None,
         frequency_half_life_s: float = 600.0,
-        ram_state_spacing_blocks: int = 8,
+        ram_state_spacing_blocks: int = 0,
         prune_gpu_states: bool = True,
+        copy_ahead_blocks: int = 0,
         **kwargs: Any,
     ) -> None:
         kwargs["lazy_offload"] = True
@@ -248,8 +255,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 f"ram_eviction must be one of {RAM_EVICTION_POLICIES}, "
                 f"got {ram_eviction!r}"
             )
-        if ram_state_spacing_blocks < 1:
-            raise ValueError("ram_state_spacing_blocks must be at least 1")
+        if ram_state_spacing_blocks < 0:
+            raise ValueError("ram_state_spacing_blocks must be 0 (off) or more")
+        if copy_ahead_blocks < 0:
+            raise ValueError("copy_ahead_blocks must be 0 (the walk's own) or more")
+        # The lazy walk covers at least this many blocks at the eviction end.
+        self._target_free = max(self._target_free, copy_ahead_blocks)
         self.ram_eviction = ram_eviction
         self.prefill_cost_coefficients = prefill_cost_coefficients
         self._cost = (
@@ -267,18 +278,36 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._mamba_gid_set = set(self.mamba_gids)
         self.units_per_block = self.block_size // self.hash_block_size
         self._state_spacing = ram_state_spacing_blocks * self.block_size
-        # Block-boundary states RAM keeps besides the spaced ones.
-        self._floors: OrderedDict[BlockHash, None] = OrderedDict()
+        # Block-boundary states both tiers keep besides the spaced ones: each
+        # live session's resume points (`_keep_resume_points`), counted by the
+        # sessions that keep them; by session, where its tool loop began and
+        # its points.
+        self._kept: Counter[BlockHash] = Counter()
+        self._kept_by: OrderedDict[BlockHash, tuple[int, tuple[BlockHash, ...]]] = (
+            OrderedDict()
+        )
+        # Resume points no live session keeps any more. One stays a point
+        # several continuations share only if resumed more than once: its
+        # other continuation is usually its own session's past, the turns a
+        # user prompt rendered anew.
+        self._superseded: OrderedDict[BlockHash, None] = OrderedDict()
+        # Requests admitted extending the end their session reached (a tool
+        # loop's next turn), not only its prompt.
+        self._extends_end: set[str] = set()
         # The GPU keeps the same block-boundary states of a finished request's
         # chain; the others go when it finishes (`_prune_gpu_states`).
         self.prune_gpu_states = prune_gpu_states
         # Finished chains' state keys, pruned once their requests' blocks are
-        # free (the scheduler frees them after `request_finished`).
+        # free (the scheduler frees them after `request_finished`); the steps
+        # a key held by another request has waited.
         self._prune_pending: list[BlockHash] = []
-        self._prune_skips: Counter[str] = Counter()
-        self._prune_skips_logged = 0
+        self._prune_waits: dict[BlockHash, int] = {}
+        self.prune_outcomes: Counter[str] = Counter()
+        self._prune_outcomes_snapshot: Counter[str] = Counter()
         self.num_gpu_states_pruned = 0
         self._gpu_states_pruned_snapshot = 0
+        self.num_ram_states_dropped = 0
+        self._ram_states_dropped_snapshot = 0
         self._kv_cache_manager: KVCacheManager | None = None
         # Exact-end states in RAM, and the ends finished requests reached:
         # their ends and their prompts' (the session each belongs to).
@@ -286,8 +315,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._seen_ends = _EndIndex()
         self._seen_order: OrderedDict[BlockHash, None] = OrderedDict()
         self._session_of: dict[BlockHash, BlockHash] = {}
-        # Each end's tokens past its last hash unit.
+        # Each end's tokens past its last hash unit; and by the hash unit
+        # before that one, its tokens past it (`_seen_end`).
         self._seen_tails: dict[BlockHash, tuple[int, ...]] = {}
+        self._seen_by_previous: dict[
+            BlockHash | None, dict[BlockHash, tuple[int, ...]]
+        ] = {}
+        self._previous_of: dict[BlockHash, BlockHash | None] = {}
         # Restores: by request, queued for the next load event, by event.
         self._restores: dict[str, _Restore] = {}
         self._unsent: list[_Restore] = []
@@ -363,17 +397,22 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         between resume points (module docstring)."""
         return block.block_hash is not None and not self._thinned(block)
 
+    def _spaced(self, num_tokens: int) -> bool:
+        """Whether both tiers keep the block-boundary state at `num_tokens`
+        whatever resumes there (`ram_state_spacing_blocks`)."""
+        return bool(self._state_spacing) and not num_tokens % self._state_spacing
+
     def _thinned(self, block: KVCacheBlock) -> bool:
         """Whether `block` is a block-boundary state RAM does not keep: not a
-        spaced one, not the last boundary before a finished request's prompt
-        end or end, and not a point several continuations share."""
+        spaced one, not a live session's resume point, and not a point several
+        continuations share."""
         assert block.block_hash is not None
         num_tokens = block.block_hash_num_tokens
         if (
             get_group_id(block.block_hash) not in self._mamba_gid_set
             or num_tokens is None
             or num_tokens % self.block_size
-            or not num_tokens % self._state_spacing
+            or self._spaced(num_tokens)
         ):
             return False
         checkpoints = self._checkpoints
@@ -386,10 +425,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         ):
             return False
         block_hash = get_block_hash(block.block_hash)
-        if block_hash in self._floors:
+        if block_hash in self._kept:
             return False
-        unit = checkpoints.graph.units.get(block_hash)
-        return unit is None or not unit.is_branch_point
+        return not self._shared(block_hash)
+
+    def _shared(self, key: BlockHash) -> bool:
+        """Whether the state at `key` is a point several continuations share
+        (`_superseded`)."""
+        checkpoints = self._checkpoints
+        unit = None if checkpoints is None else checkpoints.graph.units.get(key)
+        return (
+            unit is not None
+            and unit.is_branch_point
+            and (unit.hits > 1 or key not in self._superseded)
+        )
 
     def needs_spill(self, block: KVCacheBlock) -> bool:
         """SpillGuard: also a block of an exact-end state whose other blocks
@@ -914,52 +963,128 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._observed.discard(request_id)
         self._admitted_from_ram.discard(request_id)
         parent = self._resumed_from.pop(request_id, None)
-        self._keep_floors(request)
+        loop_start = self._loop_start(request, parent)
+        key = self._remember_end(request, loop_start)
+        if key is not None:
+            self._keep_resume_points(request, key, parent, loop_start)
         self._prune_gpu_states(request)
-        key = self._remember_end(request)
         if key is not None and self.ram_policy is not None:
             self.ram_policy.add_session(
-                key, _end(request), self._session_units(request), parent
+                key, _end(request), self._session_units(request, loop_start), parent
             )
         return super().request_finished(request, block_ids)
 
-    def _keep_floors(self, request: "Request") -> None:
-        """RAM keeps the states at the last block boundaries before a finished
-        request's prompt end and end: its next turn resumes there when the
-        states inside those blocks are gone."""
+    def _loop_start(self, request: "Request", parent: BlockHash | None) -> int:
+        """Where the tool loop a finished request belongs to began: the prompt
+        end of the last turn in its session that did not extend the previous
+        turn's end (a user prompt; a reasoning model's template drops the
+        loop's reasoning then, so the next user prompt parts from the session
+        there), or its own prompt end."""
+        prompt = min(_end(request), request.num_prompt_tokens)
+        extended = request.request_id in self._extends_end
+        self._extends_end.discard(request.request_id)
+        if extended and parent is not None:
+            kept = self._kept_by.get(parent)
+            if kept is not None and kept[0] <= prompt:
+                return kept[0]
+        return prompt
+
+    def _keep_resume_points(
+        self,
+        request: "Request",
+        key: BlockHash,
+        parent: BlockHash | None,
+        loop_start: int,
+    ) -> None:
+        """Both tiers keep the states at the last block boundaries before a
+        finished request's prompt end, its end and its loop's start: its next
+        turn resumes there when the states inside those blocks are gone. The
+        session it resumed keeps its own no more: states only that one kept
+        leave the GPU and RAM."""
         hashes, per_block = request.block_hashes, self.units_per_block
         end = _end(request)
-        for last in {min(end, request.num_prompt_tokens), end}:
+        points: dict[BlockHash, None] = {}
+        for last in (loop_start, min(end, request.num_prompt_tokens), end):
             k = last // self.block_size
             if k and k * per_block <= len(hashes):
-                key = hashes[k * per_block - 1]
-                self._floors[key] = None
-                self._floors.move_to_end(key)
-        while len(self._floors) > _MAX_SEEN_ENDS:
-            self._floors.popitem(last=False)
+                points[hashes[k * per_block - 1]] = None
+        # Counted before any are released, so the points they share stay.
+        previous = self._kept_by.pop(key, None)
+        self._kept_by[key] = (loop_start, tuple(points))
+        self._kept.update(list(points))
+        if previous is not None:
+            self._release_points(previous[1])
+        if parent is not None and parent != key:
+            self._release_resume_points(parent)
+        while len(self._kept_by) > _MAX_SEEN_ENDS:
+            self._release_resume_points(next(iter(self._kept_by)))
+
+    def _release_resume_points(self, session: BlockHash) -> None:
+        kept = self._kept_by.pop(session, None)
+        if kept is not None:
+            self._release_points(kept[1])
+
+    def _release_points(self, states: tuple[BlockHash, ...]) -> None:
+        for state in states:
+            self._kept[state] -= 1
+            if self._kept[state] > 0:
+                continue
+            del self._kept[state]
+            self._superseded[state] = None
+            self._superseded.move_to_end(state)
+            while len(self._superseded) > _MAX_SEEN_ENDS:
+                self._superseded.popitem(last=False)
+            self._drop_ram_state(state)
+            if self.prune_gpu_states:
+                self._prune_pending.append(state)
+
+    def _drop_ram_state(self, state: BlockHash) -> None:
+        """RAM drops the block-boundary state `state` no live session resumes
+        at, unless it is spaced or a point several continuations share."""
+        if self._shared(state):
+            return
+        cpu_pool = self.cpu_block_pool
+        cpu = cpu_pool.cached_block_hash_to_block
+        for group_id in self.mamba_gids:
+            grouped = make_block_hash_with_group_id(state, group_id)
+            for block in list(cpu.get_all_blocks(grouped)):
+                num_tokens = block.block_hash_num_tokens
+                if (
+                    block.ref_cnt
+                    or block.block_id in self._loading_cpu
+                    or (num_tokens is not None and self._spaced(num_tokens))
+                    # Another key (an exact-end state at a boundary).
+                    or cpu_pool.cached_block_hashes_by_block.get(block.block_id)
+                ):
+                    continue
+                if cpu_pool._maybe_evict_cached_block(block):
+                    self.num_ram_states_dropped += 1
 
     def _prune_gpu_states(self, request: "Request") -> None:
         """Release the block-boundary states on a finished request's chain
         that RAM would not keep either (`_thinned`): its next turn resumes at
         its end, and each takes a block per Mamba group until the GPU's LRU
         order reaches it, which ranks them by age across sessions, not by use.
-        Kept: spaced states, floors, branch points, states in use or where a
-        waiting request resumes, and blocks that carry another key.
+        Kept: spaced states, live sessions' resume points, branch points,
+        states in use or where a waiting request resumes, and blocks that
+        carry another key.
 
         The request still holds its blocks here (the scheduler frees them
         after `request_finished`), and a state in use cannot be released: its
-        keys wait for the next step (`_apply_prunes`)."""
+        keys wait for the next steps (`_apply_prunes`)."""
         if not self.prune_gpu_states or self._checkpoints is None:
             return
         hashes, per_block = request.block_hashes, self.units_per_block
         for i in range(1, _end(request) // self.block_size + 1):
             if i * per_block > len(hashes):
                 break
-            if (i * self.block_size) % self._state_spacing:
+            if not self._spaced(i * self.block_size):
                 self._prune_pending.append(hashes[i * per_block - 1])
 
     def _apply_prunes(self) -> None:
-        """Release the pending states (`_prune_gpu_states`) nothing holds."""
+        """Release the pending states (`_prune_gpu_states`) nothing holds. A
+        state a request holds stays pending for up to `_PRUNE_RETRY_STEPS`
+        steps. `prune_outcomes` counts each state's outcome once."""
         checkpoints = self._checkpoints
         pool = self._gpu_block_pool
         pending, self._prune_pending = self._prune_pending, []
@@ -968,56 +1093,63 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         graph = checkpoints.graph
         waiting = set(checkpoints._resume.values())
         gpu = pool.cached_block_hash_to_block
-        skips = self._prune_skips
-        for key in pending:
+        outcomes = self.prune_outcomes
+        retry: dict[BlockHash, None] = {}
+        for key in dict.fromkeys(pending):
             unit = graph.units.get(key)
-            skip = (
+            outcome = (
                 "no unit"
                 if unit is None
                 else "frontier"
                 if unit.frontier
+                else "kept"
+                if key in self._kept
                 else "branch point"
-                if unit.is_branch_point
-                else "floor"
-                if key in self._floors
+                if self._shared(key)
                 else "held"
                 if checkpoints.held(key)
                 else "needed"
                 if checkpoints._needed(key, waiting)
                 else None
             )
-            if skip is not None:
-                skips[skip] += 1
-                continue
-            blocks = [
-                block
-                for group_id in self.mamba_gids
-                for block in gpu.get_all_blocks(
-                    make_block_hash_with_group_id(key, group_id)
-                )
-            ]
-            if any(b.ref_cnt for b in blocks):
-                # Another request runs past it.
-                skips["in use"] += 1
-                continue
-            if any(pool.cached_block_hashes_by_block.get(b.block_id) for b in blocks):
-                skips["other key"] += 1
-                continue
-            checkpoints.release(key)
-            pruned = sum(b.block_hash is None for b in blocks)
-            skips["pruned" if pruned else "not uncached"] += 1
-            self.num_gpu_states_pruned += pruned
-        total = sum(skips.values())
-        if total >= self._prune_skips_logged + 2000:
-            # Debugging: why finished chains' states stay on the GPU.
-            self._prune_skips_logged = total
-            logger.info("GPU state pruning, by outcome: %s", dict(skips))
+            blocks: list[KVCacheBlock] = []
+            if outcome is None:
+                blocks = [
+                    block
+                    for group_id in self.mamba_gids
+                    for block in gpu.get_all_blocks(
+                        make_block_hash_with_group_id(key, group_id)
+                    )
+                ]
+                if any(b.ref_cnt for b in blocks):
+                    # Another request runs past it.
+                    outcome = "in use"
+                elif any(
+                    pool.cached_block_hashes_by_block.get(b.block_id) for b in blocks
+                ):
+                    outcome = "other key"
+            if outcome in ("held", "needed", "in use"):
+                waited = self._prune_waits.get(key, 0) + 1
+                if waited < _PRUNE_RETRY_STEPS:
+                    self._prune_waits[key] = waited
+                    retry[key] = None
+                    continue
+            self._prune_waits.pop(key, None)
+            if outcome is None:
+                checkpoints.release(key)
+                pruned = sum(b.block_hash is None for b in blocks)
+                outcome = "pruned" if pruned else "not uncached"
+                self.num_gpu_states_pruned += pruned
+            outcomes[outcome] += 1
+        self._prune_pending.extend(retry)
 
-    def _session_units(self, request: "Request") -> list[tuple[int, BlockHash]]:
+    def _session_units(
+        self, request: "Request", loop_start: int
+    ) -> list[tuple[int, BlockHash]]:
         """The hash units a finished request's session owns: its block
         boundaries (pages and the states there), the hash units inside the
-        last blocks of its prompt and of its end (partial pages, the prompt
-        tail's state), and its exact-end state."""
+        last blocks of its prompt, of its end and of its loop's start (partial
+        pages, the prompt tails' states), and its exact-end state."""
         unit, block_size = self.hash_block_size, self.block_size
         hashes = request.block_hashes
         end = _end(request)
@@ -1026,7 +1158,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             for i in range(1, end // block_size + 1)
             if i * self.units_per_block <= len(hashes)
         ]
-        for last in {min(end, request.num_prompt_tokens), end}:
+        for last in {loop_start, min(end, request.num_prompt_tokens), end}:
             start = last // block_size * block_size
             for position in range(start + unit, last + 1, unit):
                 if position // unit <= len(hashes):
@@ -1061,11 +1193,15 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self._release(restore)
         self._unsent = []
         self.ram_frontiers.clear()
-        self._floors.clear()
+        self._kept.clear()
+        self._kept_by.clear()
+        self._superseded.clear()
+        self._extends_end.clear()
         if self.ram_policy is not None:
             self.ram_policy.reset()
         self._waiting_since.clear()
         self._prune_pending.clear()
+        self._prune_waits.clear()
         if self._restores_by_event:
             super().reset()
             return False
@@ -1074,17 +1210,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     # ------------------------------------------------------------------
     # Measurement: tokens a resume recomputes that it had already seen.
 
-    def _remember_end(self, request: "Request") -> BlockHash | None:
-        """Remember the end a finished request reached, and its prompt's end:
-        a reasoning model's next turn drops the reasoning, so it extends only
-        the prompt. Returns the end's key, its session's."""
+    def _remember_end(self, request: "Request", loop_start: int) -> BlockHash | None:
+        """Remember the end a finished request reached, its prompt's end and
+        its loop's start: a reasoning model's next turn drops the reasoning
+        after a user prompt, so it extends only the prompt that began the
+        loop. Returns the end's key, its session's."""
         end = _end(request)
         key = self._remember(request, end)
-        prompt = min(end, request.num_prompt_tokens)
-        if key is not None and prompt < end:
-            prompt_key = self._remember(request, prompt)
-            if prompt_key is not None:
-                self._session_of[prompt_key] = key
+        if key is None:
+            return None
+        for last in {min(end, request.num_prompt_tokens), loop_start}:
+            if last < end:
+                prompt_key = self._remember(request, last)
+                if prompt_key is not None:
+                    self._session_of[prompt_key] = key
         return key
 
     def _remember(self, request: "Request", num_tokens: int) -> BlockHash | None:
@@ -1107,30 +1246,47 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         suffix = tuple(request.all_token_ids[start:num_tokens])
         self._seen_ends.add(_Unit(key, anchor, num_tokens, suffix, ()))
         self._seen_tails[key] = tuple(request.all_token_ids[h * unit : num_tokens])
+        if h:
+            # A turn that parts inside the end's own hash unit shares only
+            # the unit before it.
+            previous = request.block_hashes[h - 2] if h > 1 else None
+            self._seen_by_previous.setdefault(previous, {})[key] = tuple(
+                request.all_token_ids[(h - 1) * unit : num_tokens]
+            )
+            self._previous_of[key] = previous
         self._seen_order[key] = None
         while len(self._seen_order) > _MAX_SEEN_ENDS:
             oldest, _ = self._seen_order.popitem(last=False)
             self._seen_ends.remove(oldest)
             self._seen_tails.pop(oldest, None)
             self._session_of.pop(oldest, None)
+            if oldest in self._previous_of:
+                previous = self._previous_of.pop(oldest)
+                by_previous = self._seen_by_previous[previous]
+                del by_previous[oldest]
+                if not by_previous:
+                    del self._seen_by_previous[previous]
         return key
 
-    def _seen_end(self, request: "Request") -> tuple[int, BlockHash | None]:
+    def _seen_end(self, request: "Request") -> tuple[int, BlockHash | None, bool]:
         """How far `request` shares an end (or prompt end) a finished request
-        reached, and that end's session's key: the end it extends, or else
-        the deepest end whose hash unit it shares, up to where they part. A
-        reasoning model's next turn parts from the previous prompt a few
-        tokens before its end: that prompt ended with the generation prefix,
-        which the next turn renders without."""
+        reached, that end's session's key, and whether it extends the end
+        itself: the end it extends, or else the deepest end whose hash unit
+        it shares, up to where they part. A reasoning model's next turn parts
+        from the previous prompt a few tokens before its end: that prompt
+        ended with the generation prefix, which the next turn renders
+        without."""
         frontiers = None if self._checkpoints is None else self._checkpoints.frontiers
         if frontiers is None or not self._seen_ends.entries:
-            return 0, None
+            return 0, None, False
         unit = self.hash_block_size
         hashes = request.block_hashes
         tokens = request.all_token_ids
         for h in range(min(request.num_tokens // unit, len(hashes)), -1, -1):
-            lengths = self._seen_ends.index.get(hashes[h - 1] if h else None)
-            if not lengths:
+            anchor = hashes[h - 1] if h else None
+            lengths = self._seen_ends.index.get(anchor) or {}
+            parted = self._seen_by_previous.get(anchor, {})
+            if not lengths and not parted:
                 continue
             for num_tokens in sorted(lengths, reverse=True):
                 if num_tokens > request.num_tokens:
@@ -1141,24 +1297,34 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     continue
                 key = frontier_key(frontiers.hash_fn, request, num_tokens, unit)
                 if key in keys:
-                    return num_tokens, self._session_of.get(key, key)
-            # No end here that it extends: the one it shares most of.
+                    session = self._session_of.get(key)
+                    return num_tokens, session or key, session is None
+            # No end here that it extends: the one it shares most of, its own
+            # hash unit's or (parted inside it) the next one's.
             best, best_key = -1, None
             ours = tokens[h * unit : h * unit + unit]
-            for by_suffix in lengths.values():
-                for keys in by_suffix.values():
-                    for key in keys:
-                        tail = self._seen_tails.get(key, ())
-                        shared = 0
-                        for mine, theirs in zip(ours, tail):
-                            if mine != theirs:
-                                break
-                            shared += 1
-                        if shared > best:
-                            best, best_key = shared, key
+            tails = [
+                (key, self._seen_tails.get(key, ()))
+                for by_suffix in lengths.values()
+                for keys in by_suffix.values()
+                for key in keys
+            ]
+            tails.extend(parted.items())
+            for key, tail in tails:
+                shared = 0
+                for mine, theirs in zip(ours, tail):
+                    if mine != theirs:
+                        break
+                    shared += 1
+                if shared > best:
+                    best, best_key = shared, key
             if best_key is not None:
-                return h * unit + best, self._session_of.get(best_key, best_key)
-        return 0, None
+                return (
+                    h * unit + best,
+                    self._session_of.get(best_key, best_key),
+                    False,
+                )
+        return 0, None, False
 
     def observe_admission(self, request: "Request", num_computed_tokens: int) -> None:
         """Record how many tokens the admitted request recomputes that a
@@ -1169,11 +1335,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._observed.add(request_id)
         restored = request_id in self._admitted_from_ram
         self._admitted_from_ram.discard(request_id)
-        seen, key = self._seen_end(request)
+        seen, key, extends_end = self._seen_end(request)
         if key is None:
             return
         # The session resumed, whichever tier holds it.
         self._resumed_from[request_id] = key
+        if extends_end:
+            self._extends_end.add(request_id)
         if self.ram_policy is not None:
             self.ram_policy.resumed(key)
         tier = "ram" if restored else "gpu" if num_computed_tokens else "cold"
@@ -1217,12 +1385,34 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         if pruned > 0:
             stats.increase_counter(TieredMetricName.GPU_STATES_PRUNED, pruned, ())
         self._gpu_states_pruned_snapshot = self.num_gpu_states_pruned
+        for outcome, count in self.prune_outcomes.items():
+            delta = count - self._prune_outcomes_snapshot[outcome]
+            if delta > 0:
+                stats.increase_counter(
+                    TieredMetricName.GPU_STATE_PRUNES, delta, (outcome,)
+                )
+        self._prune_outcomes_snapshot = Counter(self.prune_outcomes)
+        dropped = self.num_ram_states_dropped - self._ram_states_dropped_snapshot
+        if dropped > 0:
+            stats.increase_counter(TieredMetricName.RAM_STATES_DROPPED, dropped, ())
+        self._ram_states_dropped_snapshot = self.num_ram_states_dropped
+        pool = self._gpu_block_pool
+        if pool is not None:
+            stats.set_gauge(
+                TieredMetricName.GPU_STATE_BLOCKS,
+                sum(
+                    block.block_hash is not None
+                    and get_group_id(block.block_hash) in self._mamba_gid_set
+                    for block in pool.blocks
+                ),
+            )
         if self.ram_policy is not None:
             current, previous = self.ram_policy.stats, self._ram_evictions_snapshot
             for kind, field_name in (
                 ("orphan", "orphans"),
                 ("session", "session_blocks"),
                 ("dead", "dead"),
+                ("unranked", "unranked"),
             ):
                 delta = getattr(current, field_name) - getattr(previous, field_name)
                 if delta > 0:

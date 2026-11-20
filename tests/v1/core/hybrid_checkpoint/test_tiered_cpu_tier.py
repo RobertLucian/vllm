@@ -5,6 +5,7 @@ that extends a small GPU pool resumes every session where a GPU that never
 evicts would, its exact end included. The device checks every state a
 request reads and every state cached or restored."""
 
+import itertools
 import random
 
 import pytest
@@ -42,6 +43,8 @@ def make_engine(
     num_blocks: int = 90,
     num_cpu_blocks: int | None = 400,
     ram_eviction: str = "lru",
+    ram_state_spacing_blocks: int = 8,
+    copy_ahead_blocks: int = 0,
 ) -> Engine:
     """The tiered connector with a RAM pool of `num_cpu_blocks`, or (None) no
     connector."""
@@ -61,7 +64,12 @@ def make_engine(
         kv_transfer_config=(
             None
             if num_cpu_blocks is None
-            else tiered_cpu_connector(num_cpu_blocks, ram_eviction)
+            else tiered_cpu_connector(
+                num_cpu_blocks,
+                ram_eviction,
+                ram_state_spacing_blocks,
+                copy_ahead_blocks,
+            )
         ),
     )
     device = Device(scheduler, num_drafts=DRAFTS, truncate=True, accept=default_accept)
@@ -308,23 +316,32 @@ def _boundary_states(engine: Engine, request_id: str) -> list[int]:
     return held
 
 
-def test_a_finished_session_keeps_only_its_resume_states_on_the_gpu():
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_a_finished_session_keeps_only_its_resume_states_on_the_gpu(
+    async_scheduling: bool, hash_block_size: int
+):
     """The GPU holds a state at the block boundaries its prefill chunks ended
     at. Once the request finishes, it keeps those RAM would keep (every 8th
     block, the last boundaries before its prompt end and its end) and
     releases the rest; a GPU without the tier keeps them all. The next turn
     still resumes at the exact end."""
-    engine = make_engine(False, BLOCK, num_blocks=400)
-    roomy = roomy_engine(False, BLOCK)
+    engine = make_engine(async_scheduling, hash_block_size, num_blocks=400)
+    roomy = roomy_engine(async_scheduling, hash_block_size)
     tokens = prompt(11, 1500)
     for e in (engine, roomy):
         e.add("p0", tokens, 40)
         e.run("p0")
     prompt_floor, end_floor = 1500 // BLOCK, (1500 + 39) // BLOCK
-    kept = {8, 16, prompt_floor, end_floor}
+    # Finer hashing caches the prompt tail inside the last prompt block
+    # instead of a state at its boundary.
+    held = set(_boundary_states(roomy, "p0"))
+    kept = {8, 16, prompt_floor, end_floor} & held
     assert _boundary_states(engine, "p0") == sorted(kept)
-    assert set(_boundary_states(roomy, "p0")) - kept
-    assert manager(engine).num_gpu_states_pruned > 0
+    assert held - kept
+    tier = manager(engine)
+    assert tier.num_gpu_states_pruned > 0
+    assert tier.prune_outcomes["pruned"] == len(held - kept)
     nxt = list(engine.requests["p0"].all_token_ids) + prompt(12, 40)
     for e in (engine, roomy):
         e.add("p1", nxt, 17)
@@ -349,4 +366,138 @@ def test_a_turn_that_diverges_mid_session_resumes_at_the_nearest_kept_state():
         e.run("d1")
     assert roomy.admissions["d1"][0] == before * BLOCK > 16 * BLOCK
     assert engine.admissions["d1"][0] == 16 * BLOCK
+    assert_nothing_lost(engine)
+
+
+def _ram_states(engine: Engine, request_id: str) -> list[int]:
+    """The block boundaries of `request_id`'s chain whose state RAM holds in
+    some Mamba group."""
+    tier = manager(engine)
+    request = engine.requests[request_id]
+    per_block = BLOCK // engine.scheduler.hash_block_size
+    cpu = tier.cpu_block_pool.cached_block_hash_to_block
+    held = []
+    for i in range(1, len(request.block_hashes) // per_block + 1):
+        key = request.block_hashes[i * per_block - 1]
+        if any(
+            cpu.get_one_block(make_block_hash_with_group_id(key, group_id))
+            for group_id in tier.mamba_gids
+        ):
+            held.append(i)
+    return held
+
+
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_a_tool_loop_keeps_only_its_latest_turn_and_loop_start_points(
+    async_scheduling: bool, hash_block_size: int
+):
+    """Each turn of a tool loop extends the previous turn's end. The GPU then
+    keeps the states at the last boundaries before the latest turn's prompt
+    end and end and before the loop's first prompt end, and no others: the
+    points earlier turns kept go once the next turn finishes."""
+    engine = make_engine(
+        async_scheduling, hash_block_size, num_blocks=400, ram_state_spacing_blocks=0
+    )
+    roomy = roomy_engine(async_scheduling, hash_block_size)
+    tokens = prompt(21, 700)
+    for turn in range(5):
+        request_id = f"l{turn}"
+        for e in (engine, roomy):
+            e.add(request_id, tokens, 40)
+            e.run(request_id)
+        assert engine.admissions[request_id][0] == roomy.admissions[request_id][0]
+        tokens = list(engine.requests[request_id].all_token_ids) + prompt(
+            30 + turn, 150
+        )
+    request = engine.requests[request_id]
+    end = len(request.all_token_ids) - 1
+    points = {700 // BLOCK, request.num_prompt_tokens // BLOCK, end // BLOCK}
+    held = set(_boundary_states(roomy, request_id))
+    assert set(_boundary_states(engine, request_id)) == points & held
+    assert manager(engine).prune_outcomes["pruned"] > 0
+    assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize(
+    ("ram_eviction", "num_cpu_blocks"), [("gdsf", 48), ("lru", 400)]
+)
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_a_user_prompt_after_a_tool_loop_resumes_at_the_loop_start(
+    async_scheduling: bool, ram_eviction: str, num_cpu_blocks: int
+):
+    """A reasoning model's template drops a tool loop's reasoning once a user
+    prompt follows, so that turn parts from its session a few tokens before
+    the end of the prompt that began the loop. Two sessions take turns
+    through a GPU too small for both, loop after loop. With room in RAM every
+    turn resumes as deep as on a GPU that never evicts; with RAM full under
+    GDSF none resumes more than a block short of that (the policy gives up
+    the cheapest tail, an exact end, first). RAM holds no state where
+    neither session resumes."""
+    slack = 0 if ram_eviction == "lru" else BLOCK
+    hash_block_size = BLOCK // 4
+    engine = make_engine(
+        async_scheduling,
+        hash_block_size,
+        num_blocks=36,
+        num_cpu_blocks=num_cpu_blocks,
+        ram_eviction=ram_eviction,
+        ram_state_spacing_blocks=0,
+    )
+    roomy = roomy_engine(async_scheduling, hash_block_size)
+    sessions = {s: prompt(40 + s, 400) for s in range(2)}
+    loop_starts = {s: 400 for s in range(2)}
+    latest: dict[int, str] = {}
+    for loop in range(4):
+        began = dict(loop_starts)
+        for turn in range(3):
+            for s in range(2):
+                request_id = f"s{s}l{loop}t{turn}"
+                for e in (engine, roomy):
+                    e.add(request_id, sessions[s], 20)
+                    e.run(request_id)
+                short = (
+                    roomy.admissions[request_id][0] - engine.admissions[request_id][0]
+                )
+                assert 0 <= short <= slack, (request_id, short)
+                latest[s] = request_id
+                # A tool turn: the reply stays and a tool result follows.
+                seed = 1000 + 100 * s + 10 * loop + turn
+                sessions[s] = list(engine.requests[request_id].all_token_ids) + prompt(
+                    seed, 40
+                )
+        for s in range(2):
+            # A user prompt: the loop renders again without its reasoning,
+            # from 3 tokens before the end of the prompt that began it.
+            seed = 5000 + 100 * s + 10 * loop
+            sessions[s] = (
+                sessions[s][: loop_starts[s] - 3]
+                + prompt(seed, 60)
+                + prompt(seed + 1, 50)
+            )
+            loop_starts[s] = len(sessions[s])
+    tier = manager(engine)
+    for s, request_id in latest.items():
+        request = engine.requests[request_id]
+        end = len(request.all_token_ids) - 1
+        points = {began[s] // BLOCK, request.num_prompt_tokens // BLOCK, end // BLOCK}
+        assert set(_ram_states(engine, request_id)) <= points, request_id
+    assert tier.num_ram_states_dropped > 0
+    assert_nothing_lost(engine)
+
+
+def test_copy_ahead_keeps_the_eviction_end_copied():
+    """With `copy_ahead_blocks` the walk keeps that many blocks at the GPU's
+    eviction end copied (or droppable), so an allocation that takes them,
+    a restore's most of all, never waits for a copy."""
+    engine = make_engine(False, BLOCK, num_blocks=90, copy_ahead_blocks=40)
+    rotate(engine)
+    # An idle step lets the walk cover the blocks the last turns freed.
+    engine.step()
+    engine.step()
+    tier = manager(engine)
+    pool = engine.scheduler.kv_cache_manager.block_pool
+    ahead = list(itertools.islice(pool.free_block_queue.iter_blocks_after(None), 40))
+    assert len(ahead) == 40
+    assert not [b.block_id for b in ahead if tier.needs_spill(b)]
     assert_nothing_lost(engine)
