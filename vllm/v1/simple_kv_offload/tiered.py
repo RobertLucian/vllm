@@ -25,7 +25,7 @@ across the tiers in any order resumes whole.
 
 import bisect
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -70,9 +70,14 @@ RAM_EVICTION_POLICIES = ("lru", "gdsf")
 _MIN_RESTORE_GAIN_TOKENS = 64
 # Restores admitted no later than this pin their blocks; then the pins go.
 _PIN_TIMEOUT_S = 30.0
-# A request waits at most this long for room to restore into, then resumes
-# from the GPU alone.
-_MAX_RESTORE_WAIT_S = 10.0
+# A request waits this long for room to restore into, then resumes from the
+# GPU alone. With a prefill cost model the wait grows with the prefill the
+# restore saves (`_RESTORE_WAIT_SHARE` of it), up to `_MAX_RESTORE_WAIT_S`,
+# and so does the pin timeout: a 120k-token session takes minutes to prefill
+# again, far longer than its blocks take to free up and load.
+_MIN_RESTORE_WAIT_S = 10.0
+_MAX_RESTORE_WAIT_S = 120.0
+_RESTORE_WAIT_SHARE = 0.5
 # Finished requests' ends remembered to measure resumes against, and the
 # block-boundary states RAM keeps as their resume points.
 _MAX_SEEN_ENDS = 65536
@@ -176,6 +181,8 @@ class _Plan:
     frontier: _Unit | None = None
     # Mamba state keys (and the length they hold) the point resumes at.
     state: tuple[BlockHash, int] | None = None
+    # Where the request would resume from the GPU alone.
+    gpu_only_tokens: int = 0
 
     @property
     def on_gpu_only(self) -> bool:
@@ -192,6 +199,7 @@ class _Restore:
     pinned: list[KVCacheBlock]
     frontier: _Unit | None
     state: tuple[BlockHash, int] | None
+    pin_timeout_s: float = _PIN_TIMEOUT_S
     event: int = -1
     done: bool = False
     done_at: float = 0.0
@@ -244,6 +252,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             raise ValueError("ram_state_spacing_blocks must be at least 1")
         self.ram_eviction = ram_eviction
         self.prefill_cost_coefficients = prefill_cost_coefficients
+        self._cost = (
+            PrefillCostModel(*prefill_cost_coefficients[:2])
+            if prefill_cost_coefficients and len(prefill_cost_coefficients) >= 2
+            else None
+        )
         self.frequency_half_life_s = frequency_half_life_s
         groups = self.cpu_kv_cache_config.kv_cache_groups
         self.mamba_gids = [
@@ -259,6 +272,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         # The GPU keeps the same block-boundary states of a finished request's
         # chain; the others go when it finishes (`_prune_gpu_states`).
         self.prune_gpu_states = prune_gpu_states
+        # Finished chains' state keys, pruned once their requests' blocks are
+        # free (the scheduler frees them after `request_finished`).
+        self._prune_pending: list[BlockHash] = []
+        self._prune_skips: Counter[str] = Counter()
+        self._prune_skips_logged = 0
         self.num_gpu_states_pruned = 0
         self._gpu_states_pruned_snapshot = 0
         self._kv_cache_manager: KVCacheManager | None = None
@@ -296,9 +314,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 raise ValueError(
                     "ram_eviction='gdsf' needs prefill_cost_coefficients [D, E]"
                 )
+            assert self._cost is not None
             self.ram_policy = RamGreedyDualSizeFrequency(
                 self.cpu_block_pool,
-                cost=PrefillCostModel(*prefill_cost_coefficients[:2]),
+                cost=self._cost,
                 page_group_id=self.fa_gidx,
                 state_group_ids=[
                     g for g in self.prefix_cacheable_group_ids if g != self.fa_gidx
@@ -547,6 +566,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             return None, False
         num_blocks = len(loads)
         stats = self.restore_stats
+        wait_s = self._restore_wait_s(plan)
         if (
             self._num_pinned
             and self._num_pinned + num_blocks + len(pinned) > self._max_pinned
@@ -554,12 +574,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # Restores that wait for admission already pin their share; a
             # restore alone may pin a whole session.
             stats.waited_cap += 1
-            return self._wait(request_id)
+            return self._wait(request_id, wait_s)
         # Blocks pinned below leave the free queue: they are not safe to take.
         if pool.num_spill_safe_free_blocks(num_blocks, exclude=pinned) < num_blocks:
             stats.waited_guard += 1
             self.on_allocation_held(num_blocks)
-            return self._wait(request_id)
+            return self._wait(request_id, wait_s)
         self._waiting_since.pop(request_id, None)
         pool.touch(pinned)
         gpu_blocks = pool.get_new_blocks(num_blocks)
@@ -571,6 +591,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             pinned,
             plan.frontier,
             plan.state,
+            pin_timeout_s=max(_PIN_TIMEOUT_S, wait_s),
         )
         self._restores[request_id] = restore
         self._unsent.append(restore)
@@ -579,11 +600,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         stats.started += 1
         return None, False
 
-    def _wait(self, request_id: str) -> tuple[int | None, bool]:
-        """Wait a step for room to restore into, at most _MAX_RESTORE_WAIT_S."""
+    def _wait(self, request_id: str, wait_s: float) -> tuple[int | None, bool]:
+        """Wait a step for room to restore into, `wait_s` in all at most."""
         now = time.monotonic()
         since = self._waiting_since.setdefault(request_id, now)
-        if now - since < _MAX_RESTORE_WAIT_S:
+        if now - since < wait_s:
             return None, False
         self._waiting_since.pop(request_id, None)
         self.restore_stats.gave_up += 1
@@ -609,7 +630,19 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         gpu_only = 0 if plan is None else plan.num_tokens
         if deepest.num_tokens - gpu_only < _MIN_RESTORE_GAIN_TOKENS:
             return None
+        deepest.gpu_only_tokens = gpu_only
         return deepest
+
+    def _restore_wait_s(self, plan: _Plan) -> float:
+        """How long `plan`'s request may wait for room to restore into, and
+        its restored blocks stay pinned for admission: a share of the prefill
+        the restore saves (`_RESTORE_WAIT_SHARE`), within bounds."""
+        if self._cost is None:
+            return _MIN_RESTORE_WAIT_S
+        saved = self._cost.seconds(plan.gpu_only_tokens, plan.num_tokens)
+        return min(
+            _MAX_RESTORE_WAIT_S, max(_MIN_RESTORE_WAIT_S, _RESTORE_WAIT_SHARE * saved)
+        )
 
     def _resume_points(self, request: "Request") -> Iterator[_Plan]:
         """Points `request` can resume at with blocks from either tier,
@@ -739,6 +772,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self, scheduler_output: "SchedulerOutput"
     ) -> SimpleCPUOffloadMetadata:
         meta = super().build_connector_meta(scheduler_output)
+        self._apply_prunes()
         self._expire_pins()
         if not self._unsent:
             return meta
@@ -860,7 +894,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _expire_pins(self) -> None:
         now = time.monotonic()
         for restore in list(self._restores.values()):
-            if restore.done and now - restore.done_at > _PIN_TIMEOUT_S:
+            if restore.done and now - restore.done_at > restore.pin_timeout_s:
                 self.restore_stats.pin_timeouts += 1
                 self._release(restore)
 
@@ -910,30 +944,50 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         its end, and each takes a block per Mamba group until the GPU's LRU
         order reaches it, which ranks them by age across sessions, not by use.
         Kept: spaced states, floors, branch points, states in use or where a
-        waiting request resumes, and blocks that carry another key."""
-        checkpoints = self._checkpoints
-        pool = self._gpu_block_pool
-        if not self.prune_gpu_states or checkpoints is None or pool is None:
+        waiting request resumes, and blocks that carry another key.
+
+        The request still holds its blocks here (the scheduler frees them
+        after `request_finished`), and a state in use cannot be released: its
+        keys wait for the next step (`_apply_prunes`)."""
+        if not self.prune_gpu_states or self._checkpoints is None:
             return
-        graph = checkpoints.graph
         hashes, per_block = request.block_hashes, self.units_per_block
-        waiting = set(checkpoints._resume.values())
-        gpu = pool.cached_block_hash_to_block
         for i in range(1, _end(request) // self.block_size + 1):
             if i * per_block > len(hashes):
                 break
-            if not (i * self.block_size) % self._state_spacing:
-                continue
-            key = hashes[i * per_block - 1]
+            if (i * self.block_size) % self._state_spacing:
+                self._prune_pending.append(hashes[i * per_block - 1])
+
+    def _apply_prunes(self) -> None:
+        """Release the pending states (`_prune_gpu_states`) nothing holds."""
+        checkpoints = self._checkpoints
+        pool = self._gpu_block_pool
+        pending, self._prune_pending = self._prune_pending, []
+        if not pending or checkpoints is None or pool is None:
+            return
+        graph = checkpoints.graph
+        waiting = set(checkpoints._resume.values())
+        gpu = pool.cached_block_hash_to_block
+        skips = self._prune_skips
+        for key in pending:
             unit = graph.units.get(key)
-            if (
-                unit is None
-                or unit.frontier
-                or unit.is_branch_point
-                or key in self._floors
-                or checkpoints.held(key)
-                or checkpoints._needed(key, waiting)
-            ):
+            skip = (
+                "no unit"
+                if unit is None
+                else "frontier"
+                if unit.frontier
+                else "branch point"
+                if unit.is_branch_point
+                else "floor"
+                if key in self._floors
+                else "held"
+                if checkpoints.held(key)
+                else "needed"
+                if checkpoints._needed(key, waiting)
+                else None
+            )
+            if skip is not None:
+                skips[skip] += 1
                 continue
             blocks = [
                 block
@@ -942,10 +996,22 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     make_block_hash_with_group_id(key, group_id)
                 )
             ]
+            if any(b.ref_cnt for b in blocks):
+                # Another request runs past it.
+                skips["in use"] += 1
+                continue
             if any(pool.cached_block_hashes_by_block.get(b.block_id) for b in blocks):
+                skips["other key"] += 1
                 continue
             checkpoints.release(key)
-            self.num_gpu_states_pruned += sum(b.block_hash is None for b in blocks)
+            pruned = sum(b.block_hash is None for b in blocks)
+            skips["pruned" if pruned else "not uncached"] += 1
+            self.num_gpu_states_pruned += pruned
+        total = sum(skips.values())
+        if total >= self._prune_skips_logged + 2000:
+            # Debugging: why finished chains' states stay on the GPU.
+            self._prune_skips_logged = total
+            logger.info("GPU state pruning, by outcome: %s", dict(skips))
 
     def _session_units(self, request: "Request") -> list[tuple[int, BlockHash]]:
         """The hash units a finished request's session owns: its block
@@ -999,6 +1065,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         if self.ram_policy is not None:
             self.ram_policy.reset()
         self._waiting_since.clear()
+        self._prune_pending.clear()
         if self._restores_by_event:
             super().reset()
             return False
