@@ -108,6 +108,18 @@ def test_agents_share_a_prefill_cap_while_a_chat_prefills(prefill_cap: int):
     assert step(scheduler) == {"chat": 1, "a1": 128, "a2": 127}
 
 
+def test_a_waiting_chats_chunk_comes_out_of_the_step_first():
+    """The running agents are scheduled before the waiting chat: a cap of 200
+    alone would leave the chat 56 of the step's 256 tokens. Its 128-token
+    chunk is kept for it, so the agents share what is left."""
+    scheduler = make(prefill_cap=200)
+    add(scheduler, "a1", AGENT, 1000, 1.0)
+    add(scheduler, "a2", AGENT, 1000, 2.0)
+    step(scheduler)
+    add(scheduler, "chat", CHAT, 300, 3.0)
+    assert step(scheduler) == {"a1": 128, "chat": 128}
+
+
 def test_a_chat_has_its_own_long_prefill_threshold():
     scheduler = make(prefill_cap=128, urgent_threshold=256, budget=512)
     add(scheduler, "a1", AGENT, 1000, 1.0)

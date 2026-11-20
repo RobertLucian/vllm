@@ -870,11 +870,18 @@ class Scheduler(SchedulerInterface):
         )
         # While a request of priority 0 or less waits or prefills, the others
         # share this many prefill tokens, and its own prefill is not deferred.
-        low_prefill_left: int | None = (
-            self.low_priority_prefill_tokens
-            if self.low_priority_prefill_tokens and self._urgent_demand()
-            else None
-        )
+        # Running requests are scheduled before waiting ones: a waiting urgent
+        # request's chunk and the running decodes come out of the step first.
+        low_prefill_left: int | None = None
+        if self.low_priority_prefill_tokens and self._urgent_demand():
+            reserved = self._urgent_waiting_chunk(
+                urgent_long_prefill_threshold or token_budget
+            ) + sum(
+                1 + self.num_spec_tokens for r in self.running if not r.is_prefill_chunk
+            )
+            low_prefill_left = max(
+                0, min(self.low_priority_prefill_tokens, token_budget - reserved)
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -3293,6 +3300,17 @@ class Scheduler(SchedulerInterface):
         if any(r.priority <= 0 and r.is_prefill_chunk for r in self.running):
             return True
         return bool(self.waiting) and self.waiting.peek_request().priority <= 0
+
+    def _urgent_waiting_chunk(self, threshold: int) -> int:
+        """The first chunk the waiting queue's head takes if it is urgent: its
+        whole remaining prompt up to `threshold` (its prefix-cache hit is not
+        known before its lookup), else 0."""
+        if not self.waiting:
+            return 0
+        head = self.waiting.peek_request()
+        if head.priority > 0:
+            return 0
+        return min(head.num_tokens - head.num_computed_tokens, threshold)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
