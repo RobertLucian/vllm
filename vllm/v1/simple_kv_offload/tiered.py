@@ -1084,7 +1084,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _apply_prunes(self) -> None:
         """Release the pending states (`_prune_gpu_states`) nothing holds. A
         state a request holds stays pending for up to `_PRUNE_RETRY_STEPS`
-        steps. `prune_outcomes` counts each state's outcome once."""
+        steps. `prune_outcomes` counts each state's outcome once.
+
+        The checkpoint graph lets a superseded boundary state go while the
+        running request still holds its blocks; they stay cached on the GPU
+        with no unit. Such a state is evicted from the GPU cache directly
+        ("pruned untracked"); a tracked one is released through the graph."""
         checkpoints = self._checkpoints
         pool = self._gpu_block_pool
         pending, self._prune_pending = self._prune_pending, []
@@ -1098,12 +1103,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         for key in dict.fromkeys(pending):
             unit = graph.units.get(key)
             outcome = (
-                "no unit"
-                if unit is None
-                else "frontier"
-                if unit.frontier
-                else "kept"
+                "kept"
                 if key in self._kept
+                else "frontier"
+                if unit is not None and unit.frontier
                 else "branch point"
                 if self._shared(key)
                 else "held"
@@ -1121,7 +1124,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                         make_block_hash_with_group_id(key, group_id)
                     )
                 ]
-                if any(b.ref_cnt for b in blocks):
+                if not blocks:
+                    outcome = "no state"
+                elif any(b.ref_cnt for b in blocks):
                     # Another request runs past it.
                     outcome = "in use"
                 elif any(
@@ -1136,9 +1141,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     continue
             self._prune_waits.pop(key, None)
             if outcome is None:
-                checkpoints.release(key)
+                if unit is not None:
+                    checkpoints.release(key)
+                else:
+                    for block in blocks:
+                        if pool._maybe_evict_cached_block(block):
+                            checkpoints.frontiers.to_front(block)
                 pruned = sum(b.block_hash is None for b in blocks)
-                outcome = "pruned" if pruned else "not uncached"
+                outcome = (
+                    "not uncached"
+                    if not pruned
+                    else "pruned"
+                    if unit is not None
+                    else "pruned untracked"
+                )
                 self.num_gpu_states_pruned += pruned
             outcomes[outcome] += 1
         self._prune_pending.extend(retry)

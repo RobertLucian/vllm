@@ -501,3 +501,64 @@ def test_copy_ahead_keeps_the_eviction_end_copied():
     assert len(ahead) == 40
     assert not [b.block_id for b in ahead if tier.needs_spill(b)]
     assert_nothing_lost(engine)
+
+
+def test_states_the_graph_no_longer_tracks_are_pruned_from_the_gpu_cache():
+    """The checkpoint graph lets a superseded boundary state go while the
+    running request still holds its blocks; they stay cached on the GPU with
+    no unit (production showed only such states). Once the request finishes,
+    pruning evicts them from the GPU cache directly, keeping its resume
+    points."""
+    engine = make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0)
+    roomy = roomy_engine(False, BLOCK)
+    tier = manager(engine)
+    tier.prune_gpu_states = False
+    tokens = prompt(15, 1500)
+    for e in (engine, roomy):
+        e.add("u0", tokens, 40)
+        e.run("u0")
+    request = engine.requests["u0"]
+    checkpoints = engine.scheduler.kv_cache_manager.checkpoints
+    per_block = BLOCK // engine.scheduler.hash_block_size
+    held = set(_boundary_states(engine, "u0"))
+    assert held == set(_boundary_states(roomy, "u0"))
+    points = {1500 // BLOCK, (1500 + 39) // BLOCK} & held
+    stale = [request.block_hashes[i * per_block - 1] for i in sorted(held - points)]
+    assert stale
+    for key in stale:
+        checkpoints.graph.removed(key)
+    # The states are still cached on the GPU, in every Mamba group.
+    assert set(_cached_states(engine, "u0")) == held
+    tier.prune_gpu_states = True
+    tier._prune_pending.extend(stale)
+    engine.add("u1", prompt(16, 30), 4)
+    engine.run("u1")
+    assert set(_cached_states(engine, "u0")) == points
+    assert tier.prune_outcomes["pruned untracked"] == len(stale)
+    nxt = list(request.all_token_ids) + prompt(17, 40)
+    for e in (engine, roomy):
+        e.add("u2", nxt, 17)
+        e.run("u2")
+    assert engine.admissions["u2"][0] == roomy.admissions["u2"][0]
+    assert_nothing_lost(engine)
+
+
+def _cached_states(engine: Engine, request_id: str) -> list[int]:
+    """The block boundaries of `request_id`'s chain whose state the GPU cache
+    holds in every Mamba group, whether the checkpoint graph tracks it."""
+    tier = manager(engine)
+    request = engine.requests[request_id]
+    per_block = BLOCK // engine.scheduler.hash_block_size
+    gpu = engine.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block
+    return [
+        i
+        for i in range(1, len(request.block_hashes) // per_block + 1)
+        if all(
+            gpu.get_one_block(
+                make_block_hash_with_group_id(
+                    request.block_hashes[i * per_block - 1], group_id
+                )
+            )
+            for group_id in tier.mamba_gids
+        )
+    ]
