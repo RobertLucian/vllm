@@ -585,3 +585,126 @@ def test_ram_holds_each_session_once_when_its_blocks_go_back_to_the_gpu():
     assert max(e - r for r, e in zip(resumed, expected)) <= BLOCK + 90
     assert manager(engine).ram_policy.stats.duplicates > 0
     assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_a_restore_that_waits_for_room_keeps_its_place_in_the_queue(
+    async_scheduling: bool,
+):
+    """A turn whose session only RAM holds waits for GPU blocks while a long
+    request holds most of them. It waits as long as that takes instead of
+    resuming from the GPU alone (recomputing what RAM holds), and a request
+    that arrives after it waits behind it until the restore has its blocks,
+    instead of taking the blocks it waits for: as a load that waits for
+    blocks makes the queue behind it wait."""
+    engine = make_engine(async_scheduling, BLOCK, num_blocks=40)
+    engine.add("s0", prompt(1, 1300), 17)
+    engine.run("s0")
+    for s in range(3):
+        engine.add(f"f{s}", prompt(60 + s, 1300), 17)
+        engine.run(f"f{s}")
+    tier = manager(engine)
+    request = engine.requests["s0"]
+    engine.add("long", prompt(70, 1200), 500)
+    while engine.requests["long"].num_output_tokens < 3:
+        engine.step()
+    engine.add("s1", list(request.all_token_ids) + prompt(2, 40), 17)
+    for _ in range(3):
+        engine.step()
+    assert "s1" not in engine.admissions and tier._head is not None
+    engine.add("late", prompt(80, 100), 4)
+    request_ids = ("long", "s1", "late")
+    for _ in range(3000):
+        if all(engine.done(rid) for rid in request_ids):
+            break
+        engine.step()
+        if tier._head is not None and tier._head[0] == "s1":
+            assert "late" not in engine.admissions
+    engine.quiesce()
+    stats = tier.restore_stats
+    assert stats.gave_up == 0 and stats.waited_behind > 0, stats
+    # It resumed from RAM at the previous turn's exact end.
+    assert stats.completed > 0, stats
+    assert engine.admissions["s1"][0] >= len(request.all_token_ids) - 1
+    assert tier._head is None and not tier._head_pins
+    assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+def test_the_prompt_floor_of_a_turn_that_starts_a_loop_outlives_its_run(
+    hash_block_size: int,
+):
+    """The checkpoint graph lets a boundary state go once the request runs
+    past it, and a GPU short of blocks then drops it. The state at the last
+    boundary before the prompt end of a turn that starts a tool loop (a user
+    prompt) is where the user prompt after the loop resumes when the states
+    inside that block are gone: both tiers keep it from the turn's
+    admission, so it is still there when the turn finishes."""
+    engine = make_engine(
+        False, hash_block_size, num_blocks=40, ram_state_spacing_blocks=0
+    )
+    roomy = roomy_engine(False, hash_block_size)
+    tokens = prompt(31, 1000)
+    for e in (engine, roomy):
+        e.add("p0", tokens, 400)
+        e.run("p0")
+    floor = 1000 // BLOCK
+    if floor not in _boundary_states(roomy, "p0"):
+        pytest.skip("the prefill caches no state at the prompt floor")
+    tier = manager(engine)
+    request = engine.requests["p0"]
+    key = request.block_hashes[floor * (BLOCK // hash_block_size) - 1]
+    gpu = engine.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block
+    cpu = tier.cpu_block_pool.cached_block_hash_to_block
+    for group_id in tier.mamba_gids:
+        grouped = make_block_hash_with_group_id(key, group_id)
+        assert gpu.get_one_block(grouped) or cpu.get_one_block(grouped), group_id
+    assert_nothing_lost(engine)
+
+
+def test_ram_never_copies_what_only_superseded_turns_resumed_at():
+    """A tool loop's turns supersede each other: once the next turn finishes,
+    the previous turn's exact end and prompt tail are where nothing resumes.
+    The GPU drops their blocks without a copy, so RAM spends no block (and no
+    eviction of a live session's) on them."""
+    engine = make_engine(
+        False,
+        BLOCK // 4,
+        num_blocks=36,
+        num_cpu_blocks=48,
+        ram_eviction="gdsf",
+        ram_state_spacing_blocks=0,
+    )
+    tier = manager(engine)
+    policy = tier.ram_policy
+    assert policy is not None
+    pool = engine.scheduler.kv_cache_manager.block_pool
+    copied_disowned = []
+    walk = tier._prepare_lazy_store_specs
+
+    def record():
+        specs = walk()
+        for block_id in specs[0]:
+            block = pool.blocks[block_id]
+            extra = pool.cached_block_hashes_by_block.get(block_id, ())
+            if policy.disowned((block.block_hash, *extra)):
+                copied_disowned.append(block_id)
+        return specs
+
+    tier._prepare_lazy_store_specs = record  # type: ignore[method-assign]
+    sessions = {s: prompt(40 + s, 400) for s in range(2)}
+    for loop in range(3):
+        for turn in range(3):
+            for s in range(2):
+                request_id = f"s{s}l{loop}t{turn}"
+                engine.add(request_id, sessions[s], 20)
+                engine.run(request_id)
+                sessions[s] = list(engine.requests[request_id].all_token_ids) + prompt(
+                    1000 + 100 * s + 10 * loop + turn, 40
+                )
+        for s in range(2):
+            seed = 5000 + 100 * s + 10 * loop
+            sessions[s] = sessions[s][:-43] + prompt(seed, 60)
+    assert policy._disowned, "no turn was superseded"
+    assert not copied_disowned
+    assert_nothing_lost(engine)

@@ -173,16 +173,33 @@ def test_at_equal_frequency_the_cheaper_tokens_go_first():
 
 def test_frequency_decays():
     """A was resumed four times three half-lives ago (a count of 0.5 now), B
-    once just now: A goes."""
+    once just now: A goes. Each resumes only at its end, so each is one
+    segment."""
     ram = Ram(32)
-    a, b = two_sessions(ram)
+    a = Session("a", 10 * BLOCK, (10 * BLOCK,))
+    b = Session("b", 10 * BLOCK, (10 * BLOCK,))
+    ram.add(a)
+    ram.add(b)
     for _ in range(4):
         ram.policy.resumed(a.key)
     ram.time += 3 * HALF_LIFE
     ram.policy.resumed(b.key)
     assert ram.policy._freq(ram.policy.sessions[a.key], ram.time) == pytest.approx(0.5)
-    ram.evict(16)
+    # The 6 free blocks, then A's 13.
+    ram.evict(19)
     assert ram.whole(b) and not ram.held(a)
+
+
+def test_sessions_give_up_their_tails_before_a_prefix():
+    """A and B resume at their ends and 8 blocks in. Losing the last two
+    blocks costs a session those two blocks' prefill; losing the state 8
+    blocks in costs it all 8 (no point resumes below). Making room for one
+    session's tail takes both tails, not one session's prefix."""
+    ram = Ram(32)
+    a, b = two_sessions(ram)
+    ram.evict(10)
+    for s in (a, b):
+        assert ram.held(s) == [p for p in range(BLOCK, 8 * BLOCK + 1, BLOCK)]
 
 
 def test_the_next_turn_inherits_the_count_and_retires_the_last():
@@ -265,3 +282,25 @@ def test_a_session_with_nothing_of_its_own_retires():
     assert b.key not in ram.policy.sessions
     assert ram.policy.owners[unit_key("a", BLOCK)] == {a.key}
     assert ram.policy.stats.retired == 1
+
+
+def test_two_keys_at_a_sessions_end_are_one_point():
+    """A's end holds every group's blocks under two keys (an exact-end state
+    and the hash unit there): one resume point, not a segment of its own.
+    A still ranks, below B (resumed three times), and loses its tail first."""
+    ram = Ram(40)
+    a = Session("a", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    a.units.append((10 * BLOCK, BlockHash(b"a:frontier@end")))
+    ram.store(a.blocks())
+    ram.policy.add_session(a.key, a.end, a.units, None)
+    b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    ram.add(b)
+    assert ram.policy._score(ram.policy.sessions[a.key], ram.time) < float("inf")
+    for _ in range(3):
+        ram.policy.resumed(b.key)
+    ram.evict(10)
+    assert ram.whole(b)
+    held = ram.held(a)
+    assert 10 * BLOCK not in held
+    assert set(range(BLOCK, 8 * BLOCK + 1, BLOCK)) <= set(held)
+    assert ram.policy.stats.unranked == 0

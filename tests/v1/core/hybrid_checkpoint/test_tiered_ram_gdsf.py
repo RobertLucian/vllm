@@ -127,13 +127,25 @@ class TailChecker:
         self.violations: list[tuple] = []
         self.evictions = 0
         take_sessions = self.policy._take_sessions
+        prepare_eviction = self.policy.prepare_eviction
+        # One eviction may take sessions' blocks in two passes (the second
+        # with fresh copies too): the victims of both count.
+        self._taken: set[int] = set()
 
-        def checked_take_sessions(take, victims: list[KVCacheBlock], num_blocks):
+        def checked_prepare_eviction(num_blocks: int) -> None:
+            self._taken = set()
+            prepare_eviction(num_blocks)
+
+        def checked_take_sessions(
+            take, may_go, victims: list[KVCacheBlock], num_blocks: int, gone
+        ):
             before = self._needed()
             start = len(victims)
-            take_sessions(take, victims, num_blocks)
-            self._check_tail(before, {b.block_id for b in victims[start:]})
+            take_sessions(take, may_go, victims, num_blocks, gone)
+            self._taken |= {b.block_id for b in victims[start:]}
+            self._check_tail(before, self._taken)
 
+        self.policy.prepare_eviction = checked_prepare_eviction  # type: ignore[method-assign]
         self.policy._take_sessions = checked_take_sessions  # type: ignore[method-assign]
         pool = self.tier.cpu_block_pool
         get_new_blocks = pool.get_new_blocks

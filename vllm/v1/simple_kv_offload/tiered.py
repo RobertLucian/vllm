@@ -13,10 +13,14 @@ sessions resume (`_keep_resume_points`: the last boundaries before the latest
 turn's prompt end and end, and before the prompt that began its tool loop),
 at points several continuations share, and every `ram_state_spacing_blocks`
 blocks if set: a state takes a page of RAM per Mamba group, as much as the
-attention pages of a whole block. When a turn supersedes the one it resumed,
-the states only the older turn resumed at leave both tiers. With
-`prune_gpu_states` the GPU also releases a finished request's other states,
-instead of holding them until its LRU order reaches them.
+attention pages of a whole block. A turn that starts a tool loop keeps the
+state before its prompt end from its admission (`_hold_prefill_points`): the
+GPU would otherwise drop it as the turn runs past it. When a turn supersedes
+the one it resumed, the states only the older turn resumed at leave both
+tiers, and blocks only retired sessions owned are never copied
+(`RamGreedyDualSizeFrequency.disowned`). With `prune_gpu_states` the GPU also
+releases a finished request's other states, instead of holding them until its
+LRU order reaches them.
 
 RAM -> VRAM ("promote, then hit"): before a waiting request's next lookup,
 the connector finds the deepest point the request can resume at with blocks
@@ -24,7 +28,10 @@ from either tier, loads the blocks only RAM holds into GPU blocks, caches them
 under their own keys (re-indexing an exact-end state as a GPU frontier), and
 pins them until the request is admitted. The ordinary GPU lookup then makes
 the hit; no tokens are ever loaded as an external suffix, so a session split
-across the tiers in any order resumes whole.
+across the tiers in any order resumes whole. A request waits for room to
+restore into as long as blocks take to free up, and the requests behind it in
+the queue wait with it (`_behind_head`), as behind a load that waits for
+blocks: resuming from the GPU alone would recompute what RAM holds.
 """
 
 import bisect
@@ -55,6 +62,7 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadWorkerMetadata,
 )
 from vllm.v1.simple_kv_offload.metrics import SimpleCPUOffloadStats, TieredMetricName
+
 from vllm.v1.simple_kv_offload.ram_policy import (
     RamEvictionStats,
     RamGreedyDualSizeFrequency,
@@ -74,15 +82,18 @@ RAM_EVICTION_POLICIES = ("lru", "gdsf")
 # the GPU alone.
 _MIN_RESTORE_GAIN_TOKENS = 64
 # Restores admitted no later than this pin their blocks; then the pins go.
+# With a prefill cost model the pin timeout grows with the prefill the
+# restore saves (`_RESTORE_WAIT_SHARE` of it), up to `_MAX_PIN_TIMEOUT_S`: a
+# 120k-token session takes minutes to prefill again.
 _PIN_TIMEOUT_S = 30.0
-# A request waits this long for room to restore into, then resumes from the
-# GPU alone. With a prefill cost model the wait grows with the prefill the
-# restore saves (`_RESTORE_WAIT_SHARE` of it), up to `_MAX_RESTORE_WAIT_S`,
-# and so does the pin timeout: a 120k-token session takes minutes to prefill
-# again, far longer than its blocks take to free up and load.
-_MIN_RESTORE_WAIT_S = 10.0
-_MAX_RESTORE_WAIT_S = 120.0
+_MAX_PIN_TIMEOUT_S = 120.0
 _RESTORE_WAIT_SHARE = 0.5
+# A request waits for room to restore into for as long as its session is in
+# RAM: resuming from the GPU alone recomputes what RAM holds, in the same GPU
+# blocks the restore waits for. The requests behind it in the queue wait too
+# (`_behind_head`), as a load that waits for blocks makes them wait. This
+# bounds the wait only if blocks never free up.
+_MAX_RESTORE_WAIT_S = 600.0
 # Finished requests' ends remembered to measure resumes against, and the
 # sessions whose resume points the tiers keep.
 _MAX_SEEN_ENDS = 65536
@@ -113,6 +124,8 @@ class RestoreStats:
     # Steps a restore waited for the spill guard, or for the pin cap.
     waited_guard: int = 0
     waited_cap: int = 0
+    # Steps a request waited behind a restore that waits for room.
+    waited_behind: int = 0
     # Requests that resumed from the GPU alone after waiting too long.
     gave_up: int = 0
     # Restores whose request was not admitted before the pins timed out.
@@ -287,6 +300,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._kept_by: OrderedDict[BlockHash, tuple[int, tuple[BlockHash, ...]]] = (
             OrderedDict()
         )
+        # By running request, the points its session will keep that its
+        # prefill computes, and the hash units RAM keeps for it meanwhile
+        # (`_hold_prefill_points`).
+        self._held_points: dict[str, tuple[BlockHash, ...]] = {}
+        self._held_units: dict[str, tuple[BlockHash, ...]] = {}
         # Resume points no live session keeps any more. One stays a point
         # several continuations share only if resumed more than once: its
         # other continuation is usually its own session's past, the turns a
@@ -330,8 +348,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._load_event_pending_counts: dict[int, int] = {}
         self._loading_cpu: set[int] = set()
         self._num_pinned = 0
-        # Request -> when it first waited for room to restore into.
+        # Request -> when it first waited for room to restore into. The first
+        # of them in the queue (its id and queue position), and the RAM blocks
+        # it would load, pinned so that making room does not evict them.
         self._waiting_since: dict[str, float] = {}
+        self._head: tuple[str, tuple[int, float, str]] | None = None
+        self._head_pins: list[KVCacheBlock] = []
+        self._priority_policy = self.vllm_config.scheduler_config.policy == "priority"
         self._observed: set[str] = set()
         # Admitted at a point a restore loaded, until `observe_admission`.
         self._admitted_from_ram: set[str] = set()
@@ -422,8 +445,25 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _restorable(self, block: KVCacheBlock) -> bool:
         """Every key a lookup can use is restored, including keys that end
         inside a block (exact-end and prompt-tail states), except states
-        between resume points (module docstring)."""
-        return block.block_hash is not None and not self._thinned(block)
+        between resume points (module docstring) and what only retired
+        sessions owned (`RamGreedyDualSizeFrequency.disowned`)."""
+        return (
+            block.block_hash is not None
+            and not self._thinned(block)
+            and not self._disowned(block)
+        )
+
+    def _disowned(self, block: KVCacheBlock) -> bool:
+        policy, pool = self.ram_policy, self._gpu_block_pool
+        if policy is None or pool is None:
+            return False
+        assert block.block_hash is not None
+        return policy.disowned(
+            (
+                block.block_hash,
+                *pool.cached_block_hashes_by_block.get(block.block_id, ()),
+            )
+        )
 
     def _spaced(self, num_tokens: int) -> bool:
         """Whether both tiers keep the block-boundary state at `num_tokens`
@@ -487,12 +527,18 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         pool = self._gpu_block_pool
         assert pool is not None
         cpu = self.cpu_block_pool.cached_block_hash_to_block
+        policy = self.ram_policy
         for key in (
             block.block_hash,
             *pool.cached_block_hashes_by_block.get(block.block_id, ()),
         ):
             entry = frontiers.entries.get(get_block_hash(key))
             if entry is None:
+                continue
+            if policy is not None and policy.disowned(
+                make_block_hash_with_group_id(entry.key, g) for g in entry.blocks
+            ):
+                # A state only retired sessions resumed at: never copied.
                 continue
             for group_id in entry.blocks:
                 if (
@@ -535,7 +581,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     or sibling.block_id in self._unpinned_stores
                     or (sibling.ref_cnt and sibling_group != self.fa_gidx)
                     or cpu.get_one_block(key) is not None
-                    or self._thinned(sibling)
+                    or not self._restorable(sibling)
                 ):
                     continue
                 siblings[sibling.block_id] = sibling
@@ -616,19 +662,54 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         """Never an external hit: (None, False) while a restore for the
-        request is pending (the scheduler retries it next step), else
-        (0, False)."""
+        request is pending or the request waits behind one (the scheduler
+        retries it next step), else (0, False)."""
         request_id = request.request_id
         restore = self._restores.get(request_id)
         if restore is not None:
             return (0, False) if restore.done else (None, False)
-        if request.skip_reading_external_kv or self._gpu_block_pool is None:
+        if self._gpu_block_pool is None:
+            return 0, False
+        if self._behind_head(request):
+            self.restore_stats.waited_behind += 1
+            return None, False
+        if request.skip_reading_external_kv:
             return 0, False
         plan = self._plan(request)
         if plan is None:
-            self._waiting_since.pop(request_id, None)
+            self._stop_waiting(request_id)
             return 0, False
         return self._start_restore(request, plan)
+
+    def _queue_position(self, request: "Request") -> tuple[int, float, str]:
+        """Where `request` stands in the scheduler's waiting queue (ties go by
+        request id, as `Request.__lt__` orders them)."""
+        return (
+            request.priority if self._priority_policy else 0,
+            request.arrival_time,
+            request.request_id,
+        )
+
+    def _behind_head(self, request: "Request") -> bool:
+        """Whether `request` comes after a request that waits for room to
+        restore into: it would take the blocks that one waits for."""
+        head = self._head
+        return (
+            head is not None
+            and head[0] != request.request_id
+            and self._queue_position(request) > head[1]
+        )
+
+    def _stop_waiting(self, request_id: str) -> None:
+        self._waiting_since.pop(request_id, None)
+        if self._head is not None and self._head[0] == request_id:
+            self._head = None
+            self._unpin_head()
+
+    def _unpin_head(self) -> None:
+        if self._head_pins:
+            self.cpu_block_pool.free_blocks(self._head_pins)
+            self._head_pins = []
 
     def _start_restore(
         self, request: "Request", plan: _Plan
@@ -643,7 +724,6 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             return None, False
         num_blocks = len(loads)
         stats = self.restore_stats
-        wait_s = self._restore_wait_s(plan)
         if (
             self._num_pinned
             and self._num_pinned + num_blocks + len(pinned) > self._max_pinned
@@ -651,16 +731,25 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # Restores that wait for admission already pin their share; a
             # restore alone may pin a whole session.
             stats.waited_cap += 1
-            return self._wait(request_id, wait_s)
+            return self._wait(request, loads)
         # Blocks pinned below leave the free queue: they are not safe to take.
-        if pool.num_spill_safe_free_blocks(num_blocks, exclude=pinned) < num_blocks:
+        # Once the spill guard lets held allocations go, neither does this one
+        # wait for copies (`KVCacheManager.allocate_slots`).
+        safe = (
+            pool.num_spill_safe_free_blocks(num_blocks, exclude=pinned)
+            if self.holding
+            else pool.get_num_free_blocks() - sum(not b.ref_cnt for b in pinned)
+        )
+        if safe < num_blocks:
             stats.waited_guard += 1
-            self.on_allocation_held(num_blocks)
-            return self._wait(request_id, wait_s)
-        self._waiting_since.pop(request_id, None)
+            if self.holding:
+                self.on_allocation_held(num_blocks - safe)
+            return self._wait(request, loads)
+        self._stop_waiting(request_id)
         pool.touch(pinned)
         gpu_blocks = pool.get_new_blocks(num_blocks)
         self.cpu_block_pool.touch(loads)
+        wait_s = self._restore_wait_s(plan)
         restore = _Restore(
             request_id,
             plan.num_tokens,
@@ -677,15 +766,31 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         stats.started += 1
         return None, False
 
-    def _wait(self, request_id: str, wait_s: float) -> tuple[int | None, bool]:
-        """Wait a step for room to restore into, `wait_s` in all at most."""
+    def _wait(
+        self, request: "Request", loads: list[KVCacheBlock]
+    ) -> tuple[int | None, bool]:
+        """Wait a step for room to restore into (`_MAX_RESTORE_WAIT_S`). The
+        first such request in the queue holds the requests behind it back
+        and pins the RAM blocks it would load."""
+        request_id = request.request_id
         now = time.monotonic()
         since = self._waiting_since.setdefault(request_id, now)
-        if now - since < wait_s:
-            return None, False
-        self._waiting_since.pop(request_id, None)
-        self.restore_stats.gave_up += 1
-        return 0, False
+        if now - since >= _MAX_RESTORE_WAIT_S:
+            self._stop_waiting(request_id)
+            self.restore_stats.gave_up += 1
+            return 0, False
+        head = self._head
+        position = self._queue_position(request)
+        if head is None or head[0] == request_id or position < head[1]:
+            self._unpin_head()
+            self._head = (request_id, position)
+            # The GPU blocks it waits for may need copies in RAM first: it
+            # pins its own only while the rest of RAM still takes those.
+            cpu_pool = self.cpu_block_pool
+            if cpu_pool.get_num_free_blocks() - len(loads) >= len(loads):
+                cpu_pool.touch(loads)
+                self._head_pins = list(loads)
+        return None, False
 
     def _plan(self, request: "Request") -> _Plan | None:
         """The deepest point `request` can resume at with blocks from either
@@ -711,15 +816,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         return deepest
 
     def _restore_wait_s(self, plan: _Plan) -> float:
-        """How long `plan`'s request may wait for room to restore into, and
-        its restored blocks stay pinned for admission: a share of the prefill
-        the restore saves (`_RESTORE_WAIT_SHARE`), within bounds."""
+        """How long `plan`'s restored blocks stay pinned for its request's
+        admission: a share of the prefill the restore saves
+        (`_RESTORE_WAIT_SHARE`), within bounds."""
         if self._cost is None:
-            return _MIN_RESTORE_WAIT_S
+            return _PIN_TIMEOUT_S
         saved = self._cost.seconds(plan.gpu_only_tokens, plan.num_tokens)
-        return min(
-            _MAX_RESTORE_WAIT_S, max(_MIN_RESTORE_WAIT_S, _RESTORE_WAIT_SHARE * saved)
-        )
+        return min(_MAX_PIN_TIMEOUT_S, max(_PIN_TIMEOUT_S, _RESTORE_WAIT_SHARE * saved))
 
     def _resume_points(self, request: "Request") -> Iterator[_Plan]:
         """Points `request` can resume at with blocks from either tier,
@@ -987,7 +1090,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 restore.orphaned = True
                 self.restore_stats.orphaned += 1
                 del self._restores[request_id]
-        self._waiting_since.pop(request_id, None)
+        self._stop_waiting(request_id)
         self._observed.discard(request_id)
         self._admitted_from_ram.discard(request_id)
         parent = self._resumed_from.pop(request_id, None)
@@ -995,11 +1098,19 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         key = self._remember_end(request, loop_start)
         if key is not None:
             self._keep_resume_points(request, key, parent, loop_start)
+        for state in self._held_points.pop(request_id, ()):
+            # Not superseded: no session kept it if this was the last count
+            # (the pruning below lets the GPU's copy go).
+            self._kept[state] -= 1
+            if self._kept[state] <= 0:
+                del self._kept[state]
         self._prune_gpu_states(request)
-        if key is not None and self.ram_policy is not None:
-            self.ram_policy.add_session(
-                key, _end(request), self._session_units(request, loop_start), parent
-            )
+        if self.ram_policy is not None:
+            if key is not None:
+                self.ram_policy.add_session(
+                    key, _end(request), self._session_units(request, loop_start), parent
+                )
+            self.ram_policy.unhold(self._held_units.pop(request_id, ()))
         return super().request_finished(request, block_ids)
 
     def _loop_start(self, request: "Request", parent: BlockHash | None) -> int:
@@ -1046,6 +1157,43 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self._release_resume_points(parent)
         while len(self._kept_by) > _MAX_SEEN_ENDS:
             self._release_resume_points(next(iter(self._kept_by)))
+
+    def _hold_prefill_points(
+        self, request: "Request", parent: BlockHash | None, extends_end: bool
+    ) -> None:
+        """Both tiers keep the states at the last block boundaries before an
+        admitted request's prompt end and its loop's start from now on, not
+        only once it finishes (`_keep_resume_points`): the checkpoint graph
+        lets a boundary state go as the request runs past it, and the GPU then
+        drops it uncopied. Without them its session resumes only near its end,
+        and losing that tail re-reads the session from the start."""
+        if extends_end and parent in self._kept_by:
+            # A tool loop's next turn: its session resumed where the loop
+            # began keeps that point, and its own prompt end is superseded
+            # once it finishes.
+            return
+        prompt = request.num_prompt_tokens
+        hashes, per_block = request.block_hashes, self.units_per_block
+        unit = self.hash_block_size
+        points: dict[BlockHash, None] = {}
+        units: dict[BlockHash, None] = {}
+        for last in (prompt,):
+            k = last // self.block_size
+            if k and k * per_block <= len(hashes):
+                points[hashes[k * per_block - 1]] = None
+            # The states inside the last block too (its prompt tail): RAM
+            # takes what no session owns yet for an orphan.
+            for position in range(k * self.block_size + unit, last + 1, unit):
+                if position // unit <= len(hashes):
+                    units[hashes[position // unit - 1]] = None
+        request_id = request.request_id
+        if points:
+            self._held_points[request_id] = tuple(points)
+            self._kept.update(list(points))
+        units.update(points)
+        if units and self.ram_policy is not None:
+            self._held_units[request_id] = tuple(units)
+            self.ram_policy.hold(units)
 
     def _release_resume_points(self, session: BlockHash) -> None:
         kept = self._kept_by.pop(session, None)
@@ -1239,11 +1387,15 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self.ram_frontiers.clear()
         self._kept.clear()
         self._kept_by.clear()
+        self._held_points.clear()
+        self._held_units.clear()
         self._superseded.clear()
         self._extends_end.clear()
         if self.ram_policy is not None:
             self.ram_policy.reset()
         self._waiting_since.clear()
+        self._head = None
+        self._unpin_head()
         self._prune_pending.clear()
         self._prune_waits.clear()
         if self._restores_by_event:
@@ -1380,6 +1532,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         restored = request_id in self._admitted_from_ram
         self._admitted_from_ram.discard(request_id)
         seen, key, extends_end = self._seen_end(request)
+        self._hold_prefill_points(request, key, extends_end)
         if key is None:
             return
         # The session resumed, whichever tier holds it.
