@@ -24,8 +24,10 @@ left cached):
   in turn.
 - A session's frequency is counted where it is resumed, whichever tier holds
   it, and its next turn's session inherits it, also after it retired.
-- Victims: blocks no session owns, then the RAM blocks a session holds past
-  the point it resumes at (nothing reads them), then the lowest-value
+- Victims: blocks no session owns, then RAM copies of blocks the GPU keeps
+  (RAM would otherwise mirror every session restored to it), then the RAM
+  blocks a session holds past the point it resumes at (nothing reads them),
+  then the lowest-value
   session's exclusive blocks, deepest first, so a session loses its tail and
   never a middle page. A session whose exclusive blocks no longer resume
   deeper than what it shares retires.
@@ -88,6 +90,8 @@ class RamEvictionStats:
     sessions: int = 0
     session_blocks: int = 0
     dead: int = 0
+    # RAM copies of blocks the GPU kept.
+    duplicates: int = 0
     # Blocks with a key the pool took in its own LRU order: none of the above
     # could go (all in use).
     unranked: int = 0
@@ -108,6 +112,7 @@ class RamGreedyDualSizeFrequency:
         block_size: int,
         half_life_s: float,
         on_gpu: Callable[[BlockHashWithGroupId], bool],
+        gpu_keeps: Callable[[], Callable[[BlockHashWithGroupId], bool]] | None = None,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
         self.pool = pool
@@ -119,6 +124,7 @@ class RamGreedyDualSizeFrequency:
         self.block_size = block_size
         self.half_life_s = half_life_s
         self.on_gpu = on_gpu
+        self.gpu_keeps = gpu_keeps
         self.sessions: OrderedDict[BlockHash, _Session] = OrderedDict()
         # Hash unit -> the sessions that own it.
         self.owners: dict[BlockHash, set[BlockHash]] = {}
@@ -367,10 +373,11 @@ class RamGreedyDualSizeFrequency:
 
     def prepare_eviction(self, num_blocks: int) -> None:
         """Move the next `num_blocks` victims to the free queue's front:
-        blocks no session owns, then sessions' blocks nothing reads, then the
-        lowest-value sessions' exclusive blocks, deepest first, fresh copies
-        last. The pool takes any shortfall in its LRU order, live sessions'
-        blocks included (`RamEvictionStats.unranked`)."""
+        blocks no session owns, then copies of blocks the GPU keeps, then
+        sessions' blocks nothing reads, then the lowest-value sessions'
+        exclusive blocks, deepest first, fresh copies last. The pool takes
+        any shortfall in its LRU order, live sessions' blocks included
+        (`RamEvictionStats.unranked`)."""
         self._decay()
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
@@ -404,7 +411,9 @@ class RamGreedyDualSizeFrequency:
                     if len(victims) >= num_blocks:
                         break
             else:
-                self._take_sessions(take, victims, num_blocks)
+                self._take_duplicates(take, victims, num_blocks)
+                if len(victims) < num_blocks:
+                    self._take_sessions(take, victims, num_blocks)
                 if len(victims) < num_blocks:
                     # Fresh copies too: the GPU copies such a block again, but
                     # the pool's LRU order would take a live session's.
@@ -421,6 +430,30 @@ class RamGreedyDualSizeFrequency:
                 for block in itertools.islice(queue.iter_blocks_after(None), num_blocks)
             )
         self._retire_pending(self.now())
+
+    def _take_duplicates(
+        self,
+        take: Callable[[KVCacheBlock], bool],
+        victims: list[KVCacheBlock],
+        num_blocks: int,
+    ) -> None:
+        """RAM copies of blocks the GPU keeps (`gpu_keeps`: a restored
+        session that runs or stays cached, a pinned restore): losing one loses
+        nothing now, and the GPU copies the block again only once it is about
+        to drop it. Without this the RAM tier mirrors every session restored
+        to the GPU and holds that much less of the others."""
+        if self.gpu_keeps is None:
+            return
+        keeps = self.gpu_keeps()
+        extra = self.pool.cached_block_hashes_by_block
+        for block in self.pool.free_block_queue.iter_blocks_after(None):
+            if block.block_hash is None:
+                continue
+            keys = (block.block_hash, *extra.get(block.block_id, ()))
+            if all(keeps(key) for key in keys) and take(block):
+                self.stats.duplicates += 1
+                if len(victims) >= num_blocks:
+                    return
 
     def _owned(self, block: KVCacheBlock) -> bool:
         assert block.block_hash is not None

@@ -562,3 +562,26 @@ def _cached_states(engine: Engine, request_id: str) -> list[int]:
             for group_id in tier.mamba_gids
         )
     ]
+
+
+def test_ram_holds_each_session_once_when_its_blocks_go_back_to_the_gpu():
+    """A session restored from RAM runs on the GPU and stays cached there; RAM
+    still holds copies of its blocks. RAM drops those copies first (the GPU
+    copies a block again once it is about to drop it), so a pool that holds
+    every session once, GPU and RAM together, resumes them all with no full
+    re-read. Mirroring them instead re-reads several sessions in full."""
+    engine = make_engine(
+        False,
+        BLOCK,
+        num_cpu_blocks=140,
+        ram_eviction="gdsf",
+        ram_state_spacing_blocks=0,
+    )
+    resumed = rotate(engine)
+    expected = rotate(roomy_engine(False, BLOCK))
+    assert not [r for r in resumed if r == 0]
+    # At most the block before an end whose exact-end state GDSF gave up (its
+    # cheapest tail): a block plus that turn's output (rotate's at most 90).
+    assert max(e - r for r, e in zip(resumed, expected)) <= BLOCK + 90
+    assert manager(engine).ram_policy.stats.duplicates > 0
+    assert_nothing_lost(engine)

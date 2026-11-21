@@ -28,9 +28,10 @@ across the tiers in any order resumes whole.
 """
 
 import bisect
+import itertools
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -359,6 +360,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 block_size=self.block_size,
                 half_life_s=frequency_half_life_s,
                 on_gpu=self._on_gpu,
+                gpu_keeps=self._gpu_keeps,
             )
             self.cpu_block_pool.eviction_policy = self.ram_policy
             # The policy ranks RAM; a GPU eviction does not refresh it.
@@ -390,6 +392,32 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             pool is not None
             and pool.cached_block_hash_to_block.get_one_block(key) is not None
         )
+
+    def _gpu_keeps(self) -> Callable[[BlockHashWithGroupId], bool]:
+        """Whether the GPU holds the block under a key and will not drop it
+        soon: a request holds it, or it is cached outside the eviction end the
+        lazy walk copies ahead (`_target_free` blocks). RAM's copy of such a
+        block only mirrors it (`RamGreedyDualSizeFrequency._take_duplicates`);
+        the walk copies the block again once it reaches that end."""
+        pool = self._gpu_block_pool
+        if pool is None:
+            return lambda key: False
+        policy = pool.eviction_policy
+        order = (
+            policy.peek_eviction_order(self._target_free)
+            if policy is not None
+            else pool.free_block_queue.iter_blocks_after(None)
+        )
+        leaving = {b.block_id for b in itertools.islice(order, self._target_free)}
+        cached = pool.cached_block_hash_to_block
+
+        def keeps(key: BlockHashWithGroupId) -> bool:
+            block = cached.get_one_block(key)
+            return block is not None and (
+                block.ref_cnt > 0 or block.block_id not in leaving
+            )
+
+        return keeps
 
     def _restorable(self, block: KVCacheBlock) -> bool:
         """Every key a lookup can use is restored, including keys that end
@@ -1428,6 +1456,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 ("orphan", "orphans"),
                 ("session", "session_blocks"),
                 ("dead", "dead"),
+                ("duplicate", "duplicates"),
                 ("unranked", "unranked"),
             ):
                 delta = getattr(current, field_name) - getattr(previous, field_name)
