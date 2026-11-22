@@ -840,6 +840,12 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        if self.connector is not None:
+            observe_queue = getattr(self.connector, "observe_queue", None)
+            if observe_queue is not None:
+                # Before this step allocates: what queued requests resume from
+                # is the last to go.
+                observe_queue(self.waiting)
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.

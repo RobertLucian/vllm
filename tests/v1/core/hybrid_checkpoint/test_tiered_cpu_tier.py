@@ -12,7 +12,8 @@ import pytest
 
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import init_none_hash, make_block_hash_with_group_id
-from vllm.v1.simple_kv_offload.tiered import TieredCPUOffloadScheduler
+from vllm.v1.request import Request
+from vllm.v1.simple_kv_offload.tiered import _REQUEUE_STEPS, TieredCPUOffloadScheduler
 
 from .spec_device import Device, Engine
 from .test_speculative_frontiers import (
@@ -708,3 +709,147 @@ def test_ram_never_copies_what_only_superseded_turns_resumed_at():
     assert policy._disowned, "no turn was superseded"
     assert not copied_disowned
     assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize("protect", [True, False])
+def test_a_queued_turns_session_stays_on_the_gpu(protect: bool):
+    """Session A finished before B, so LRU would move A to RAM first. A's
+    next turn waits in the queue while a long prefill takes the blocks: the
+    GPU moves B's pages to RAM instead (the queue's requests are the next to
+    read their blocks), and A's turn resumes at its exact end with A's pages
+    from the GPU. Only blocks RAM already copied may leave first (the spill
+    guard's order): at most the exact-end point's own. Without that, A's
+    pages come back from RAM too."""
+    engine = make_engine(False, BLOCK, num_blocks=56, ram_state_spacing_blocks=0)
+    tier = manager(engine)
+    if not protect:
+        tier.observe_queue = lambda waiting: None  # type: ignore[method-assign]
+    engine.add("a0", prompt(1, 600), 17)
+    engine.run("a0")
+    engine.add("b0", prompt(2, 600), 17)
+    engine.run("b0")
+    a = engine.requests["a0"]
+    engine.add("long", prompt(3, 1400), 4)
+    engine.step()
+    engine.add("a1", list(a.all_token_ids) + prompt(4, 30), 4)
+    for _ in range(200):
+        if engine.done("long") and engine.done("a1"):
+            break
+        engine.step()
+    engine.quiesce()
+    assert engine.admissions["a1"][0] >= len(a.all_token_ids) - 1
+    gpu = engine.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block
+    b0 = engine.requests["b0"]
+    b_pages = [
+        make_block_hash_with_group_id(b0.block_hashes[i], tier.fa_gidx)
+        for i in range(600 // BLOCK)
+    ]
+    b_moved = sum(gpu.get_one_block(key) is None for key in b_pages)
+    stats = tier.restore_stats
+    point = len(tier.mamba_gids) + 1
+    if protect:
+        assert stats.restored_blocks <= point and b_moved > 0, (stats, b_moved)
+    else:
+        assert stats.restored_blocks > point, stats
+    assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+@pytest.mark.parametrize("protect", [True, False])
+def test_queued_turns_resume_whole_under_ram_pressure(
+    protect: bool, hash_block_size: int
+):
+    """Four sessions fit both tiers (GDSF RAM). The two oldest sessions'
+    next turns wait in the queue behind a long prefill that needs most of
+    the GPU, and the GPU's evictions fill RAM: both tiers make room from the
+    two idle sessions, so both queued turns resume at their exact ends,
+    nothing queued is evicted and nothing leaves uncopied. Without that,
+    the oldest session is the first to go. (The pools are sized so the idle
+    sessions just cover what the prefill needs.)"""
+    engine = make_engine(
+        False,
+        hash_block_size,
+        num_blocks=56,
+        num_cpu_blocks=52,
+        ram_eviction="gdsf",
+        ram_state_spacing_blocks=0,
+    )
+    tier = manager(engine)
+    if not protect:
+        tier.observe_queue = lambda waiting: None  # type: ignore[method-assign]
+    for s in range(4):
+        engine.add(f"s{s}", prompt(10 + s, 600), 17)
+        engine.run(f"s{s}")
+    engine.add("long", prompt(99, 1400), 4)
+    engine.step()
+    for s in (0, 1):
+        tokens = list(engine.requests[f"s{s}"].all_token_ids) + prompt(20 + s, 30)
+        engine.add(f"t{s}", tokens, 4)
+    request_ids = ("long", "t0", "t1")
+    for _ in range(400):
+        if all(engine.done(rid) for rid in request_ids):
+            break
+        engine.step()
+    engine.quiesce()
+    deep = [
+        engine.admissions[f"t{s}"][0]
+        >= len(engine.requests[f"s{s}"].all_token_ids) - 1
+        for s in (0, 1)
+    ]
+    if protect:
+        assert all(deep), engine.admissions
+        assert tier.ram_policy.stats.queued == 0
+    else:
+        assert not all(deep), engine.admissions
+    assert_nothing_lost(engine)
+
+
+def _queued_turn(engine: Engine) -> tuple[Request, list[Request]]:
+    """A finished session's next turn, added to the queue but not stepped:
+    the finished request and the waiting queue."""
+    engine.add("a0", prompt(1, 600), 17)
+    engine.run("a0")
+    a0 = engine.requests["a0"]
+    engine.add("a1", list(a0.all_token_ids) + prompt(2, 30), 4)
+    return a0, list(engine.scheduler.waiting)
+
+
+def test_a_queued_turn_looks_its_point_up_again_once_a_block_under_it_is_gone():
+    """A queued turn's keys are found again once any of them left both
+    tiers, not only its deepest: with a page gone under its point, the
+    blocks above it resume nothing, and keeping them would keep them for
+    nothing."""
+    engine = make_engine(False, BLOCK, num_blocks=400)
+    tier = manager(engine)
+    a0, waiting = _queued_turn(engine)
+    tier.observe_queue(waiting)
+    page = make_block_hash_with_group_id(a0.block_hashes[3], tier.fa_gidx)
+    assert page in tier._queued["a1"][1]
+    pool = engine.scheduler.kv_cache_manager.block_pool
+    block = pool.cached_block_hash_to_block.get_one_block(page)
+    assert block is not None
+    pool.evict_blocks({block.block_id})
+    tier.observe_queue(waiting)
+    assert page not in tier._queued["a1"][1]
+
+
+def test_a_queued_turns_point_is_looked_up_again_every_requeue_steps():
+    """A running request may compute a deeper point a queued turn can resume
+    at: the turn's keys are found again every `_REQUEUE_STEPS` steps, also
+    while it has some."""
+    engine = make_engine(False, BLOCK, num_blocks=400)
+    tier = manager(engine)
+    _, waiting = _queued_turn(engine)
+    lookups: list[str] = []
+    resume_keys = tier._resume_keys
+
+    def counted(request: Request) -> tuple:
+        lookups.append(request.request_id)
+        return resume_keys(request)
+
+    tier._resume_keys = counted  # type: ignore[method-assign]
+    for _ in range(2 * _REQUEUE_STEPS):
+        tier.observe_queue(waiting)
+    # When it joined, and `_REQUEUE_STEPS` steps later.
+    assert lookups.count("a1") == 2
+    assert tier._queued["a1"][1]

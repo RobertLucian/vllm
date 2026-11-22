@@ -34,7 +34,11 @@ left cached):
   then the lowest-value
   session's exclusive blocks, deepest first, so a session loses its tail and
   never a middle page. A session whose exclusive blocks no longer resume
-  deeper than what it shares retires.
+  deeper than what it shares retires. The blocks queued requests resume from
+  go only after all of these: those requests are the next to read them. The
+  back of the queue goes first, each request's deepest units first and
+  whole, and first only what no block the GPU still holds rests on
+  (`_take_queued`).
 """
 
 import heapq
@@ -102,6 +106,8 @@ class RamEvictionStats:
     dead: int = 0
     # RAM copies of blocks the GPU kept.
     duplicates: int = 0
+    # Blocks queued requests resume from (`queued`): nothing else could go.
+    queued: int = 0
     # Blocks with a key the pool took in its own LRU order: none of the above
     # could go (all in use).
     unranked: int = 0
@@ -143,6 +149,12 @@ class RamGreedyDualSizeFrequency:
         self._disowned: OrderedDict[BlockHash, None] = OrderedDict()
         # Hash units running requests' sessions will own (`hold`).
         self._held: Counter[BlockHash] = Counter()
+        # The keys each queued request resumes from, the queue's head first,
+        # all of them, and the sessions that own some of them alone
+        # (`queued`).
+        self._queued_requests: list[tuple[BlockHashWithGroupId, ...]] = []
+        self._queued: set[BlockHashWithGroupId] = set()
+        self._queued_sessions: set[BlockHash] = set()
         self.heap: list[tuple[float, int, BlockHash]] = []
         self.clock = 0.0
         self._seq = itertools.count()
@@ -271,6 +283,57 @@ class RamGreedyDualSizeFrequency:
             self._held[unit] -= 1
             if self._held[unit] <= 0:
                 del self._held[unit]
+
+    def queued(self, requests: list[tuple[BlockHashWithGroupId, ...]]) -> None:
+        """The keys of the blocks each queued request resumes from, the
+        queue's head first, each request's shallowest first (its pages from
+        the first, then the point's own). They go only once nothing else may:
+        their requests are the next to read them (`_take_queued`). A key
+        several requests list is the one's nearest the head. A session whose
+        deepest unit is among them, and whose alone, leaves the ranking until
+        no request resumes from it: its segments are queued blocks, and
+        ranking it would walk it at every eviction for nothing. (A user prompt
+        after a tool loop resumes at the loop's start: its session's tail is
+        no queued block and stays ranked.)"""
+        listed: set[BlockHashWithGroupId] = set()
+        own: list[tuple[BlockHashWithGroupId, ...]] = []
+        for keys in requests:
+            own.append(tuple(key for key in keys if key not in listed))
+            listed.update(keys)
+        self._queued_requests = own
+        self._queued = listed
+        sessions: set[BlockHash] = set()
+        owners = self.owners
+        for key in listed:
+            unit = get_block_hash(key)
+            unit_owners = owners.get(unit)
+            if unit_owners is None or len(unit_owners) != 1:
+                continue
+            (owner,) = unit_owners
+            session = self.sessions.get(owner)
+            if session is not None and session.units and session.units[0][1] == unit:
+                sessions.add(owner)
+        for key in self._queued_sessions - sessions:
+            session = self.sessions.get(key)
+            if session is not None:
+                self._push(session)
+        self._queued_sessions = sessions
+
+    @property
+    def has_queued(self) -> bool:
+        return bool(self._queued)
+
+    def _is_queued(self, block: KVCacheBlock) -> bool:
+        queued = self._queued
+        return bool(queued) and (
+            block.block_hash in queued
+            or any(
+                key in queued
+                for key in self.pool.cached_block_hashes_by_block.get(
+                    block.block_id, ()
+                )
+            )
+        )
 
     def disowned(self, keys: Iterable[BlockHashWithGroupId]) -> bool:
         """Whether a block cached under `keys` holds only what retired
@@ -441,9 +504,10 @@ class RamGreedyDualSizeFrequency:
         """Move the next `num_blocks` victims to the free queue's front:
         blocks no session owns, then copies of blocks the GPU keeps, then
         sessions' blocks nothing reads, then the lowest-value sessions'
-        exclusive blocks, deepest first, fresh copies last. The pool takes
-        any shortfall in its LRU order, live sessions' blocks included
-        (`RamEvictionStats.unranked`)."""
+        exclusive blocks, deepest first, fresh copies last, and queued
+        requests' blocks only after all of those, the back of the queue first
+        (`_take_queued`). The pool takes any shortfall in its LRU order, live
+        sessions' blocks included (`RamEvictionStats.unranked`)."""
         self._decay()
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
@@ -451,17 +515,22 @@ class RamGreedyDualSizeFrequency:
         fresh = self._fresh | self._fresher
         self._fresher, self._fresh = self._fresh, set()
 
-        def may_go(block: KVCacheBlock, even_fresh: bool = False) -> bool:
+        def may_go(
+            block: KVCacheBlock, even_fresh: bool = False, even_queued: bool = False
+        ) -> bool:
             return not (
                 block.ref_cnt
                 or block.block_id in seen
                 or block.is_null
                 or (block.block_id in fresh and not even_fresh)
+                or (not even_queued and self._is_queued(block))
             )
 
-        def take(block: KVCacheBlock, even_fresh: bool = False) -> bool:
+        def take(
+            block: KVCacheBlock, even_fresh: bool = False, even_queued: bool = False
+        ) -> bool:
             """Takes `block` if it may go."""
-            if not may_go(block, even_fresh):
+            if not may_go(block, even_fresh, even_queued):
                 return False
             seen.add(block.block_id)
             victims.append(block)
@@ -499,6 +568,8 @@ class RamGreedyDualSizeFrequency:
                 # the pool's LRU order would take a live session's.
                 fresh.clear()
                 take_ranked()
+            if len(victims) < num_blocks and self._queued:
+                self._take_queued(take, victims, num_blocks)
         moved = [b for b in victims if b.prev_free_block is not None]
         for block in moved:
             queue.remove(block)
@@ -511,9 +582,81 @@ class RamGreedyDualSizeFrequency:
             )
         self._retire_pending(self.now())
 
+    def _take_queued(
+        self,
+        take: Callable[..., bool],
+        victims: list[KVCacheBlock],
+        num_blocks: int,
+    ) -> None:
+        """Queued requests' blocks, once nothing else may go: the back of the
+        queue first, each request's deepest units first and whole, as
+        `_take_sessions` takes a session's (a unit's other blocks lose the
+        point with one of them gone). First only what no block of the GPU's
+        rests on: a request stops at a unit the GPU still holds (it serves
+        the resume, or it is on its way to RAM: losing its copy would make the
+        GPU copy it again), and taking the units under it would cut the chain
+        under the GPU's part. Then, if that is not enough, the units under
+        the GPU's (its own still stay), rather than in the pool's LRU order,
+        which would take the queue's head as soon as its back. A unit with a
+        block in use stops its request either way. The sessions that lost
+        blocks, by any of their keys, are ranked again: what they hold past
+        the point they now resume at goes before any value (`_Walk.dead`)."""
+        cpu = self.pool.cached_block_hash_to_block
+        extra = self.pool.cached_block_hashes_by_block
+        losers: set[BlockHash] = set()
+        # Per request from the back of the queue, its units deepest first:
+        # (whether the GPU holds one of its keys, its RAM blocks).
+        order: list[list[tuple[bool, list[KVCacheBlock]]]] = []
+        for keys in reversed(self._queued_requests):
+            units: dict[BlockHash, list[BlockHashWithGroupId]] = {}
+            for key in keys:
+                units.setdefault(get_block_hash(key), []).append(key)
+            order.append(
+                [
+                    (
+                        any(map(self.on_gpu, unit)),
+                        [b for key in unit for b in cpu.get_all_blocks(key)],
+                    )
+                    for unit in reversed(units.values())
+                ]
+            )
+
+        def take_all(under_gpu: bool) -> bool:
+            for units in order:
+                for on_gpu, blocks in units:
+                    if any(block.ref_cnt for block in blocks):
+                        break
+                    if on_gpu:
+                        if under_gpu:
+                            continue
+                        break
+                    for block in blocks:
+                        if not take(block, True, True):
+                            continue
+                        self.stats.queued += 1
+                        for key in (block.block_hash, *extra.get(block.block_id, ())):
+                            losers.update(self.owners.get(get_block_hash(key), ()))
+                    if len(victims) >= num_blocks:
+                        return True
+            return False
+
+        if not take_all(False):
+            take_all(True)
+        # Valued as if the victims were evicted already.
+        gone = {block.block_id for block in victims}
+        now = self.now()
+        for key in losers:
+            session = self.sessions.get(key)
+            if session is None:
+                continue
+            session.version = next(self._seq)
+            score = self._score(session, now, gone)
+            if score != float("inf"):
+                heapq.heappush(self.heap, (score, session.version, key))
+
     def _take_duplicates(
         self,
-        take: Callable[[KVCacheBlock], bool],
+        take: Callable[..., bool],
         victims: list[KVCacheBlock],
         num_blocks: int,
     ) -> None:
@@ -530,7 +673,8 @@ class RamGreedyDualSizeFrequency:
             if block.block_hash is None:
                 continue
             keys = (block.block_hash, *extra.get(block.block_id, ()))
-            if all(keeps(key) for key in keys) and take(block):
+            # Also a queued request's: the GPU block it copies stays.
+            if all(keeps(key) for key in keys) and take(block, even_queued=True):
                 self.stats.duplicates += 1
                 if len(victims) >= num_blocks:
                     return
@@ -552,7 +696,7 @@ class RamGreedyDualSizeFrequency:
 
     def _take_sessions(
         self,
-        take: Callable[[KVCacheBlock], bool],
+        take: Callable[..., bool],
         may_go: Callable[[KVCacheBlock], bool],
         victims: list[KVCacheBlock],
         num_blocks: int,
@@ -575,6 +719,11 @@ class RamGreedyDualSizeFrequency:
             if session is None or session.version != version:
                 heapq.heappop(heap)
                 continue
+            if score > 0.0 and key in self._queued_sessions:
+                # Its segments are queued blocks (`queued`): ranked again
+                # once its request leaves the queue.
+                heapq.heappop(heap)
+                continue
             current, walk = self._scored(session, now, gone)
             if current > score + 1e-12:
                 session.version = next(self._seq)
@@ -588,7 +737,8 @@ class RamGreedyDualSizeFrequency:
             taken = len(victims)
             if dead:
                 for block in walk.dead:
-                    if take(block) and len(victims) >= num_blocks:
+                    # Also a queued request's: it resumes below them now.
+                    if take(block, False, True) and len(victims) >= num_blocks:
                         break
             else:
                 for unit in walk.live:
@@ -638,6 +788,9 @@ class RamGreedyDualSizeFrequency:
         self.owners.clear()
         self._disowned.clear()
         self._held.clear()
+        self._queued_requests = []
+        self._queued = set()
+        self._queued_sessions = set()
         self.heap.clear()
         self.clock = 0.0
         self._retired.clear()

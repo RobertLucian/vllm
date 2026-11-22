@@ -304,3 +304,188 @@ def test_two_keys_at_a_sessions_end_are_one_point():
     assert 10 * BLOCK not in held
     assert set(range(BLOCK, 8 * BLOCK + 1, BLOCK)) <= set(held)
     assert ram.policy.stats.unranked == 0
+
+
+def queue(*sessions: Session) -> list[tuple[BlockHashWithGroupId, ...]]:
+    """What `TieredCPUOffloadScheduler.observe_queue` passes for requests
+    queued in this order (the head first), each resuming at its session's
+    end: its pages from the first, then the states there."""
+    requests = []
+    for session in sessions:
+        end = session.units[-1][1]
+        keys = [make_block_hash_with_group_id(u, PAGE) for _, u in session.units]
+        keys += [make_block_hash_with_group_id(end, g) for g in STATES]
+        requests.append(tuple(keys))
+    return requests
+
+
+def store_but(ram: Ram, session: Session, gpu_only: int) -> None:
+    """`session` finished with the GPU alone holding its blocks at
+    `gpu_only` (the page and the states there): RAM holds the rest."""
+    end = {key for key, n in session.blocks() if n == gpu_only}
+    ram.gpu.update(end)
+    ram.store([(key, n) for key, n in session.blocks() if key not in end])
+    ram.policy.add_session(session.key, session.end, session.units, None)
+
+
+def has_states(ram: Ram, session: Session, position: int) -> bool:
+    """Whether RAM holds every group's state at `position` of `session`."""
+    cached = ram.pool.cached_block_hash_to_block
+    unit = dict(session.units)[position]
+    return all(
+        cached.get_one_block(make_block_hash_with_group_id(unit, g)) for g in STATES
+    )
+
+
+@pytest.mark.parametrize("queued", [True, False])
+def test_a_queued_requests_session_goes_last(queued: bool):
+    """A is older than B and resumed less, so RAM would drop A first. A
+    request waiting in the queue resumes from A: RAM drops B instead, as
+    that request is the next to read A's blocks."""
+    ram = Ram(32)
+    a, b = two_sessions(ram)
+    ram.policy.resumed(b.key)
+    if queued:
+        ram.policy.queued(queue(a))
+    ram.evict(16)
+    kept, lost = (a, b) if queued else (b, a)
+    assert ram.whole(kept) and not ram.held(lost)
+    assert ram.policy.stats.queued == 0
+
+
+def test_queued_requests_give_up_the_back_of_the_queue_first():
+    """Only queued requests' blocks are left to evict, each request resuming
+    at its session's end. The request queued last loses its end first (its
+    last page and the states there, whole), then its 9th page, and still
+    resumes at its state 8 blocks in; the queue's head keeps all of its
+    own."""
+    ram = Ram(32)
+    a, b = two_sessions(ram)
+    ram.policy.queued(queue(a, b))
+    # B's end (its last page and the states there), then its 9th page.
+    ram.evict(5)
+    assert ram.whole(a)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 9)]
+    assert has_states(ram, b, 8 * BLOCK)
+    assert ram.policy.stats.queued == 5
+
+
+def test_what_a_queued_request_can_no_longer_read_goes_first():
+    """B's request waits at B's end, behind A's. With only queued blocks
+    left, B gives up its end's states: it resumes 8 blocks in now, and B's
+    pages past that are blocks nothing reads. Once A's request is admitted,
+    those pages go before A's (which A resumes from, but no request waits
+    for), although B's request still lists them."""
+    ram = Ram(32)
+    a, b = two_sessions(ram)
+    ram.policy.queued(queue(a, b))
+    ram.evict(3)
+    ram.policy.queued(queue(b))
+    # The 3 blocks the last eviction stored (no session's), then B's 9th
+    # page and what is left of its end.
+    ram.evict(5)
+    assert ram.whole(a)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 9)]
+
+
+def test_the_back_of_the_queue_goes_first_while_its_copies_are_fresh():
+    """B was copied to RAM just now, A two evictions before: B's copies are
+    fresh (the GPU may still hold the blocks they copy). With only queued
+    blocks left, the back of the queue (B) still gives first: its copies
+    being fresh is no reason to take the head's."""
+    ram = Ram(33)
+    a = Session("a", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    ram.add(a)
+    ram.store(Session("orphan", BLOCK, ()).blocks())
+    ram.add(b)
+    ram.policy.queued(queue(a, b))
+    # Room for 5 blocks without `Ram.evict`, which forgets fresh copies: the
+    # orphan, then B's end (its last page and the states there).
+    ram.store(Session("filler", 5 * BLOCK, ()).blocks())
+    assert ram.whole(a)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 10)]
+    assert not has_states(ram, b, 10 * BLOCK)
+    assert ram.policy.stats.queued == 4
+
+
+def test_a_queued_request_keeps_the_ram_blocks_under_its_gpu_tail():
+    """The GPU alone holds B's end (its last page and the states there); RAM
+    holds the rest of B, and A. With only queued blocks left, B's RAM blocks
+    stay although B is at the back of the queue: they are the chain under
+    the GPU's part, which would resume nothing without them. A gives its
+    end instead."""
+    ram = Ram(28)
+    a = Session("a", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    ram.add(a)
+    store_but(ram, b, 10 * BLOCK)
+    ram.policy.queued(queue(a, b))
+    ram.evict(4)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 10)]
+    assert has_states(ram, b, 8 * BLOCK)
+    assert ram.held(a) == [p * BLOCK for p in range(1, 10)]
+    assert ram.policy.stats.queued == 4
+
+
+def test_with_only_blocks_under_the_gpus_left_the_back_is_cut_first():
+    """The GPU alone holds both sessions' ends, RAM the rest. With only
+    queued blocks left, the back of the queue gives the deepest of its
+    blocks under its GPU part (its pages: its requests resume at its end),
+    rather than the pool's LRU order taking the head's older blocks."""
+    ram = Ram(24)
+    a = Session("a", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    store_but(ram, a, 10 * BLOCK)
+    store_but(ram, b, 10 * BLOCK)
+    ram.policy.queued(queue(a, b))
+    ram.evict(4)
+    assert ram.held(a) == [p * BLOCK for p in range(1, 10)]
+    assert has_states(ram, a, 8 * BLOCK)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 6)]
+    assert ram.policy.stats.queued == 4
+    assert ram.policy.stats.unranked == 0
+
+
+def test_a_session_ranks_again_once_its_request_leaves_the_queue():
+    """A's request waits, so B gives its end although B was resumed more.
+    Once A's request is admitted, A ranks again: the next eviction takes
+    A's end, the cheaper tail, and not B's prefix."""
+    ram = Ram(32)
+    a, b = two_sessions(ram)
+    ram.policy.resumed(b.key)
+    ram.policy.queued(queue(a))
+    ram.evict(4)
+    assert ram.whole(a)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 10)]
+    ram.policy.queued([])
+    # The 4 blocks the last eviction stored (no session's), B's 9th page
+    # (it resumes 8 blocks in now), then A's end.
+    ram.evict(9)
+    assert ram.held(a) == [p * BLOCK for p in range(1, 10)]
+    assert ram.held(b) == [p * BLOCK for p in range(1, 9)]
+
+
+def test_the_sessions_a_queued_block_holds_a_key_of_are_ranked_again():
+    """B's last page also holds a page of C (a block can carry several keys).
+    Both are queued; with only queued blocks left, B's end goes, C's 3rd
+    page with it. C resumes nowhere now, so nothing reads what RAM holds of
+    it: it goes next, before any more of B's."""
+    ram = Ram(24)
+    b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    c = Session("c", 6 * BLOCK, (6 * BLOCK,))
+    ram.add(b)
+    shared = make_block_hash_with_group_id(unit_key("c", 3 * BLOCK), PAGE)
+    ram.store([(key, n) for key, n in c.blocks() if key != shared])
+    ram.policy.add_session(c.key, c.end, c.units, None)
+    last_page = make_block_hash_with_group_id(unit_key("b", 10 * BLOCK), PAGE)
+    block = ram.pool.cached_block_hash_to_block.get_one_block(last_page)
+    ram.pool._insert_block_hash(shared, block, num_tokens=3 * BLOCK)
+    ram.policy.queued(queue(c, b))
+    ram.evict(4)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 10)]
+    # The 4 blocks the last eviction stored (no session's), then what
+    # nothing reads: C's 8 blocks and B's 9th page (B resumes 8 blocks in).
+    ram.evict(13)
+    assert not ram.held(c) and not has_states(ram, c, 6 * BLOCK)
+    assert ram.held(b) == [p * BLOCK for p in range(1, 9)]

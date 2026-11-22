@@ -4,7 +4,8 @@
 
 One connector owns everything that moves KV between VRAM and RAM:
 - What leaves VRAM: the GPU prefix cache's LRU order (``--prefix-cache-eviction
-  lru``, required).
+  lru``, required), except that what queued requests resume from goes last,
+  in either tier.
 - How it leaves: copied to RAM before the GPU may drop it, with the other
   groups' blocks under the same keys (SimpleCPU's lazy walk and spill guard),
   ``copy_ahead_blocks`` at the eviction end ahead of need. Recurrent states at
@@ -24,6 +25,7 @@ Configuration (``kv_connector_extra_config``): SimpleCPU's ``cpu_bytes_to_use``
 ``copy_ahead_blocks`` (default 0: the lazy walk's own target).
 """
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -100,6 +102,12 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
         manager = self.scheduler_manager
         if isinstance(manager, TieredCPUOffloadScheduler):
             manager.observe_admission(request, num_computed_tokens)
+
+    def observe_queue(self, waiting: Iterable["Request"]) -> None:
+        """The requests waiting for admission as a scheduler step starts."""
+        manager = self.scheduler_manager
+        if isinstance(manager, TieredCPUOffloadScheduler):
+            manager.observe_queue(waiting)
 
     @classmethod
     def build_prom_metrics(

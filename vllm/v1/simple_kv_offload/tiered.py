@@ -2,25 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler side of TieredCPUOffloadConnector: a RAM tier that extends VRAM.
 
-VRAM -> RAM: the GPU prefix cache evicts least recently used first; the lazy
-walk of `SimpleCPUOffloadScheduler` copies every block a lookup can use before
-the GPU may drop it, including the blocks of exact-end and prompt-tail states
-(keys that end inside a block), each with the other groups' blocks under the
-same keys. With `copy_ahead_blocks` the walk keeps that many blocks at the
-eviction end copied, so an allocation (a restore's most of all) rarely waits
-for a copy. Recurrent states at block boundaries are copied only where live
-sessions resume (`_keep_resume_points`: the last boundaries before the latest
-turn's prompt end and end, and before the prompt that began its tool loop),
-at points several continuations share, and every `ram_state_spacing_blocks`
-blocks if set: a state takes a page of RAM per Mamba group, as much as the
-attention pages of a whole block. A turn that starts a tool loop keeps the
-state before its prompt end from its admission (`_hold_prefill_points`): the
-GPU would otherwise drop it as the turn runs past it. When a turn supersedes
-the one it resumed, the states only the older turn resumed at leave both
-tiers, and blocks only retired sessions owned are never copied
-(`RamGreedyDualSizeFrequency.disowned`). With `prune_gpu_states` the GPU also
-releases a finished request's other states, instead of holding them until its
-LRU order reaches them.
+VRAM -> RAM: the GPU prefix cache evicts least recently used first, except
+the blocks queued requests resume from, which both tiers keep until nothing
+else may go (`observe_queue`): LRU would take them first, as their requests
+wait. The lazy walk of `SimpleCPUOffloadScheduler` copies every block a
+lookup can use before the GPU may drop it, including the blocks of exact-end
+and prompt-tail states (keys that end inside a block), each with the other
+groups' blocks under the same keys. With `copy_ahead_blocks` the walk keeps
+that many blocks at the eviction end copied, so an allocation (a restore's
+most of all) rarely waits for a copy. Recurrent states at block boundaries
+are copied only where live sessions resume (`_keep_resume_points`: the last
+boundaries before the latest turn's prompt end and end, and before the prompt
+that began its tool loop), at points several continuations share, and every
+`ram_state_spacing_blocks` blocks if set: a state takes a page of RAM per
+Mamba group, as much as the attention pages of a whole block. A turn that
+starts a tool loop keeps the state before its prompt end from its admission
+(`_hold_prefill_points`): the GPU would otherwise drop it as the turn runs
+past it. When a turn supersedes the one it resumed, the states only the older
+turn resumed at leave both tiers, and blocks only retired sessions owned are
+never copied (`RamGreedyDualSizeFrequency.disowned`). With `prune_gpu_states`
+the GPU also releases a finished request's other states, instead of holding
+them until its LRU order reaches them.
 
 RAM -> VRAM ("promote, then hit"): before a waiting request's next lookup,
 the connector finds the deepest point the request can resume at with blocks
@@ -38,7 +40,7 @@ import bisect
 import itertools
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +96,14 @@ _RESTORE_WAIT_SHARE = 0.5
 # (`_behind_head`), as a load that waits for blocks makes them wait. This
 # bounds the wait only if blocks never free up.
 _MAX_RESTORE_WAIT_S = 600.0
+# Steps between lookups of what a queued request resumes from
+# (`observe_queue`): a running request may compute a deeper point it can
+# resume at.
+_REQUEUE_STEPS = 32
+# The share of both pools, GPU and RAM, that queued requests' blocks are kept
+# in, from the queue's head (`observe_queue`): a queue longer than that would
+# leave only the sessions of requests about to come back to give.
+_QUEUE_KEEP_SHARE = 0.5
 # Finished requests' ends remembered to measure resumes against, and the
 # sessions whose resume points the tiers keep.
 _MAX_SEEN_ENDS = 65536
@@ -354,6 +364,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._waiting_since: dict[str, float] = {}
         self._head: tuple[str, tuple[int, float, str]] | None = None
         self._head_pins: list[KVCacheBlock] = []
+        # By queued request, the step its keys were found at and the keys of
+        # the blocks it resumes from, shallowest first (`observe_queue`).
+        self._queued: dict[str, tuple[int, tuple[BlockHashWithGroupId, ...]]] = {}
+        self._queue_steps = 0
         self._priority_policy = self.vllm_config.scheduler_config.policy == "priority"
         self._observed: set[str] = set()
         # Admitted at a point a restore loaded, until `observe_admission`.
@@ -711,6 +725,107 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self.cpu_block_pool.free_blocks(self._head_pins)
             self._head_pins = []
 
+    def observe_queue(self, waiting: Iterable["Request"]) -> None:
+        """Keep what the queued requests resume from until they are admitted
+        (`_resume_keys`): on the GPU at the far end of the LRU order and in
+        RAM out of eviction's reach (`RamGreedyDualSizeFrequency.queued`).
+        The queue's requests are the next to read their blocks, yet LRU would
+        take those first: they have aged as their requests waited. Requests
+        from the queue's head are kept while their blocks fit
+        `_QUEUE_KEEP_SHARE` of both pools. When nothing else may go, the back
+        of the queue goes first, each request's deepest units first. A
+        request's keys are found when it joins the queue, again once any of
+        them left both tiers, and every `_REQUEUE_STEPS` steps (a running
+        request may compute a deeper point it can resume at)."""
+        pool = self._gpu_block_pool
+        if pool is None:
+            return
+        self._queue_steps += 1
+        steps = self._queue_steps
+        # The scheduler's order: by priority, else its own (preempted
+        # requests go to the front).
+        order = (
+            sorted(waiting, key=self._queue_position)
+            if self._priority_policy
+            else list(waiting)
+        )
+        gpu = pool.cached_block_hash_to_block
+        cpu = self.cpu_block_pool.cached_block_hash_to_block
+        previous = self._queued
+        queued: dict[str, tuple[int, tuple[BlockHashWithGroupId, ...]]] = {}
+        for request in order:
+            entry = previous.get(request.request_id)
+            if (
+                entry is None
+                or steps - entry[0] >= _REQUEUE_STEPS
+                or any(
+                    gpu.get_one_block(key) is None and cpu.get_one_block(key) is None
+                    for key in entry[1]
+                )
+            ):
+                entry = (steps, self._resume_keys(request))
+            queued[request.request_id] = entry
+        self._queued = queued
+        policy = self.ram_policy
+        if not queued and (policy is None or not policy.has_queued):
+            return
+        gpu_queue = pool.free_block_queue
+        # A RAM pool in LRU order keeps them at its far end too.
+        tiers = (
+            ((gpu_queue, gpu),)
+            if policy is not None
+            else ((gpu_queue, gpu), (self.cpu_block_pool.free_block_queue, cpu))
+        )
+        budget = _QUEUE_KEEP_SHARE * (
+            pool.num_gpu_blocks + self.cpu_block_pool.num_gpu_blocks
+        )
+        kept: list[tuple[BlockHashWithGroupId, ...]] = []
+        for request in order:
+            keys = queued[request.request_id][1]
+            # Counts keys, not blocks: a block can hold several keys, and a
+            # key's block can sit in both tiers (RAM copies of what the GPU
+            # keeps go first).
+            budget -= len(keys)
+            if budget < 0:
+                break
+            kept.append(keys)
+        # The back of the queue first, each request's deepest first: the
+        # queue's head ends at the far end.
+        for keys in reversed(kept):
+            for key in reversed(keys):
+                for queue, cached in tiers:
+                    block = cached.get_one_block(key)
+                    if block is not None and block.prev_free_block is not None:
+                        queue.remove(block)
+                        queue.append(block)
+        if policy is not None:
+            policy.queued(kept)
+
+    def _resume_keys(self, request: "Request") -> tuple[BlockHashWithGroupId, ...]:
+        """The keys of the blocks at the deepest point `request` can resume at
+        with blocks of either tier, its pages from the first, then the
+        point's own (states, an exact end, the page they end in), the last of
+        them the deepest; none if it reads no cached KV. Not those of the
+        deepest point the GPU alone holds: when that one is close enough to
+        resume at instead of restoring (`_plan`), keeping it would cost the
+        request the tokens between them."""
+        if request.skip_reading_external_kv:
+            return ()
+        plan = next(self._resume_points(request), None)
+        if plan is None:
+            return ()
+        keys: dict[BlockHashWithGroupId, None] = {}
+        for piece in plan.pieces:
+            block = piece.block
+            if block.block_hash is None:
+                continue
+            pool = self._gpu_block_pool if piece.on_gpu else self.cpu_block_pool
+            assert pool is not None
+            keys[block.block_hash] = None
+            for key in pool.cached_block_hashes_by_block.get(block.block_id, ()):
+                keys[key] = None
+        return tuple(keys)
+
     def _start_restore(
         self, request: "Request", plan: _Plan
     ) -> tuple[int | None, bool]:
@@ -860,7 +975,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         frontiers = None if checkpoints is None else checkpoints.frontiers
         hash_fn = None if frontiers is None else frontiers.hash_fn
         tokens = request.all_token_ids
-        for h in range(min(max_length // unit, len(hashes)), -1, -1):
+        # A point past the chain's next block needs a page neither tier holds.
+        top = min(
+            max_length // unit,
+            len(hashes),
+            ((len(chain) + 1) * self.block_size - 1) // unit,
+        )
+        for h in range(top, -1, -1):
             anchor = hashes[h - 1] if h else None
             if hash_fn is not None:
                 yield from self._frontier_points(
@@ -1396,6 +1517,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._waiting_since.clear()
         self._head = None
         self._unpin_head()
+        self._queued.clear()
         self._prune_pending.clear()
         self._prune_waits.clear()
         if self._restores_by_event:
@@ -1610,6 +1732,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 ("session", "session_blocks"),
                 ("dead", "dead"),
                 ("duplicate", "duplicates"),
+                ("queued", "queued"),
                 ("unranked", "unranked"),
             ):
                 delta = getattr(current, field_name) - getattr(previous, field_name)
