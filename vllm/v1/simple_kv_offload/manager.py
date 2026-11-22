@@ -860,12 +860,20 @@ class SimpleCPUOffloadScheduler:
                 continue
             # A block the CPU pool holds may still be held back for its
             # siblings (a unit that leaves the GPU whole).
-            if self._uncopied(node):
-                gpu_ids.append(node.block_id)
-                chosen.add(node.block_id)
-            for page in self._boundary_siblings(node):
-                if page.block_id in chosen:
-                    continue
+            own = [node] if self._uncopied(node) else []
+            siblings = [
+                page
+                for page in self._boundary_siblings(node)
+                if page.block_id not in chosen
+            ]
+            # The unit is copied whole or not at all, within the CPU pool's
+            # free blocks: its siblings can take it past them.
+            if len(chosen) + len(own) + len(siblings) > num_cpu_free:
+                break
+            for block in own:
+                gpu_ids.append(block.block_id)
+                chosen.add(block.block_id)
+            for page in siblings:
                 assert page.block_hash is not None
                 pages.append(page.block_id)
                 chosen.add(page.block_id)
