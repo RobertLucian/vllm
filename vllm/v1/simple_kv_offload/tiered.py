@@ -31,10 +31,12 @@ from either tier, loads the blocks only RAM holds into GPU blocks, caches them
 under their own keys (re-indexing an exact-end state as a GPU frontier), and
 pins them until the request is admitted. The ordinary GPU lookup then makes
 the hit; no tokens are ever loaded as an external suffix, so a session split
-across the tiers in any order resumes whole. A request waits for room to
-restore into as long as blocks take to free up, and the requests behind it in
-the queue wait with it (`_behind_head`), as behind a load that waits for
-blocks: resuming from the GPU alone would recompute what RAM holds.
+across the tiers in any order resumes whole. Restores run side by side while
+a step's blocks stay free for the running requests (`_start_restore`). A
+request waits for room to restore into as long as blocks take to free up;
+the requests behind it in the queue pass it for `_HEAD_PASS_S`, then wait
+with it (`_behind_head`), so a long session's restore is not starved by
+shorter ones: resuming from the GPU alone would recompute what RAM holds.
 """
 
 import bisect
@@ -93,10 +95,14 @@ _MAX_PIN_TIMEOUT_S = 120.0
 _RESTORE_WAIT_SHARE = 0.5
 # A request waits for room to restore into for as long as its session is in
 # RAM: resuming from the GPU alone recomputes what RAM holds, in the same GPU
-# blocks the restore waits for. The requests behind it in the queue wait too
-# (`_behind_head`), as a load that waits for blocks makes them wait. This
-# bounds the wait only if blocks never free up.
+# blocks the restore waits for. This bounds the wait only if blocks never
+# free up. The requests behind it in the queue pass it for `_HEAD_PASS_S`
+# (shorter restores and GPU-only resumes run meanwhile), then wait with it
+# until it is admitted (`_behind_head`). Holding them from the start
+# serialized restores: on real GPUs the tiered connector ran 26-54% of the
+# eager mirror's turns at equal pools (tests/v1/hybrid_gpu).
 _MAX_RESTORE_WAIT_S = 600.0
+_HEAD_PASS_S = 5.0
 # Steps between lookups of what a queued request resumes from
 # (`observe_queue`): a running request may compute a deeper point it can
 # resume at.
@@ -127,6 +133,18 @@ def _end(request: "Request") -> int:
     computed count also holds the slots of the step still in flight (the
     sampled token and the drafts after it), past the tokens it has."""
     return min(request.num_computed_tokens, len(request.all_token_ids) - 1)
+
+
+def pin_timeout_s(
+    cost: PrefillCostModel | None, gpu_only_tokens: int, num_tokens: int
+) -> float:
+    """How long a restore's blocks stay pinned for its request's admission:
+    a share of the prefill it saves over resuming at `gpu_only_tokens`
+    (`_RESTORE_WAIT_SHARE`), within bounds."""
+    if cost is None:
+        return _PIN_TIMEOUT_S
+    saved = cost.seconds(gpu_only_tokens, num_tokens)
+    return min(_MAX_PIN_TIMEOUT_S, max(_PIN_TIMEOUT_S, _RESTORE_WAIT_SHARE * saved))
 
 
 @dataclass
@@ -430,11 +448,6 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _checkpoints(self) -> "HybridCheckpointManager | None":
         manager = self._kv_cache_manager
         return None if manager is None else manager.checkpoints
-
-    @property
-    def _max_pinned(self) -> int:
-        assert self._gpu_block_pool is not None
-        return max(1, self._gpu_block_pool.num_gpu_blocks // 4)
 
     # ------------------------------------------------------------------
     # VRAM -> RAM
@@ -751,14 +764,18 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         )
 
     def _behind_head(self, request: "Request") -> bool:
-        """Whether `request` comes after a request that waits for room to
-        restore into: it would take the blocks that one waits for."""
+        """Whether `request` comes after a request that has waited
+        `_HEAD_PASS_S` for room to restore into: it would take the blocks
+        that one waits for. Until then it passes it."""
         head = self._head
-        return (
-            head is not None
-            and head[0] != request.request_id
-            and self._queue_position(request) > head[1]
-        )
+        if (
+            head is None
+            or head[0] == request.request_id
+            or self._queue_position(request) <= head[1]
+        ):
+            return False
+        since = self._waiting_since.get(head[0])
+        return since is not None and time.monotonic() - since >= _HEAD_PASS_S
 
     def _stop_waiting(self, request_id: str) -> None:
         self._waiting_since.pop(request_id, None)
@@ -901,12 +918,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             return None, False
         num_blocks = len(loads)
         stats = self.restore_stats
-        if (
-            self._num_pinned
-            and self._num_pinned + num_blocks + len(pinned) > self._max_pinned
-        ):
-            # Restores that wait for admission already pin their share; a
-            # restore alone may pin a whole session.
+        # Restores waiting for admission run side by side while the running
+        # requests keep a step's blocks free (the lazy walk's target); a
+        # restore alone may pin a whole session. A cap of a quarter of the
+        # pool let one 60-120-block session restore at a time in production.
+        free = pool.get_num_free_blocks() - sum(not b.ref_cnt for b in pinned)
+        if self._num_pinned and free - num_blocks < self._target_free:
             stats.waited_cap += 1
             return self._wait(request, loads)
         # Blocks pinned below leave the free queue: they are not safe to take.
@@ -993,13 +1010,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         return deepest
 
     def _restore_wait_s(self, plan: _Plan) -> float:
-        """How long `plan`'s restored blocks stay pinned for its request's
-        admission: a share of the prefill the restore saves
-        (`_RESTORE_WAIT_SHARE`), within bounds."""
-        if self._cost is None:
-            return _PIN_TIMEOUT_S
-        saved = self._cost.seconds(plan.gpu_only_tokens, plan.num_tokens)
-        return min(_MAX_PIN_TIMEOUT_S, max(_PIN_TIMEOUT_S, _RESTORE_WAIT_SHARE * saved))
+        return pin_timeout_s(self._cost, plan.gpu_only_tokens, plan.num_tokens)
 
     def _find(self, key: BlockHashWithGroupId) -> _Piece | None:
         """The block cached under `key` in either tier, the GPU's first."""

@@ -596,49 +596,6 @@ def test_ram_holds_each_session_once_when_its_blocks_go_back_to_the_gpu():
     assert_nothing_lost(engine)
 
 
-@pytest.mark.parametrize("async_scheduling", [True, False])
-def test_a_restore_that_waits_for_room_keeps_its_place_in_the_queue(
-    async_scheduling: bool,
-):
-    """A turn whose session only RAM holds waits for GPU blocks while a long
-    request holds most of them. It waits as long as that takes instead of
-    resuming from the GPU alone (recomputing what RAM holds), and a request
-    that arrives after it waits behind it until the restore has its blocks,
-    instead of taking the blocks it waits for: as a load that waits for
-    blocks makes the queue behind it wait."""
-    engine = make_engine(async_scheduling, BLOCK, num_blocks=40)
-    engine.add("s0", prompt(1, 1300), 17)
-    engine.run("s0")
-    for s in range(3):
-        engine.add(f"f{s}", prompt(60 + s, 1300), 17)
-        engine.run(f"f{s}")
-    tier = manager(engine)
-    request = engine.requests["s0"]
-    engine.add("long", prompt(70, 1200), 500)
-    while engine.requests["long"].num_output_tokens < 3:
-        engine.step()
-    engine.add("s1", list(request.all_token_ids) + prompt(2, 40), 17)
-    for _ in range(3):
-        engine.step()
-    assert "s1" not in engine.admissions and tier._head is not None
-    engine.add("late", prompt(80, 100), 4)
-    request_ids = ("long", "s1", "late")
-    for _ in range(3000):
-        if all(engine.done(rid) for rid in request_ids):
-            break
-        engine.step()
-        if tier._head is not None and tier._head[0] == "s1":
-            assert "late" not in engine.admissions
-    engine.quiesce()
-    stats = tier.restore_stats
-    assert stats.gave_up == 0 and stats.waited_behind > 0, stats
-    # It resumed from RAM at the previous turn's exact end.
-    assert stats.completed > 0, stats
-    assert engine.admissions["s1"][0] >= len(request.all_token_ids) - 1
-    assert tier._head is None and not tier._head_pins
-    assert_nothing_lost(engine)
-
-
 @pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
 def test_the_prompt_floor_of_a_turn_that_starts_a_loop_outlives_its_run(
     hash_block_size: int,
@@ -800,8 +757,7 @@ def test_queued_turns_resume_whole_under_ram_pressure(
         engine.step()
     engine.quiesce()
     deep = [
-        engine.admissions[f"t{s}"][0]
-        >= len(engine.requests[f"s{s}"].all_token_ids) - 1
+        engine.admissions[f"t{s}"][0] >= len(engine.requests[f"s{s}"].all_token_ids) - 1
         for s in (0, 1)
     ]
     if protect:
