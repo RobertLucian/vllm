@@ -67,6 +67,9 @@ class SimpleCPUOffloadWorker:
         self.store_stream: torch.cuda.Stream | None = None
 
         self._backend: DmaCopyBackend | DiskBackend | None = None
+        # The host ranges registered with CUDA (`pin_tensor`), released at
+        # shutdown.
+        self._host_registrations: list[torch.Tensor] = []
 
         # Ordered (event_idx, Event). Events pre-allocated on main thread.
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -291,7 +294,26 @@ class SimpleCPUOffloadWorker:
                 for tensor in reversed(registered):
                     unpin_tensor(tensor)
                 raise
+            self._host_registrations = registered
         return cpu_kv_caches
+
+    def shutdown(self) -> None:
+        """Stop the copy thread and release the pinned host memory. An engine
+        torn down in a process that goes on (tests, several engines in one
+        process) would otherwise leave its range registered with CUDA after
+        the mapping is gone: the next mapping at that address fails to
+        register ("part or all of the requested memory range is already
+        mapped")."""
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            backend.shutdown()
+        for stream in (self.load_stream, self.store_stream):
+            if stream is not None:
+                stream.synchronize()
+        registrations, self._host_registrations = self._host_registrations, []
+        for tensor in reversed(registrations):
+            unpin_tensor(tensor)
+        self.cpu_kv_caches = None
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
