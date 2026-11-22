@@ -11,7 +11,11 @@ import random
 import pytest
 
 from vllm.utils.hashing import sha256
-from vllm.v1.core.kv_cache_utils import init_none_hash, make_block_hash_with_group_id
+from vllm.v1.core.kv_cache_utils import (
+    get_group_id,
+    init_none_hash,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.tiered import _REQUEUE_STEPS, TieredCPUOffloadScheduler
 
@@ -853,3 +857,146 @@ def test_a_queued_turns_point_is_looked_up_again_every_requeue_steps():
     # When it joined, and `_REQUEUE_STEPS` steps later.
     assert lookups.count("a1") == 2
     assert tier._queued["a1"][1]
+
+
+# A system prompt sessions start with: its last block boundary (448) is no
+# prefill chunk's end (256 tokens per step).
+SYSTEM = prompt(424242, 450)
+
+
+def _sessions_with_a_system_prompt(engine: Engine, fillers: bool = False) -> list[int]:
+    """Five sessions one after another, each the system prompt and its own
+    first message, then a second turn; with `fillers`, two long prompts after
+    each, which move the sessions out of a small GPU. Returns the tokens
+    each session's first turn was admitted with."""
+    for s in range(5):
+        engine.add(f"s{s}t0", SYSTEM + prompt(600 + s, 150), 40)
+        engine.run(f"s{s}t0")
+        tokens = list(engine.requests[f"s{s}t0"].all_token_ids) + prompt(700 + s, 30)
+        engine.add(f"s{s}t1", tokens, 20)
+        engine.run(f"s{s}t1")
+        for f in range(2 if fillers else 0):
+            engine.add(f"f{s}{f}", prompt(800 + 10 * s + f, 1300), 4)
+            engine.run(f"f{s}{f}")
+    return [engine.admissions[f"s{s}t0"][0] for s in range(5)]
+
+
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_sessions_that_share_a_prefix_resume_at_its_last_block_boundary(
+    async_scheduling: bool, hash_block_size: int
+):
+    """Sessions start one after another with the same system prompt. The
+    second finds its pages with no state under them (the first's were
+    released when it finished) and caches the state at their last block
+    boundary, the junction: both tiers keep it, so from the third on
+    sessions resume there, as on a GPU that never evicts."""
+    engine = make_engine(
+        async_scheduling, hash_block_size, num_blocks=400, ram_state_spacing_blocks=0
+    )
+    resumed = _sessions_with_a_system_prompt(engine)
+    expected = _sessions_with_a_system_prompt(
+        roomy_engine(async_scheduling, hash_block_size)
+    )
+    assert resumed[2:] == expected[2:], (resumed, expected)
+    assert min(expected[2:]) >= 7 * BLOCK
+    assert len(manager(engine)._junctions) == 1
+    assert_nothing_lost(engine)
+
+
+@pytest.mark.parametrize("ram_eviction", ["lru", "gdsf"])
+def test_a_shared_prefix_state_comes_back_from_ram(ram_eviction: str):
+    """As above, with a GPU that two long prompts after each session empty of
+    it: the shared pages are in RAM alone when the next session arrives, and
+    so is the junction's state from the third session on. The junction is
+    found across both tiers, and the sessions resume at it from RAM."""
+    engine = make_engine(
+        False,
+        BLOCK,
+        num_blocks=40,
+        ram_eviction=ram_eviction,
+        ram_state_spacing_blocks=0,
+    )
+    resumed = _sessions_with_a_system_prompt(engine, fillers=True)
+    expected = _sessions_with_a_system_prompt(roomy_engine(False, BLOCK), fillers=True)
+    assert resumed[2:] == expected[2:], (resumed, expected)
+    assert manager(engine).restore_stats.completed >= 3
+    assert_nothing_lost(engine)
+
+
+def test_a_compaction_resumes_at_the_head_once_it_is_known():
+    """A session runs a few turns, so only its latest points are kept, then
+    restarts as its head (the system prompt) and a summary, twice. The first
+    restart finds the head's pages without a state and caches it; the second
+    restart, and a new session after it, resume there."""
+    engines = (
+        make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0),
+        roomy_engine(False, BLOCK),
+    )
+    for e in engines:
+        tokens = SYSTEM + prompt(600, 150)
+        for turn in range(4):
+            e.add(f"t{turn}", tokens, 40)
+            e.run(f"t{turn}")
+            tokens = list(e.requests[f"t{turn}"].all_token_ids) + prompt(610 + turn, 30)
+        for c in range(2):
+            e.add(f"c{c}", SYSTEM + prompt(620 + c, 120), 20)
+            e.run(f"c{c}")
+        e.add("n", SYSTEM + prompt(630, 150), 20)
+        e.run("n")
+    engine, roomy = engines
+    for rid in ("c1", "n"):
+        assert engine.admissions[rid][0] == roomy.admissions[rid][0] >= 7 * BLOCK
+    assert_nothing_lost(engine)
+
+
+def test_a_second_edit_resumes_where_the_first_parted():
+    """A message 1,200 tokens into a session is edited twice. The first edit
+    resumes at the last state kept before it and caches the state at the
+    last block boundary the two share; the second resumes there, as on a GPU
+    that never evicts."""
+    engine = make_engine(False, BLOCK, num_blocks=400)
+    roomy = roomy_engine(False, BLOCK)
+    tokens = prompt(13, 1500)
+    for e in (engine, roomy):
+        e.add("d0", tokens, 40)
+        e.run("d0")
+        for edit in (1, 2):
+            e.add(f"d{edit}", tokens[:1200] + prompt(13 + edit, 60), 17)
+            e.run(f"d{edit}")
+    assert engine.admissions["d2"][0] == roomy.admissions["d2"][0] == 18 * BLOCK
+    assert_nothing_lost(engine)
+
+
+def test_a_sessions_own_re_read_keeps_at_most_one_state_more():
+    """A session whose states both tiers lost re-reads its own pages: its
+    turn marks the pages' last block boundary as a junction, one state more
+    than its own points, and its next turn resumes at its exact end without
+    marking another."""
+    engine = make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0)
+    tier = manager(engine)
+    engine.add("d0", prompt(13, 1500), 40)
+    engine.run("d0")
+    for pool in (engine.scheduler.kv_cache_manager.block_pool, tier.cpu_block_pool):
+        pool.evict_blocks(
+            {
+                b.block_id
+                for b in pool.blocks
+                if b.block_hash is not None
+                and get_group_id(b.block_hash) in tier.mamba_gids
+            }
+        )
+    d1 = list(engine.requests["d0"].all_token_ids) + prompt(16, 100)
+    engine.add("d1", d1, 17)
+    engine.run("d1")
+    assert engine.admissions["d1"][0] == 0
+    assert len(tier._junctions) == 1
+    # d1 extends d0's end, a tool loop's next turn: its own points are the
+    # floors before the loop's start (d0's prompt, 23) and its own prompt
+    # end (25). The one more is the pages' last boundary (24).
+    assert set(_cached_states(engine, "d1")) - {23, 25} <= {24}
+    engine.add("d2", list(engine.requests["d1"].all_token_ids) + prompt(17, 40), 17)
+    engine.run("d2")
+    assert engine.admissions["d2"][0] >= len(engine.requests["d1"].all_token_ids) - 1
+    assert len(tier._junctions) == 1
+    assert_nothing_lost(engine)

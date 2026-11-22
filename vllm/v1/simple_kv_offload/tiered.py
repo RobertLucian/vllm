@@ -13,7 +13,8 @@ that many blocks at the eviction end copied, so an allocation (a restore's
 most of all) rarely waits for a copy. Recurrent states at block boundaries
 are copied only where live sessions resume (`_keep_resume_points`: the last
 boundaries before the latest turn's prompt end and end, and before the prompt
-that began its tool loop), at points several continuations share, and every
+that began its tool loop), at points several continuations share (branch
+points, and shared prefixes' junctions: `_note_junction`), and every
 `ram_state_spacing_blocks` blocks if set: a state takes a page of RAM per
 Mamba group, as much as the attention pages of a whole block. A turn that
 starts a tool loop keeps the state before its prompt end from its admission
@@ -104,8 +105,8 @@ _REQUEUE_STEPS = 32
 # in, from the queue's head (`observe_queue`): a queue longer than that would
 # leave only the sessions of requests about to come back to give.
 _QUEUE_KEEP_SHARE = 0.5
-# Finished requests' ends remembered to measure resumes against, and the
-# sessions whose resume points the tiers keep.
+# Finished requests' ends remembered to measure resumes against, the sessions
+# whose resume points the tiers keep, and shared prefixes' junctions.
 _MAX_SEEN_ENDS = 65536
 # Steps a state stays pending for pruning while a request still holds it.
 _PRUNE_RETRY_STEPS = 64
@@ -320,6 +321,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         # other continuation is usually its own session's past, the turns a
         # user prompt rendered anew.
         self._superseded: OrderedDict[BlockHash, None] = OrderedDict()
+        # Shared prefixes' junctions: block boundaries a request found pages
+        # at that another request wrote, with no state to resume from
+        # (`_note_junction`). The most recently found or resumed kept.
+        self._junctions: OrderedDict[BlockHash, None] = OrderedDict()
         # Requests admitted extending the end their session reached (a tool
         # loop's next turn), not only its prompt.
         self._extends_end: set[str] = set()
@@ -372,6 +377,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._observed: set[str] = set()
         # Admitted at a point a restore loaded, until `observe_admission`.
         self._admitted_from_ram: set[str] = set()
+        # Where the pages either tier holds end for a request being admitted,
+        # found before it allocates (`_raise_junction`): by then its own
+        # first chunk's pages are cached too.
+        self._pages_end: dict[str, int] = {}
         self.restore_stats = RestoreStats()
         self._restore_snapshot = RestoreStats()
         self.resume_stats = _ResumeStats()
@@ -512,8 +521,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         return not self._shared(block_hash)
 
     def _shared(self, key: BlockHash) -> bool:
-        """Whether the state at `key` is a point several continuations share
-        (`_superseded`)."""
+        """Whether the state at `key` is a point several continuations share:
+        a shared prefix's junction, or a branch point of the checkpoint graph
+        (`_superseded`). The graph alone does not keep a junction: the states
+        a prefill caches are linked only once its request finishes, and a
+        unit rebuilt from RAM starts without hits."""
+        if key in self._junctions:
+            return True
         checkpoints = self._checkpoints
         unit = None if checkpoints is None else checkpoints.graph.units.get(key)
         return (
@@ -681,7 +695,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         request_id = request.request_id
         restore = self._restores.get(request_id)
         if restore is not None:
-            return (0, False) if restore.done else (None, False)
+            if not restore.done:
+                return None, False
+            self._raise_junction(request, num_computed_tokens)
+            return 0, False
         if self._gpu_block_pool is None:
             return 0, False
         if self._behind_head(request):
@@ -692,8 +709,21 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         plan = self._plan(request)
         if plan is None:
             self._stop_waiting(request_id)
+            self._raise_junction(request, num_computed_tokens)
             return 0, False
         return self._start_restore(request, plan)
+
+    def _raise_junction(self, request: "Request", num_computed_tokens: int) -> None:
+        """The scheduler marks a shared prefix's junction from the GPU alone
+        (`Request.shared_prefix_boundary`): where the pages run past the
+        point the request resumes at, which another request wrote. With
+        pages in RAM too, the junction is where the pages either tier holds
+        end: the request's prefill stops there, and the state it caches is
+        one both tiers keep (`_note_junction`)."""
+        end = len(self._page_chain(request)) * self.block_size
+        self._pages_end[request.request_id] = end
+        if end > max(num_computed_tokens, request.shared_prefix_boundary):
+            request.shared_prefix_boundary = end
 
     def _queue_position(self, request: "Request") -> tuple[int, float, str]:
         """Where `request` stands in the scheduler's waiting queue (ties go by
@@ -939,31 +969,27 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         saved = self._cost.seconds(plan.gpu_only_tokens, plan.num_tokens)
         return min(_MAX_PIN_TIMEOUT_S, max(_PIN_TIMEOUT_S, _RESTORE_WAIT_SHARE * saved))
 
-    def _resume_points(self, request: "Request") -> Iterator[_Plan]:
-        """Points `request` can resume at with blocks from either tier,
-        deepest first: exact-end states (GPU frontiers and RAM ones), then
-        states at hash-unit boundaries."""
+    def _find(self, key: BlockHashWithGroupId) -> _Piece | None:
+        """The block cached under `key` in either tier, the GPU's first."""
         pool = self._gpu_block_pool
         assert pool is not None
-        gpu = pool.cached_block_hash_to_block
-        cpu = self.cpu_block_pool.cached_block_hash_to_block
+        block = pool.cached_block_hash_to_block.get_one_block(key)
+        if block is not None:
+            return _Piece(block, True)
+        block = self.cpu_block_pool.cached_block_hash_to_block.get_one_block(key)
+        # A block another restore is loading counts: the restore waits for
+        # that load (`_start_restore`).
+        return None if block is None else _Piece(block, False)
 
-        def find(key: BlockHashWithGroupId) -> _Piece | None:
-            block = gpu.get_one_block(key)
-            if block is not None:
-                return _Piece(block, True)
-            block = cpu.get_one_block(key)
-            # A block another restore is loading counts: the restore waits
-            # for that load (`_start_restore`).
-            return None if block is None else _Piece(block, False)
-
-        unit, per_block = self.hash_block_size, self.units_per_block
-        hashes = request.block_hashes
-        max_length = request.num_tokens - 1
-        # Full-attention pages either tier holds, from the first.
+    def _page_chain(self, request: "Request") -> list[_Piece]:
+        """The full-attention pages of `request` either tier holds, from the
+        first, short of its last token."""
+        per_block, hashes = self.units_per_block, request.block_hashes
         chain: list[_Piece] = []
-        for i in range(min(len(hashes) // per_block, max_length // self.block_size)):
-            piece = find(
+        for i in range(
+            min(len(hashes) // per_block, (request.num_tokens - 1) // self.block_size)
+        ):
+            piece = self._find(
                 make_block_hash_with_group_id(
                     hashes[(i + 1) * per_block - 1], self.fa_gidx
                 )
@@ -971,6 +997,17 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             if piece is None:
                 break
             chain.append(piece)
+        return chain
+
+    def _resume_points(self, request: "Request") -> Iterator[_Plan]:
+        """Points `request` can resume at with blocks from either tier,
+        deepest first: exact-end states (GPU frontiers and RAM ones), then
+        states at hash-unit boundaries."""
+        find = self._find
+        unit = self.hash_block_size
+        hashes = request.block_hashes
+        max_length = request.num_tokens - 1
+        chain = self._page_chain(request)
         checkpoints = self._checkpoints
         frontiers = None if checkpoints is None else checkpoints.frontiers
         hash_fn = None if frontiers is None else frontiers.hash_fn
@@ -1214,6 +1251,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._stop_waiting(request_id)
         self._observed.discard(request_id)
         self._admitted_from_ram.discard(request_id)
+        self._pages_end.pop(request_id, None)
         parent = self._resumed_from.pop(request_id, None)
         loop_start = self._loop_start(request, parent)
         key = self._remember_end(request, loop_start)
@@ -1511,6 +1549,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._held_points.clear()
         self._held_units.clear()
         self._superseded.clear()
+        self._junctions.clear()
+        self._pages_end.clear()
         self._extends_end.clear()
         if self.ram_policy is not None:
             self.ram_policy.reset()
@@ -1655,6 +1695,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._admitted_from_ram.discard(request_id)
         seen, key, extends_end = self._seen_end(request)
         self._hold_prefill_points(request, key, extends_end)
+        self._note_junction(request, num_computed_tokens)
         if key is None:
             return
         # The session resumed, whichever tier holds it.
@@ -1665,6 +1706,41 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self.ram_policy.resumed(key)
         tier = "ram" if restored else "gpu" if num_computed_tokens else "cold"
         self.resume_stats.record(tier, max(0, seen - num_computed_tokens))
+
+    def _note_junction(self, request: "Request", num_computed_tokens: int) -> None:
+        """Remember a shared prefix's junction: the deepest block boundary of
+        the pages either tier held for the admitted `request` before it
+        allocated (`_pages_end`), when that is past the point it resumes at.
+        Another request wrote those pages (a
+        system prompt a new session or a compaction starts with, an earlier
+        message edited twice), and this one's prefill caches the state there
+        (`_raise_junction`): both tiers keep it as a point several
+        continuations share (`_shared`), so the next request with the same
+        prefix resumes at it. A resume at a junction keeps it remembered. A
+        session that re-reads its own pages, its states lost, keeps at most
+        that one state more."""
+        end = self._pages_end.pop(request.request_id, 0)
+        hashes, unit = request.block_hashes, self.hash_block_size
+        junctions = self._junctions
+        if num_computed_tokens and not num_computed_tokens % self.block_size:
+            resumed = hashes[num_computed_tokens // unit - 1]
+            if resumed in junctions:
+                junctions.move_to_end(resumed)
+        if end <= num_computed_tokens:
+            return
+        key = hashes[end // unit - 1]
+        junctions[key] = None
+        junctions.move_to_end(key)
+        while len(junctions) > _MAX_SEEN_ENDS:
+            junctions.popitem(last=False)
+        if self.ram_policy is not None:
+            # Until its session owns the state, RAM would take it for an
+            # orphan (`_hold_prefill_points`).
+            request_id = request.request_id
+            held = self._held_units.get(request_id, ())
+            if key not in held:
+                self._held_units[request_id] = (*held, key)
+                self.ram_policy.hold((key,))
 
     # ------------------------------------------------------------------
     # Stats

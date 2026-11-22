@@ -9,7 +9,8 @@ One connector owns everything that moves KV between VRAM and RAM:
 - How it leaves: copied to RAM before the GPU may drop it, with the other
   groups' blocks under the same keys (SimpleCPU's lazy walk and spill guard),
   ``copy_ahead_blocks`` at the eviction end ahead of need. Recurrent states at
-  block boundaries are copied only where live sessions resume, and every
+  block boundaries are copied only where live sessions resume, where shared
+  prefixes end (a system prompt sessions start with), and every
   ``ram_state_spacing_blocks`` blocks if set; with ``prune_gpu_states``
   (default) the GPU releases the others when a request finishes.
 - What leaves RAM: ``ram_eviction`` (``lru`` or ``gdsf``).
