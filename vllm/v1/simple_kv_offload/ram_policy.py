@@ -30,7 +30,8 @@ left cached):
   it, and its next turn's session inherits it, also after it retired.
 - Victims: blocks no session owns, then RAM copies of blocks the GPU keeps
   (RAM would otherwise mirror every session restored to it), then the RAM
-  blocks a session holds past the point it resumes at (nothing reads them),
+  blocks a session holds past the point it resumes at (nothing reads them,
+  unless a queued request resumes past that point),
   then the lowest-value
   session's exclusive blocks, deepest first, so a session loses its tail and
   never a middle page. A session whose exclusive blocks no longer resume
@@ -435,7 +436,10 @@ class RamGreedyDualSizeFrequency:
             unlisted = [b for b in ram if b.block_id not in listed]
             listed.update(b.block_id for b in unlisted)
             if position > reach:
-                walk.dead.extend(unlisted)
+                # Not a queued request's: it may resume past this session's
+                # reach (a preempted turn, its own point no session's yet).
+                # Once its keys are found again they are no longer listed.
+                walk.dead.extend(b for b in unlisted if not self._is_queued(b))
             elif last and position > cut and unlisted:
                 walk.live.append(unlisted)
         if reach > shared:
@@ -737,8 +741,7 @@ class RamGreedyDualSizeFrequency:
             taken = len(victims)
             if dead:
                 for block in walk.dead:
-                    # Also a queued request's: it resumes below them now.
-                    if take(block, False, True) and len(victims) >= num_blocks:
+                    if take(block) and len(victims) >= num_blocks:
                         break
             else:
                 for unit in walk.live:

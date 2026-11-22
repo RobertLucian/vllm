@@ -370,22 +370,50 @@ def test_queued_requests_give_up_the_back_of_the_queue_first():
     assert ram.policy.stats.queued == 5
 
 
+def resuming_at(session: Session, position: int) -> tuple[BlockHashWithGroupId, ...]:
+    """A queued request's keys when it resumes at `position` of `session`:
+    its pages from the first, then the states there."""
+    unit = dict(session.units)[position]
+    pages = [make_block_hash_with_group_id(u, PAGE) for p, u in session.units]
+    return tuple(pages[: position // BLOCK]) + tuple(
+        make_block_hash_with_group_id(unit, g) for g in STATES
+    )
+
+
 def test_what_a_queued_request_can_no_longer_read_goes_first():
     """B's request waits at B's end, behind A's. With only queued blocks
-    left, B gives up its end's states: it resumes 8 blocks in now, and B's
-    pages past that are blocks nothing reads. Once A's request is admitted,
-    those pages go before A's (which A resumes from, but no request waits
-    for), although B's request still lists them."""
+    left, B gives up its end's states: it resumes 8 blocks in now, and its
+    keys are found again there, so B's pages past that are blocks nothing
+    reads. Once A's request is admitted, those pages go before A's (which A
+    resumes from, but no request waits for)."""
     ram = Ram(32)
     a, b = two_sessions(ram)
     ram.policy.queued(queue(a, b))
     ram.evict(3)
-    ram.policy.queued(queue(b))
+    ram.policy.queued([resuming_at(b, 8 * BLOCK)])
     # The 3 blocks the last eviction stored (no session's), then B's 9th
     # page and what is left of its end.
     ram.evict(5)
     assert ram.whole(a)
     assert ram.held(b) == [p * BLOCK for p in range(1, 9)]
+
+
+def test_a_queued_request_past_a_sessions_reach_keeps_its_pages():
+    """R's request is queued at its own end, past session S's: R (a turn
+    that ran on from S and was preempted) owns no session yet. S resumes
+    only 8 blocks in, so its pages past that are blocks S does not read, but
+    R does: they stay, and an idle session's end goes instead."""
+    ram = Ram(34)
+    s = Session("s", 10 * BLOCK, (8 * BLOCK,))
+    r = Session("r", 12 * BLOCK, (12 * BLOCK,), prefix="s", shared=10 * BLOCK)
+    ram.add(s)
+    ram.store(r.blocks())
+    idle = Session("idle", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
+    ram.add(idle)
+    ram.policy.queued(queue(r))
+    ram.evict(2)
+    assert ram.whole(s) and ram.whole(r)
+    assert ram.held(idle) == [p * BLOCK for p in range(1, 10)]
 
 
 def test_the_back_of_the_queue_goes_first_while_its_copies_are_fresh():
@@ -469,8 +497,9 @@ def test_a_session_ranks_again_once_its_request_leaves_the_queue():
 def test_the_sessions_a_queued_block_holds_a_key_of_are_ranked_again():
     """B's last page also holds a page of C (a block can carry several keys).
     Both are queued; with only queued blocks left, B's end goes, C's 3rd
-    page with it. C resumes nowhere now, so nothing reads what RAM holds of
-    it: it goes next, before any more of B's."""
+    page with it. Once their keys are found again (C's request resumes
+    nowhere now, B's 8 blocks in), nothing reads what RAM holds of C: it
+    goes next, before any more of B's."""
     ram = Ram(24)
     b = Session("b", 10 * BLOCK, (8 * BLOCK, 10 * BLOCK))
     c = Session("c", 6 * BLOCK, (6 * BLOCK,))
@@ -484,6 +513,7 @@ def test_the_sessions_a_queued_block_holds_a_key_of_are_ranked_again():
     ram.policy.queued(queue(c, b))
     ram.evict(4)
     assert ram.held(b) == [p * BLOCK for p in range(1, 10)]
+    ram.policy.queued([(), resuming_at(b, 8 * BLOCK)])
     # The 4 blocks the last eviction stored (no session's), then what
     # nothing reads: C's 8 blocks and B's 9th page (B resumes 8 blocks in).
     ram.evict(13)

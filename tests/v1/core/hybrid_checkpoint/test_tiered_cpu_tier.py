@@ -137,6 +137,8 @@ def test_sessions_restored_from_ram_resume_where_a_gpu_that_never_evicts_does(
     assert stats.completed > 0 and stats.restored_frontiers > 0, stats
     expected = rotate(roomy_engine(async_scheduling, hash_block_size))
     assert resumed == expected, (resumed, expected)
+    # No session shares another's prefix: no junction.
+    assert not manager(engine)._junctions
 
 
 @pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
@@ -290,6 +292,7 @@ def test_random_sessions_resume_where_a_gpu_that_never_evicts_does(
     assert_nothing_lost(engine)
     expected = _fuzz_case(roomy_engine(seed % 2 == 0, hash_block_size), seed)
     assert resumed == expected, (resumed, expected)
+    assert not manager(engine)._junctions
 
 
 def test_resumes_are_measured_by_tier():
@@ -421,6 +424,7 @@ def test_a_tool_loop_keeps_only_its_latest_turn_and_loop_start_points(
     held = set(_boundary_states(roomy, request_id))
     assert set(_boundary_states(engine, request_id)) == points & held
     assert manager(engine).prune_outcomes["pruned"] > 0
+    assert not manager(engine)._junctions
     assert_nothing_lost(engine)
 
 
@@ -904,21 +908,27 @@ def test_sessions_that_share_a_prefix_resume_at_its_last_block_boundary(
     assert_nothing_lost(engine)
 
 
+@pytest.mark.parametrize("hash_block_size", HASH_BLOCK_SIZES)
+@pytest.mark.parametrize("async_scheduling", [True, False])
 @pytest.mark.parametrize("ram_eviction", ["lru", "gdsf"])
-def test_a_shared_prefix_state_comes_back_from_ram(ram_eviction: str):
+def test_a_shared_prefix_state_comes_back_from_ram(
+    ram_eviction: str, async_scheduling: bool, hash_block_size: int
+):
     """As above, with a GPU that two long prompts after each session empty of
     it: the shared pages are in RAM alone when the next session arrives, and
     so is the junction's state from the third session on. The junction is
     found across both tiers, and the sessions resume at it from RAM."""
     engine = make_engine(
-        False,
-        BLOCK,
+        async_scheduling,
+        hash_block_size,
         num_blocks=40,
         ram_eviction=ram_eviction,
         ram_state_spacing_blocks=0,
     )
     resumed = _sessions_with_a_system_prompt(engine, fillers=True)
-    expected = _sessions_with_a_system_prompt(roomy_engine(False, BLOCK), fillers=True)
+    expected = _sessions_with_a_system_prompt(
+        roomy_engine(async_scheduling, hash_block_size), fillers=True
+    )
     assert resumed[2:] == expected[2:], (resumed, expected)
     assert manager(engine).restore_stats.completed >= 3
     assert_nothing_lost(engine)
@@ -968,11 +978,11 @@ def test_a_second_edit_resumes_where_the_first_parted():
     assert_nothing_lost(engine)
 
 
-def test_a_sessions_own_re_read_keeps_at_most_one_state_more():
+def test_a_sessions_own_re_read_marks_no_junction():
     """A session whose states both tiers lost re-reads its own pages: its
-    turn marks the pages' last block boundary as a junction, one state more
-    than its own points, and its next turn resumes at its exact end without
-    marking another."""
+    turn continues its previous end, so the pages' last block boundary is no
+    junction (no other request wrote them), and nothing past its own points
+    stays. Its next turn resumes at its exact end."""
     engine = make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0)
     tier = manager(engine)
     engine.add("d0", prompt(13, 1500), 40)
@@ -990,13 +1000,59 @@ def test_a_sessions_own_re_read_keeps_at_most_one_state_more():
     engine.add("d1", d1, 17)
     engine.run("d1")
     assert engine.admissions["d1"][0] == 0
-    assert len(tier._junctions) == 1
-    # d1 extends d0's end, a tool loop's next turn: its own points are the
-    # floors before the loop's start (d0's prompt, 23) and its own prompt
-    # end (25). The one more is the pages' last boundary (24).
-    assert set(_cached_states(engine, "d1")) - {23, 25} <= {24}
+    assert not tier._junctions
+    # d1 extends d0's end, a tool loop's next turn: its points are the floors
+    # before the loop's start (d0's prompt, 23) and its own prompt end (25).
+    assert set(_cached_states(engine, "d1")) <= {23, 25}
     engine.add("d2", list(engine.requests["d1"].all_token_ids) + prompt(17, 40), 17)
     engine.run("d2")
     assert engine.admissions["d2"][0] >= len(engine.requests["d1"].all_token_ids) - 1
-    assert len(tier._junctions) == 1
+    assert not tier._junctions
+    assert_nothing_lost(engine)
+
+
+def test_the_state_a_queued_turn_resumes_at_is_not_pruned():
+    """A finished request's states between its resume points are released,
+    except where a queued request resumes: an edit of an earlier message,
+    still waiting when the release runs (no lookup reached it yet), keeps
+    the state it resumes at."""
+    engine = make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0)
+    tier = manager(engine)
+    tokens = prompt(13, 1500)
+    # d0's release waits until d1 is queued.
+    tier.prune_gpu_states = False
+    engine.add("d0", tokens, 40)
+    engine.run("d0")
+    tier.prune_gpu_states = True
+    engine.add("d1", tokens[:1100] + prompt(14, 60), 17)
+    # A step that does not reach d1's lookup: the queue is observed, then the
+    # finished request's states are released.
+    tier.observe_queue(list(engine.scheduler.waiting))
+    tier._prune_gpu_states(engine.requests["d0"])
+    tier._apply_prunes()
+    assert tier.prune_outcomes["pruned"] > 0
+    engine.run("d1")
+    # The last state d0's prefill cached before the edit (a chunk's end).
+    assert engine.admissions["d1"][0] == 16 * BLOCK
+    assert_nothing_lost(engine)
+
+
+def test_a_resume_at_another_conversations_state_marks_a_junction():
+    """Two sessions start together with the same system prompt: both compute
+    it, so the states it shares are branch points of the checkpoint graph,
+    which forgets them once it rebuilds a unit from RAM. A third session
+    resumes at one of them: another conversation's state, so it becomes a
+    junction too, which both tiers keep whatever the graph remembers."""
+    engine = make_engine(False, BLOCK, num_blocks=400, ram_state_spacing_blocks=0)
+    tier = manager(engine)
+    for s in range(2):
+        engine.add(f"s{s}", SYSTEM + prompt(600 + s, 150), 40)
+    engine.run("s0")
+    engine.run("s1")
+    engine.add("s2", SYSTEM + prompt(602, 150), 40)
+    engine.run("s2")
+    resumed = engine.admissions["s2"][0]
+    assert resumed and not resumed % BLOCK, resumed
+    unit = engine.scheduler.hash_block_size
+    assert engine.requests["s2"].block_hashes[resumed // unit - 1] in tier._junctions
     assert_nothing_lost(engine)

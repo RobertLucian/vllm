@@ -105,6 +105,13 @@ _REQUEUE_STEPS = 32
 # in, from the queue's head (`observe_queue`): a queue longer than that would
 # leave only the sessions of requests about to come back to give.
 _QUEUE_KEEP_SHARE = 0.5
+# The share of RAM their keys may hold: with RAM about the size of VRAM, the
+# share of both pools is all of RAM, and RAM would make room for the next
+# copies (queued blocks the GPU moves down among them) from the queue's own.
+# With RAM over half again as large as VRAM it never binds: a lower share
+# kept fewer of pi-length sessions' requests (their keys are mostly in RAM)
+# and cost turns.
+_QUEUE_RAM_SHARE = 0.75
 # Finished requests' ends remembered to measure resumes against, the sessions
 # whose resume points the tiers keep, and shared prefixes' junctions.
 _MAX_SEEN_ENDS = 65536
@@ -372,15 +379,15 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         # By queued request, the step its keys were found at and the keys of
         # the blocks it resumes from, shallowest first (`observe_queue`).
         self._queued: dict[str, tuple[int, tuple[BlockHashWithGroupId, ...]]] = {}
+        # The units of the kept requests' keys, and of their points' states:
+        # the GPU neither drops nor prunes them uncopied, nor RAM its copies.
+        self._queued_units: set[BlockHash] = set()
+        self._queued_states: set[BlockHash] = set()
         self._queue_steps = 0
         self._priority_policy = self.vllm_config.scheduler_config.policy == "priority"
         self._observed: set[str] = set()
         # Admitted at a point a restore loaded, until `observe_admission`.
         self._admitted_from_ram: set[str] = set()
-        # Where the pages either tier holds end for a request being admitted,
-        # found before it allocates (`_raise_junction`): by then its own
-        # first chunk's pages are cached too.
-        self._pages_end: dict[str, int] = {}
         self.restore_stats = RestoreStats()
         self._restore_snapshot = RestoreStats()
         self.resume_stats = _ResumeStats()
@@ -481,12 +488,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         if policy is None or pool is None:
             return False
         assert block.block_hash is not None
-        return policy.disowned(
-            (
-                block.block_hash,
-                *pool.cached_block_hashes_by_block.get(block.block_id, ()),
-            )
-        )
+        extra = pool.cached_block_hashes_by_block.get(block.block_id, ())
+        keys = (block.block_hash, *extra)
+        # A queued request's (a sibling of a superseded turn) is read again.
+        if any(get_block_hash(key) in self._queued_units for key in keys):
+            return False
+        return policy.disowned(keys)
 
     def _spaced(self, num_tokens: int) -> bool:
         """Whether both tiers keep the block-boundary state at `num_tokens`
@@ -495,8 +502,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
 
     def _thinned(self, block: KVCacheBlock) -> bool:
         """Whether `block` is a block-boundary state RAM does not keep: not a
-        spaced one, not a live session's resume point, and not a point several
-        continuations share."""
+        spaced one, not a live session's resume point or a queued request's,
+        and not a point several continuations share."""
         assert block.block_hash is not None
         num_tokens = block.block_hash_num_tokens
         if (
@@ -516,7 +523,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         ):
             return False
         block_hash = get_block_hash(block.block_hash)
-        if block_hash in self._kept:
+        if block_hash in self._kept or block_hash in self._queued_states:
             return False
         return not self._shared(block_hash)
 
@@ -719,11 +726,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         point the request resumes at, which another request wrote. With
         pages in RAM too, the junction is where the pages either tier holds
         end: the request's prefill stops there, and the state it caches is
-        one both tiers keep (`_note_junction`)."""
-        end = len(self._page_chain(request)) * self.block_size
-        self._pages_end[request.request_id] = end
-        if end > max(num_computed_tokens, request.shared_prefix_boundary):
-            request.shared_prefix_boundary = end
+        one both tiers keep (`_note_junction`). Not where a state is cached
+        already (the request resumes short of it only because restoring it
+        would gain too little)."""
+        chain = self._page_chain(request)
+        end = len(chain) * self.block_size
+        if end <= max(num_computed_tokens, request.shared_prefix_boundary):
+            return
+        key = request.block_hashes[end // self.hash_block_size - 1]
+        if all(
+            self._find(make_block_hash_with_group_id(key, group_id))
+            for group_id in self.mamba_gids
+        ):
+            return
+        request.shared_prefix_boundary = end
 
     def _queue_position(self, request: "Request") -> tuple[int, float, str]:
         """Where `request` stands in the scheduler's waiting queue (ties go by
@@ -762,7 +778,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         The queue's requests are the next to read their blocks, yet LRU would
         take those first: they have aged as their requests waited. Requests
         from the queue's head are kept while their blocks fit
-        `_QUEUE_KEEP_SHARE` of both pools. When nothing else may go, the back
+        `_QUEUE_KEEP_SHARE` of both pools and `_QUEUE_RAM_SHARE` of RAM; the
+        states they resume at are neither pruned nor dropped uncopied
+        (`_thinned`, `_disowned`, `_apply_prunes`, `_drop_ram_state`, the
+        checkpoint graph's `queued_units`). When nothing else may go, the back
         of the queue goes first, each request's deepest units first. A
         request's keys are found when it joins the queue, again once any of
         them left both tiers, and every `_REQUEUE_STEPS` steps (a running
@@ -798,6 +817,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._queued = queued
         policy = self.ram_policy
         if not queued and (policy is None or not policy.has_queued):
+            self._queued_units = self._queued_states = set()
+            if self._checkpoints is not None:
+                self._checkpoints.queued_units = ()
             return
         gpu_queue = pool.free_block_queue
         # A RAM pool in LRU order keeps them at its far end too.
@@ -806,9 +828,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             if policy is not None
             else ((gpu_queue, gpu), (self.cpu_block_pool.free_block_queue, cpu))
         )
-        budget = _QUEUE_KEEP_SHARE * (
-            pool.num_gpu_blocks + self.cpu_block_pool.num_gpu_blocks
-        )
+        num_cpu_blocks = self.cpu_block_pool.num_gpu_blocks
+        budget = _QUEUE_KEEP_SHARE * (pool.num_gpu_blocks + num_cpu_blocks)
+        ram_budget = _QUEUE_RAM_SHARE * num_cpu_blocks
         kept: list[tuple[BlockHashWithGroupId, ...]] = []
         for request in order:
             keys = queued[request.request_id][1]
@@ -816,9 +838,19 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # key's block can sit in both tiers (RAM copies of what the GPU
             # keeps go first).
             budget -= len(keys)
-            if budget < 0:
+            ram_budget -= sum(cpu.get_one_block(key) is not None for key in keys)
+            if budget < 0 or ram_budget < 0:
                 break
             kept.append(keys)
+        self._queued_units = {get_block_hash(key) for keys in kept for key in keys}
+        self._queued_states = {
+            get_block_hash(key)
+            for keys in kept
+            for key in keys
+            if get_group_id(key) in self._mamba_gid_set
+        }
+        if self._checkpoints is not None:
+            self._checkpoints.queued_units = self._queued_states
         # The back of the queue first, each request's deepest first: the
         # queue's head ends at the far end.
         for keys in reversed(kept):
@@ -1251,7 +1283,6 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._stop_waiting(request_id)
         self._observed.discard(request_id)
         self._admitted_from_ram.discard(request_id)
-        self._pages_end.pop(request_id, None)
         parent = self._resumed_from.pop(request_id, None)
         loop_start = self._loop_start(request, parent)
         key = self._remember_end(request, loop_start)
@@ -1375,8 +1406,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
 
     def _drop_ram_state(self, state: BlockHash) -> None:
         """RAM drops the block-boundary state `state` no live session resumes
-        at, unless it is spaced or a point several continuations share."""
-        if self._shared(state):
+        at, unless it is spaced, a point several continuations share, or
+        where a queued request resumes."""
+        if self._shared(state) or state in self._queued_states:
             return
         cpu_pool = self.cpu_block_pool
         cpu = cpu_pool.cached_block_hash_to_block
@@ -1431,7 +1463,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         if not pending or checkpoints is None or pool is None:
             return
         graph = checkpoints.graph
-        waiting = set(checkpoints._resume.values())
+        waiting = set(checkpoints._resume.values()) | self._queued_states
         gpu = pool.cached_block_hash_to_block
         outcomes = self.prune_outcomes
         retry: dict[BlockHash, None] = {}
@@ -1442,6 +1474,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 if key in self._kept
                 else "frontier"
                 if unit is not None and unit.frontier
+                else "junction"
+                if key in self._junctions
                 else "branch point"
                 if self._shared(key)
                 else "held"
@@ -1550,7 +1584,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._held_units.clear()
         self._superseded.clear()
         self._junctions.clear()
-        self._pages_end.clear()
+        self._queued_units = self._queued_states = set()
+        if self._checkpoints is not None:
+            self._checkpoints.queued_units = ()
         self._extends_end.clear()
         if self.ram_policy is not None:
             self.ram_policy.reset()
@@ -1695,7 +1731,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._admitted_from_ram.discard(request_id)
         seen, key, extends_end = self._seen_end(request)
         self._hold_prefill_points(request, key, extends_end)
-        self._note_junction(request, num_computed_tokens)
+        self._note_junction(request, num_computed_tokens, seen)
         if key is None:
             return
         # The session resumed, whichever tier holds it.
@@ -1707,28 +1743,37 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         tier = "ram" if restored else "gpu" if num_computed_tokens else "cold"
         self.resume_stats.record(tier, max(0, seen - num_computed_tokens))
 
-    def _note_junction(self, request: "Request", num_computed_tokens: int) -> None:
-        """Remember a shared prefix's junction: the deepest block boundary of
-        the pages either tier held for the admitted `request` before it
-        allocated (`_pages_end`), when that is past the point it resumes at.
-        Another request wrote those pages (a
-        system prompt a new session or a compaction starts with, an earlier
-        message edited twice), and this one's prefill caches the state there
-        (`_raise_junction`): both tiers keep it as a point several
-        continuations share (`_shared`), so the next request with the same
-        prefix resumes at it. A resume at a junction keeps it remembered. A
-        session that re-reads its own pages, its states lost, keeps at most
-        that one state more."""
-        end = self._pages_end.pop(request.request_id, 0)
+    def _note_junction(
+        self, request: "Request", num_computed_tokens: int, seen: int
+    ) -> None:
+        """Remember a shared prefix's junction: where the admitted `request`'s
+        prefill stops to cache a state (`Request.shared_prefix_boundary`, to
+        its block), when that is past the point it resumes at and past the end
+        of a finished request it continues (`seen`). Another request wrote the
+        pages under it: a system prompt a new session or a compaction starts
+        with, an earlier message edited twice. Both tiers keep its state as a
+        point several continuations share (`_shared`), so the next request
+        with the same prefix resumes at it. A block-boundary state the request
+        resumes at past such an end is a junction too: another conversation
+        left it (sessions that started together computed their system prompt
+        at once, a branch point the checkpoint graph forgets once it rebuilds
+        the unit from RAM). A resume at a junction keeps it remembered. A
+        session that re-reads its own history, its states lost, marks none:
+        its next turn resumes at its new end."""
         hashes, unit = request.block_hashes, self.hash_block_size
-        junctions = self._junctions
         if num_computed_tokens and not num_computed_tokens % self.block_size:
             resumed = hashes[num_computed_tokens // unit - 1]
-            if resumed in junctions:
-                junctions.move_to_end(resumed)
-        if end <= num_computed_tokens:
+            if resumed in self._junctions:
+                self._junctions.move_to_end(resumed)
+            elif num_computed_tokens > seen:
+                self._add_junction(request, resumed)
+        end = request.shared_prefix_boundary // self.block_size * self.block_size
+        if end <= max(num_computed_tokens, seen) or end // unit > len(hashes):
             return
-        key = hashes[end // unit - 1]
+        self._add_junction(request, hashes[end // unit - 1])
+
+    def _add_junction(self, request: "Request", key: BlockHash) -> None:
+        junctions = self._junctions
         junctions[key] = None
         junctions.move_to_end(key)
         while len(junctions) > _MAX_SEEN_ENDS:

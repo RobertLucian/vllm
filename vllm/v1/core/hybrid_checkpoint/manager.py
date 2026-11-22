@@ -24,7 +24,7 @@ never released this way; the eviction order decides when they go.
 """
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING, Any
 
 from vllm.v1.core.hybrid_checkpoint.cost import PrefillCostModel
@@ -231,6 +231,9 @@ class HybridCheckpointManager:
             self.frontiers.reclaim = True
         # Request -> the unit its latest lookup resumes it at, until admitted.
         self._resume: dict[str, BlockHash] = {}
+        # Units queued requests resume at that no lookup reached yet (a KV
+        # connector's, as it sees the waiting queue): needed too.
+        self.queued_units: Collection[BlockHash] = ()
         # Request -> units its admissions already counted as hits.
         self._touched: dict[str, set[BlockHash]] = {}
         # Requests resumed at a frontier inside an open indexer group, until it
@@ -513,8 +516,9 @@ class HybridCheckpointManager:
 
     def _needed(self, key: BlockHash, waiting: set[BlockHash]) -> bool:
         """Whether a waiting request resumes at the unit `key`: its lookup did
-        (`waiting`), or under GreedyDual-Size its hit pins the unit."""
-        if key in waiting:
+        (`waiting`, `queued_units`), or under GreedyDual-Size its hit pins
+        the unit."""
+        if key in waiting or key in self.queued_units:
             return True
         unit = self.graph.units.get(key)
         return (
