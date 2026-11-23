@@ -1125,6 +1125,14 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         stats.started += 1
         return None, False
 
+    def _kept_copies(self) -> int:
+        """Free RAM blocks RAM never takes for the walk's copies: copies of
+        GPU blocks about to leave, in LRU order. RAM GDSF takes those too, by
+        value, last (`leaving_copies`), as the walk's budget counts them."""
+        if self.cpu_block_pool.eviction_policy is not None:
+            return 0
+        return len(self.leaving_copies())
+
     def _chunk_blocks(self) -> int:
         """RAM blocks a chunked restore loads at a time: at most a quarter of
         RAM, which must take the GPU's blocks it spills meanwhile."""
@@ -1145,7 +1153,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         cpu_free = (
             self.cpu_block_pool.get_num_free_blocks()
             - sum(not b.ref_cnt for b in loads)
-            - len(self.leaving_copies())
+            - self._kept_copies()
         )
         return cpu_free >= k
 
@@ -1276,7 +1284,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # pins its own only while the rest of RAM still takes those
             # (copies of blocks about to leave take nothing: `leaving_copies`).
             cpu_pool = self.cpu_block_pool
-            free = cpu_pool.get_num_free_blocks() - len(self.leaving_copies())
+            free = cpu_pool.get_num_free_blocks() - self._kept_copies()
             if free - len(loads) >= len(loads):
                 cpu_pool.touch(loads)
                 self._head_pins = list(loads)

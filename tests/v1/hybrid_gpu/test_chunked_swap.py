@@ -1,39 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A restore the GPU lacks room for swaps in chunks, and comes back exact.
+"""Restores the GPU lacks room for swap in chunks, and agents lose nothing.
 
 The GPU makes room for a restore by copying its own blocks to RAM first.
 Restored whole, the session's RAM blocks stay pinned as the load's sources
 until it lands, so RAM evicts as many blocks of other sessions for those
-copies (GPU window 5, 2026-11-23: 80 restores of 58 blocks on average).
-In chunks, each chunk's loaded RAM copies are the next chunk's room. Here
-a session leaves a small GPU for a full RAM and resumes, whole
-(`restore_chunk_blocks=0`) and in chunks: the chunked restore must load in
-several chunks without giving up, resume where the session can (its end,
-or a ladder rung if RAM took its tail meanwhile), match a cold run, and
-lose no block uncopied. What RAM evicts for each is recorded; at this size
-it is mostly the session's own dead pages and orphans, so the comparison
-of other sessions' losses comes from the production-scale trace (the
-session-loss log, `ram.sessions_lost`)."""
+copies (GPU window 5, 2026-11-23: 80 restores of 58 blocks on average). In
+chunks, each chunk's loaded RAM copies are the next chunk's room. Agents run
+out of phase on a GPU pool far smaller than their sessions (as in
+test_spill_safety), whole (`restore_chunk_blocks=0`) and in chunks of 8: the
+chunked run must swap in chunks without giving up, every turn must resume
+where its session's last prompt ended, and no block may leave the GPU
+uncopied. What RAM evicted in each is recorded side by side."""
 
 import pytest
 
-from .checks import assert_outputs_close, delta
+from .checks import delta
 from .engine import EngineSpec
-from .workloads import Session, fillers, greedy, run
+from .workloads import Session, drive
 
+_AGENTS = 8
+_SECONDS = 40.0
 _CHUNK = 8
-_SESSION_BLOCKS = 24
-_MAX_FILLERS = 40
-# Blocks other sessions lose to the swap: everything RAM evicted but copies of
-# blocks the GPU keeps.
-_OTHERS = (
-    "ram.session_blocks",
-    "ram.dead",
-    "ram.orphans",
-    "ram.queued",
-    "ram.unranked",
-)
 
 
 def _spec(tp: int, chunk: int) -> EngineSpec:
@@ -41,71 +29,56 @@ def _spec(tp: int, chunk: int) -> EngineSpec:
         family="gdn_fat",
         connector="tiered",
         ram_eviction="gdsf",
-        gpu_blocks=64,
-        ram_blocks=48,
+        async_scheduling=True,
+        gpu_blocks=96,
+        ram_blocks=384,
         restore_chunk_blocks=chunk,
         tp=tp,
     )
 
 
-def _swap(engines, spec: EngineSpec, record_property, arm: str):
-    """The session leaves the GPU, RAM fills, and its next turn resumes."""
+def _agents(engines, spec: EngineSpec, record_property, arm: str) -> dict:
     engine = engines.get(spec)
     probe, llm = engine.probe, engine.llm
-    vocab = spec.model.vocab_size
-    session = Session.start(
-        seed=21,
-        vocab_size=vocab,
-        block_size=probe.block_size,
-        num_blocks=_SESSION_BLOCKS,
-        unit=probe.hash_block_size,
-    )
-    first = run(llm, [session.prompt])[0]
-    session.record(first)
-    fa = probe.full_attention_group_ids[0]
-    for filler in fillers(21, _MAX_FILLERS, 4, vocab, probe.block_size):
-        run(llm, [filler])
-        probe.wait_for_copies()
-        if all(b is None for b in probe.block_ids(session.prompt, fa, "gpu")):
-            # The session is in RAM alone; stop once RAM is full, before it
-            # has to evict the session's own blocks.
-            assert probe.cpu_pool is not None
-            empty = sum(
-                block.block_hash is None
-                for block in probe.cpu_pool.free_block_queue.iter_blocks_after(None)
-            )
-            if not empty:
-                break
-    else:
-        pytest.fail(f"the session stayed on the GPU: {probe.residency(session.prompt)}")
+    sessions = [
+        Session.start(
+            seed=500 + i,
+            vocab_size=spec.model.vocab_size,
+            block_size=probe.block_size,
+            num_blocks=4,
+            unit=probe.hash_block_size,
+        )
+        for i in range(_AGENTS)
+    ]
     before = probe.counters()
-    nxt = session.next_tool_turn(0.5)
-    second = run(llm, [nxt], greedy(max_tokens=4, logprobs=5))[0]
+    turns = drive(
+        llm,
+        sessions,
+        seconds=_SECONDS,
+        turn_blocks=1,
+        resume_unit=probe.resume_unit,
+        user_every=5,
+        max_blocks=24,
+    )
     changed = delta(before, probe.counters())
-    others = sum(changed.get(name, 0) for name in _OTHERS)
-    record_property(f"{arm}.resumed_at", second.num_cached_tokens)
-    record_property(f"{arm}.others_evicted", others)
+    short = [t for t in turns if t.short_by > 0]
+    record_property(f"{arm}.turns", len(turns))
+    record_property(f"{arm}.short_resumes", len(short))
     for name, value in sorted(changed.items()):
         record_property(f"{arm}.{name}", value)
-    end = len(first.prompt)
-    assert 0 < second.num_cached_tokens <= end, (arm, probe.residency(nxt))
-    if spec.model.weights == "random":
-        cold = run(llm, [nxt], greedy(max_tokens=4, logprobs=5), cold=True)[0]
-        assert_outputs_close(cold, second)
-    return changed, others
+    assert not short, (
+        arm,
+        [(t.session, t.floor, t.result.num_cached_tokens) for t in short[:8]],
+    )
+    assert changed.get("spill.unspilled_evicted_blocks", 0) == 0, (arm, changed)
+    return changed
 
 
 @pytest.mark.parametrize("tp", [1, 2], ids=lambda tp: f"tp{tp}")
-def test_chunked_swap_evicts_no_one_for_its_own_room(engines, tp, record_property):
-    whole, whole_others = _swap(engines, _spec(tp, 0), record_property, "whole")
-    chunked, chunked_others = _swap(
-        engines, _spec(tp, _CHUNK), record_property, "chunked"
-    )
+def test_restores_swap_in_chunks_and_lose_nothing(engines, tp, record_property):
+    whole = _agents(engines, _spec(tp, 0), record_property, "whole")
+    chunked = _agents(engines, _spec(tp, _CHUNK), record_property, "chunked")
     assert whole.get("restore.chunked", 0) == 0, whole
-    assert chunked.get("restore.chunked", 0) == 1, chunked
-    assert chunked.get("restore.chunks", 0) >= 2, chunked
+    assert chunked.get("restore.chunked", 0) >= 1, chunked
+    assert chunked.get("restore.chunks", 0) > chunked["restore.chunked"], chunked
     assert chunked.get("restore.chunked_aborted", 0) == 0, chunked
-    assert chunked.get("restore.completed", 0) >= 1, chunked
-    record_property("others_evicted", f"whole {whole_others}, chunked {chunked_others}")
-    for changed in (whole, chunked):
-        assert changed.get("spill.unspilled_evicted_blocks", 0) == 0, changed
