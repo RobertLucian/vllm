@@ -59,7 +59,8 @@ from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     make_block_hash_with_group_id,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import (
@@ -329,6 +330,18 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             if isinstance(groups[g].kv_cache_spec, MambaSpec)
         ]
         self._mamba_gid_set = set(self.mamba_gids)
+        # Sliding-window groups, and the blocks a cache hit reads from each
+        # before its point (its window): a resume restores them too, at block
+        # boundaries only (`_window_pieces`).
+        self._window_blocks = {
+            g: cdiv(spec.sliding_window - 1, self.block_size)
+            for g in self.prefix_cacheable_group_ids
+            if isinstance(spec := groups[g].kv_cache_spec, SlidingWindowSpec)
+        }
+        # A window in blocks of another size than the pages' is not restored.
+        self._windows_restorable = all(
+            self.group_block_sizes[g] == self.block_size for g in self._window_blocks
+        )
         self.units_per_block = self.block_size // self.hash_block_size
         self._state_spacing = ram_state_spacing_blocks * self.block_size
         # Block-boundary states both tiers keep besides the spaced ones: each
@@ -1089,7 +1102,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _resume_points(self, request: "Request") -> Iterator[_Plan]:
         """Points `request` can resume at with blocks from either tier,
         deepest first: exact-end states (GPU frontiers and RAM ones), then
-        states at hash-unit boundaries."""
+        states at hash-unit boundaries. With sliding-window groups, only
+        block boundaries whose windows either tier holds (`_window_pieces`):
+        the GPU's lookup after the restore finds a hit there only with them."""
+        windows = self._window_blocks
+        if windows and not self._windows_restorable:
+            return
         find = self._find
         unit = self.hash_block_size
         hashes = request.block_hashes
@@ -1107,7 +1125,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         )
         for h in range(top, -1, -1):
             anchor = hashes[h - 1] if h else None
-            if hash_fn is not None:
+            # An exact end inside a block would need a window's partial page.
+            if hash_fn is not None and not windows:
                 yield from self._frontier_points(
                     request,
                     h,
@@ -1123,7 +1142,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 break
             num_tokens = h * unit
             k = num_tokens // self.block_size
-            if k > len(chain):
+            if k > len(chain) or (windows and num_tokens % self.block_size):
                 continue
             block_hash = hashes[h - 1]
             states = []
@@ -1139,7 +1158,34 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                     if page is None:
                         continue
                     pieces.append(page)
+                if windows:
+                    window = self._window_pieces(hashes, k)
+                    if window is None:
+                        continue
+                    pieces += window
                 yield _Plan(num_tokens, pieces, state=(block_hash, num_tokens))
+
+    def _window_pieces(self, hashes: Any, k: int) -> list[_Piece] | None:
+        """The sliding-window groups' blocks a cache hit `k` blocks long reads:
+        each group's window before it, and one block past it where the
+        scheduler drops a speculative decoding block from hits. None if
+        neither tier holds one of them."""
+        manager = self._kv_cache_manager
+        past = 1 if manager is not None and manager.use_eagle else 0
+        per_block = self.units_per_block
+        last = min(k + past, len(hashes) // per_block)
+        pieces = []
+        for group_id, window in self._window_blocks.items():
+            for i in range(max(0, k - window), last):
+                piece = self._find(
+                    make_block_hash_with_group_id(
+                        hashes[(i + 1) * per_block - 1], group_id
+                    )
+                )
+                if piece is None:
+                    return None
+                pieces.append(piece)
+        return pieces
 
     def _frontier_points(
         self,
