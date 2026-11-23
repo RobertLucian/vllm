@@ -66,6 +66,15 @@ _MAX_SESSIONS = 4096
 _DECAY_STEPS = 4
 # Hash units remembered as disowned, the most recent kept.
 _MAX_DISOWNED = 1 << 18
+# A session with turn gaps on record keeps its resume count undecayed while
+# it is not overdue (`_freq`), at most this many.
+_MAX_LIVE_FREQ = 8.0
+# The weight of the latest gap in a session's average (`arrived`).
+_GAP_WEIGHT = 0.5
+# Score floors: RAM blocks nothing reads go first, then overdue sessions'
+# (`_scored`); live sessions score from 0 up.
+_DEAD_SCORE = -2.0
+_OVERDUE_SCORE = -1.0
 
 
 @dataclass(slots=True)
@@ -79,6 +88,12 @@ class _Session:
     # The clock when it was last used: GreedyDual's aging.
     stamp: float = 0.0
     version: int = 0
+    # Average seconds from a turn finishing to the next one arriving, for
+    # tool-loop turns and for user turns (0: none seen), and the requests
+    # that resume it now, queued or running (`arrived`, `departed`).
+    gap_tool: float = 0.0
+    gap_user: float = 0.0
+    active: int = 0
 
 
 @dataclass(slots=True)
@@ -95,6 +110,10 @@ class _Walk:
     # and past the point it resumes at.
     live: list[list[KVCacheBlock]] = field(default_factory=list)
     dead: list[KVCacheBlock] = field(default_factory=list)
+    # The deepest point it resumes at with blocks of either tier, and the
+    # deepest it shares with other sessions.
+    reach: int = 0
+    shared: int = 0
 
 
 @dataclass
@@ -113,11 +132,33 @@ class RamEvictionStats:
     # nothing but queued requests' blocks could go otherwise. Their GPU
     # blocks leave uncopied.
     leaving: int = 0
+    # Sessions these evictions left with no point of their own to resume at
+    # (`settle`): their next turns re-read them whole.
+    sessions_lost: int = 0
     # Blocks with a key the pool took in its own LRU order: none of the above
     # could go (all in use).
     unranked: int = 0
     retired: int = 0
     counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SessionLoss:
+    """A session RAM's evictions left with no point of its own to resume at
+    (`RamGreedyDualSizeFrequency.settle`)."""
+
+    key: BlockHash
+    # Tokens its last turn ended at, and the deepest point it could resume
+    # at before and after the evictions (both tiers; the latter at most the
+    # point it shares with other sessions).
+    end: int
+    reach_before: int
+    reach_after: int
+    # Its blocks the evictions took, and their kinds (`prepare_eviction`).
+    blocks: int
+    kinds: tuple[str, ...]
+    # Seconds since it was last used (its turn finished or it was resumed).
+    idle_s: float
 
 
 class RamGreedyDualSizeFrequency:
@@ -133,6 +174,8 @@ class RamGreedyDualSizeFrequency:
         block_size: int,
         half_life_s: float,
         on_gpu: Callable[[BlockHashWithGroupId], bool],
+        abandon_gap_multiplier: float = 0.0,
+        abandon_floor_s: float = 30.0,
         gpu_keeps: Callable[[], Callable[[BlockHashWithGroupId], bool]] | None = None,
         leaving: Callable[[], Iterable[KVCacheBlock]] | None = None,
         dropped: Callable[[list[KVCacheBlock]], None] | None = None,
@@ -146,6 +189,11 @@ class RamGreedyDualSizeFrequency:
         self.group_ids = [page_group_id, *state_group_ids]
         self.block_size = block_size
         self.half_life_s = half_life_s
+        # A session idle for this many times its longer turn gap (at least
+        # `abandon_floor_s`) is overdue: abandoned, it goes before every live
+        # session (`_overdue`). 0: off, frequency halves every half-life.
+        self.abandon_gap_multiplier = abandon_gap_multiplier
+        self.abandon_floor_s = abandon_floor_s
         self.on_gpu = on_gpu
         self.gpu_keeps = gpu_keeps
         # Copies of GPU blocks about to leave, which the GPU waits for to drop
@@ -173,14 +221,24 @@ class RamGreedyDualSizeFrequency:
         self._decay_every = half_life_s / _DECAY_STEPS
         self._decayed_at = self.now()
         self.stats = RamEvictionStats()
-        # Retired sessions' (frequency, when): a later turn inherits it.
-        self._retired: OrderedDict[BlockHash, tuple[float, float]] = OrderedDict()
+        # Retired sessions' (frequency, when, tool gap, user gap): a later turn
+        # inherits them.
+        self._retired: OrderedDict[BlockHash, tuple[float, float, float, float]] = (
+            OrderedDict()
+        )
+        # (when it becomes overdue, its version then, key): sessions are scored
+        # again then (`_rescore_overdue`), as scores are fixed when pushed.
+        self._due: list[tuple[float, int, BlockHash]] = []
         self._to_retire: list[_Session] = []
         # Blocks stored since the last two evictions. The GPU drops the
         # blocks they copy only once the copies exist: evicting a fresh copy
         # first would make the GPU copy the block again.
         self._fresh: set[int] = set()
         self._fresher: set[int] = set()
+        # Sessions whose blocks evictions took since the last `settle`: the
+        # session, the point it resumed at before, its blocks taken, and the
+        # kinds of eviction.
+        self._touched: dict[BlockHash, tuple[_Session, int, list[int], set[str]]] = {}
 
     # ------------------------------------------------------------------
     # Sessions
@@ -200,10 +258,21 @@ class RamGreedyDualSizeFrequency:
         if session is not None:
             self._disown(session)
         freq = self._parent_freq(parent, now) if parent != key else 0.0
+        gaps = self._parent_gaps(parent) if parent != key else (0.0, 0.0)
+        if parent is not None and parent != key:
+            # Inherited: a retired parent's record is used up.
+            self._retired.pop(parent, None)
         if parent is not None and parent != key and parent in self.sessions:
             self._retire(self.sessions[parent], now)
         session = _Session(
-            key, end, sorted(set(units), reverse=True), freq, now, stamp=self.clock
+            key,
+            end,
+            sorted(set(units), reverse=True),
+            freq,
+            now,
+            stamp=self.clock,
+            gap_tool=gaps[0],
+            gap_user=gaps[1],
         )
         self.sessions[key] = session
         for _, unit in session.units:
@@ -215,10 +284,94 @@ class RamGreedyDualSizeFrequency:
                 # Its unit is no longer its own: its value changed.
                 self._push(self.sessions[other])
         self._push(session)
+        self._schedule_due(session)
         while len(self.sessions) > _MAX_SESSIONS:
             _, oldest = self.sessions.popitem(last=False)
             self._disown(oldest)
         self._retire_pending(now)
+
+    def arrived(self, key: BlockHash, at: float, extends_end: bool) -> None:
+        """A request that resumes session `key` arrived at `at` (this policy's
+        clock): one more gap on record, of a tool loop's turn (`extends_end`)
+        or a user turn, and the session is live while the request is queued
+        or runs (`departed`)."""
+        session = self.sessions.get(key)
+        if session is None:
+            retired = self._retired.get(key)
+            if retired is not None and at > retired[1]:
+                freq, when, tool, user = retired
+                tool, user = self._with_gap(tool, user, at - when, extends_end)
+                self._retired[key] = (freq, when, tool, user)
+            return
+        if at > session.freq_at:
+            session.gap_tool, session.gap_user = self._with_gap(
+                session.gap_tool, session.gap_user, at - session.freq_at, extends_end
+            )
+        session.active += 1
+        self._push(session)
+
+    def departed(self, key: BlockHash) -> None:
+        """A request `arrived` counted finished or left (`arrived`)."""
+        session = self.sessions.get(key)
+        if session is None or not session.active:
+            return
+        session.active -= 1
+        if not session.active:
+            self._schedule_due(session)
+
+    @staticmethod
+    def _with_gap(
+        tool: float, user: float, gap: float, extends_end: bool
+    ) -> tuple[float, float]:
+        old = tool if extends_end else user
+        new = gap if not old else _GAP_WEIGHT * gap + (1 - _GAP_WEIGHT) * old
+        return (new, user) if extends_end else (tool, new)
+
+    def _parent_gaps(self, parent: BlockHash | None) -> tuple[float, float]:
+        if parent is None:
+            return 0.0, 0.0
+        session = self.sessions.get(parent)
+        if session is not None:
+            return session.gap_tool, session.gap_user
+        retired = self._retired.get(parent)
+        return (0.0, 0.0) if retired is None else (retired[2], retired[3])
+
+    def _patience(self, session: _Session) -> float | None:
+        """Seconds idle after which `session` is overdue, or None (no gap on
+        record, or the rule is off)."""
+        gap = max(session.gap_tool, session.gap_user)
+        if not self.abandon_gap_multiplier or not gap:
+            return None
+        return self.abandon_gap_multiplier * max(gap, self.abandon_floor_s)
+
+    def _overdue(self, session: _Session, now: float) -> bool:
+        """Whether `session` is abandoned by its own rhythm: no request of its
+        is queued or running and it has been idle longer than its patience
+        (`abandon_gap_multiplier` times its longer turn gap, tool loop or
+        user, at least `abandon_floor_s`: a tool call's gap is short, a
+        person's long, and the same agent has both)."""
+        patience = self._patience(session)
+        return (
+            patience is not None
+            and not session.active
+            and now - session.freq_at > patience
+        )
+
+    def _schedule_due(self, session: _Session) -> None:
+        patience = self._patience(session)
+        if patience is not None and not session.active:
+            heapq.heappush(
+                self._due, (session.freq_at + patience, session.version, session.key)
+            )
+
+    def _rescore_overdue(self, now: float) -> None:
+        """Sessions that turned overdue since they were scored go to the
+        overdue tier now."""
+        while self._due and self._due[0][0] <= now:
+            _, version, key = heapq.heappop(self._due)
+            session = self.sessions.get(key)
+            if session is not None and session.version == version:
+                self._push(session)
 
     def resumed(self, key: BlockHash) -> None:
         """A request resumes at the end of session `key`."""
@@ -227,8 +380,13 @@ class RamGreedyDualSizeFrequency:
         if session is None:
             retired = self._retired.get(key)
             if retired is not None:
-                freq, at = retired
-                self._retired[key] = (self._decayed(freq, at, now) + 1.0, now)
+                freq, at, tool, user = retired
+                self._retired[key] = (
+                    self._decayed(freq, at, now) + 1.0,
+                    now,
+                    tool,
+                    user,
+                )
                 self._retired.move_to_end(key)
             return
         session.freq = self._freq(session, now) + 1.0
@@ -236,6 +394,7 @@ class RamGreedyDualSizeFrequency:
         session.stamp = self.clock
         self.sessions.move_to_end(key)
         self._push(session)
+        self._schedule_due(session)
         self._retire_pending(now)
 
     def _parent_freq(self, parent: BlockHash | None, now: float) -> float:
@@ -244,8 +403,8 @@ class RamGreedyDualSizeFrequency:
         session = self.sessions.get(parent)
         if session is not None:
             return self._freq(session, now)
-        retired = self._retired.pop(parent, None)
-        return 0.0 if retired is None else self._decayed(*retired, now)
+        retired = self._retired.get(parent)
+        return 0.0 if retired is None else self._decayed(retired[0], retired[1], now)
 
     def _retire(self, session: _Session, now: float) -> None:
         """`session` adds nothing to the sessions that share its blocks, or a
@@ -254,7 +413,12 @@ class RamGreedyDualSizeFrequency:
             return
         self._disown(session)
         self.stats.retired += 1
-        self._retired[session.key] = (self._freq(session, now), now)
+        self._retired[session.key] = (
+            self._freq(session, now),
+            now,
+            session.gap_tool,
+            session.gap_user,
+        )
         self._retired.move_to_end(session.key)
         while len(self._retired) > _MAX_SESSIONS:
             self._retired.popitem(last=False)
@@ -363,6 +527,12 @@ class RamGreedyDualSizeFrequency:
         return found
 
     def _freq(self, session: _Session, now: float) -> float:
+        """Its resumes, halved every half-life; with turn gaps on record
+        (`abandon_gap_multiplier`), undecayed while it is not overdue: a slow
+        agent's steady rhythm is no reason to forget it (window 5: 7 of 9
+        sessions RAM lost whole were slow agents)."""
+        if self._patience(session) is not None and not self._overdue(session, now):
+            return min(session.freq, _MAX_LIVE_FREQ)
         return self._decayed(session.freq, session.freq_at, now)
 
     def _decayed(self, freq: float, at: float, now: float) -> float:
@@ -453,6 +623,7 @@ class RamGreedyDualSizeFrequency:
                 walk.dead.extend(b for b in unlisted if not self._is_queued(b))
             elif last and position > cut and unlisted:
                 walk.live.append(unlisted)
+        walk.reach, walk.shared = reach, shared
         if reach > shared:
             walk.gain = self.cost.seconds(shared, reach)
             walk.gain_last = self.cost.seconds(max(previous, shared), reach)
@@ -473,15 +644,21 @@ class RamGreedyDualSizeFrequency:
         walk = self._walk(session, gone)
         if walk.dead:
             # RAM blocks nothing reads: before any value.
-            return 0.0, walk
+            return _DEAD_SCORE, walk
         if walk.gain <= 0.0:
             self._to_retire.append(session)
             return float("inf"), walk
         if not walk.live:
             # No tail in RAM to give.
             return float("inf"), walk
-        value = (1.0 + self._freq(session, now)) * walk.gain_last
-        return session.stamp + value / max(1, walk.size_last), walk
+        value = (
+            (1.0 + self._freq(session, now)) * walk.gain_last / max(1, walk.size_last)
+        )
+        if self._overdue(session, now):
+            # Abandoned by its own rhythm: before every live session, the
+            # cheapest first.
+            return _OVERDUE_SCORE + value / (1.0 + value), walk
+        return session.stamp + value, walk
 
     def _push(self, session: _Session) -> None:
         session.version = next(self._seq)
@@ -529,6 +706,7 @@ class RamGreedyDualSizeFrequency:
         them wait on. When one goes all the same, its GPU block may leave
         uncopied (`dropped`): RAM's value order chose it."""
         self._decay()
+        self._rescore_overdue(self.now())
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
         seen: set[int] = set()
@@ -538,6 +716,9 @@ class RamGreedyDualSizeFrequency:
             {b.block_id for b in self.leaving()} if self.leaving is not None else set()
         )
         was_leaving = set(leaving)
+        # The kind of eviction under way, by victim (`_note_taken`).
+        kind = ["unkeyed"]
+        kinds: dict[int, str] = {}
 
         def may_go(
             block: KVCacheBlock, even_fresh: bool = False, even_queued: bool = False
@@ -559,6 +740,7 @@ class RamGreedyDualSizeFrequency:
                 return False
             seen.add(block.block_id)
             victims.append(block)
+            kinds[block.block_id] = kind[0]
             return True
 
         extra = self.pool.cached_block_hashes_by_block
@@ -566,6 +748,7 @@ class RamGreedyDualSizeFrequency:
         def take_orphans() -> bool:
             """Blocks no session owns, in LRU order; fresh ones too if only
             retired sessions owned them (the GPU does not copy them again)."""
+            kind[0] = "orphan"
             for block in queue.iter_blocks_after(None):
                 if block.block_hash is None or self._owned(block):
                     continue
@@ -576,10 +759,12 @@ class RamGreedyDualSizeFrequency:
                         return True
             return False
 
-        def take_ranked() -> None:
+        def take_ranked(label: str = "session") -> None:
             if not take_orphans():
+                kind[0] = "duplicate"
                 self._take_duplicates(take, victims, num_blocks)
                 if len(victims) < num_blocks:
+                    kind[0] = label
                     self._take_sessions(take, may_go, victims, num_blocks, seen)
 
         # Free blocks without a key first.
@@ -597,11 +782,13 @@ class RamGreedyDualSizeFrequency:
                 # Copies of blocks about to leave too, by value, before what
                 # queued requests resume from.
                 leaving.clear()
-                take_ranked()
+                take_ranked("leaving")
             if len(victims) < num_blocks and self._queued:
+                kind[0] = "queued"
                 self._take_queued(take, victims, num_blocks)
             if len(victims) < num_blocks:
                 # The rest in the pool's LRU order, live sessions' blocks too.
+                kind[0] = "unranked"
                 for block in queue.iter_blocks_after(None):
                     if take(block, True, True):
                         self.stats.unranked += 1
@@ -622,11 +809,73 @@ class RamGreedyDualSizeFrequency:
             ]
             if dropped and self.dropped is not None:
                 self.dropped(dropped)
+        # The pool takes the first `num_blocks` (a unit can take it past).
+        self._note_taken(victims[:num_blocks], kinds)
         moved = [b for b in victims if b.prev_free_block is not None]
         for block in moved:
             queue.remove(block)
         queue.prepend_n(moved)
         self._retire_pending(self.now())
+
+    def _note_taken(self, taken: list[KVCacheBlock], kinds: dict[int, str]) -> None:
+        """Before the pool evicts `taken`: note the point each session owning
+        some of them resumes at, while they are still cached, for `settle`."""
+        extra = self.pool.cached_block_hashes_by_block
+        for block in taken:
+            if block.block_hash is None:
+                continue
+            self.note_evicting(
+                (block.block_hash, *extra.get(block.block_id, ())),
+                kinds.get(block.block_id, "unranked"),
+            )
+
+    def note_evicting(self, keys: Iterable[BlockHashWithGroupId], kind: str) -> None:
+        """A block under `keys` is about to leave a tier with no copy in the
+        other (`kind`: how): note the point each session owning one of them
+        resumes at, while it is still cached, for `settle`. The GPU dropping
+        a block RAM does not hold loses a session's point just as RAM
+        evicting one does."""
+        owners: set[BlockHash] = set()
+        for key in keys:
+            owners.update(self.owners.get(get_block_hash(key), ()))
+        for owner in owners:
+            touched = self._touched.get(owner)
+            if touched is None:
+                session = self.sessions.get(owner)
+                if session is None:
+                    continue
+                touched = (session, self._walk(session).reach, [0], set())
+                self._touched[owner] = touched
+            touched[2][0] += 1
+            touched[3].add(kind)
+
+    def settle(self) -> list[SessionLoss]:
+        """After the evictions since the last call: the sessions they left
+        with no point of their own to resume at, which resumed deeper than
+        what they share before (`RamEvictionStats.sessions_lost`). A session
+        loses its tail first, so this is the eviction that took its last
+        resume point: its next turn re-reads it whole."""
+        if not self._touched:
+            return []
+        now = self.now()
+        losses = []
+        for key, (session, before, blocks, kinds) in self._touched.items():
+            walk = self._walk(session)
+            if before > walk.shared and walk.reach <= walk.shared:
+                self.stats.sessions_lost += 1
+                losses.append(
+                    SessionLoss(
+                        key,
+                        session.end,
+                        before,
+                        walk.reach,
+                        blocks[0],
+                        tuple(sorted(kinds)),
+                        now - session.freq_at,
+                    )
+                )
+        self._touched.clear()
+        return losses
 
     def _take_queued(
         self,
@@ -801,7 +1050,8 @@ class RamGreedyDualSizeFrequency:
             if dead:
                 self.stats.dead += len(victims) - taken
             else:
-                self.clock = max(self.clock, current)
+                if current >= 0.0:
+                    self.clock = max(self.clock, current)
                 self.stats.sessions += 1
                 self.stats.session_blocks += len(victims) - taken
             session.version = next(self._seq)
@@ -842,3 +1092,5 @@ class RamGreedyDualSizeFrequency:
         self._to_retire.clear()
         self._fresh.clear()
         self._fresher.clear()
+        self._touched.clear()
+        self._due.clear()

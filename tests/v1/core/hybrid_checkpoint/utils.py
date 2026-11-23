@@ -108,6 +108,15 @@ def tiered_cpu_connector(
             "prefill_cost_coefficients": [1.862e-5, 3.33e-6],
             "ram_state_spacing_blocks": ram_state_spacing_blocks,
             "copy_ahead_blocks": copy_ahead_blocks,
+            # This harness models neither DMA time nor production's Mamba
+            # retention: chunked restores are tested on CUDA
+            # (tests/v1/hybrid_gpu).
+            "restore_chunk_blocks": 0,
+            # Its dense Mamba retention keeps every chunk's state, so rungs
+            # would only shift its sessions' points; tested on CUDA too.
+            "ram_ladder_blocks": 0,
+            # Its fake clock has no turn gaps to speak of.
+            "abandon_gap_multiplier": 0,
         },
     )
 

@@ -68,6 +68,7 @@ class TieredMetricName:
     GPU_STATE_PRUNES = "vllm:tiered_kv_gpu_state_prunes_total"
     GPU_STATE_BLOCKS = "vllm:tiered_kv_gpu_state_blocks"
     RAM_STATES_DROPPED = "vllm:tiered_kv_ram_states_dropped_total"
+    RAM_SESSIONS_LOST = "vllm:tiered_kv_ram_sessions_lost_total"
 
 
 class _MetricType:
@@ -418,6 +419,16 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                     "session resumed there."
                 ),
                 [],
+            ),
+            (
+                TieredMetricName.RAM_SESSIONS_LOST,
+                _MetricType.COUNTER,
+                (
+                    "Sessions RAM evictions left with no point to resume at "
+                    "(their next turn re-reads them whole), by the kind of "
+                    "eviction that took the last one."
+                ),
+                ["kind"],
             ),
         ]
         for name, kind, documentation, extra_labels in definitions:

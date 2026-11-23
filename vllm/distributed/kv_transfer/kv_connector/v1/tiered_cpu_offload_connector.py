@@ -22,8 +22,16 @@ Configuration (``kv_connector_extra_config``): SimpleCPU's ``cpu_bytes_to_use``
 / ``num_cpu_blocks``, plus ``ram_eviction``, ``prefill_cost_coefficients``
 (``[D, E]``, seconds per token and per token per 100k of context, used by
 ``gdsf``), ``frequency_half_life_seconds``, ``ram_state_spacing_blocks``
-(default 0, off), ``prune_gpu_states`` (default true) and
-``copy_ahead_blocks`` (default 0: the lazy walk's own target).
+(default 0, off), ``prune_gpu_states`` (default true),
+``copy_ahead_blocks`` (default 0: the lazy walk's own target),
+``restore_chunk_blocks`` (default 16: a restore the GPU lacks room for loads
+in chunks of this many blocks, a swap; 0 restores whole),
+``ram_ladder_blocks`` (default 8: a session keeps a state per doubling
+stretch from this many blocks back from its end, so RAM evicts its tail down
+to a rung, not all of it; 0, off) and ``abandon_gap_multiplier`` /
+``abandon_floor_seconds`` (default 2.5 / 30: RAM GDSF evicts a session idle
+that many times its turn gap, at least the floor, before any live one; 0,
+off).
 """
 
 from collections.abc import Iterable
@@ -90,6 +98,12 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
             ),
             "prune_gpu_states": bool(extra_config.get("prune_gpu_states", True)),
             "copy_ahead_blocks": int(extra_config.get("copy_ahead_blocks", 0)),
+            "restore_chunk_blocks": int(extra_config.get("restore_chunk_blocks", 16)),
+            "ram_ladder_blocks": int(extra_config.get("ram_ladder_blocks", 8)),
+            "abandon_gap_multiplier": float(
+                extra_config.get("abandon_gap_multiplier", 2.5)
+            ),
+            "abandon_floor_s": float(extra_config.get("abandon_floor_seconds", 30.0)),
         }
 
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:

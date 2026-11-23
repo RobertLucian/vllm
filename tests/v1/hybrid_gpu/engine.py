@@ -44,6 +44,16 @@ class EngineSpec:
     gpu_blocks: int = 64
     ram_blocks: int = 128
     copy_ahead_blocks: int = 0
+    # RAM blocks a restore loads at a time when the GPU lacks room for all of
+    # it (0: the whole session at once).
+    restore_chunk_blocks: int = 16
+    # A session's checkpoint ladder: its first rung this many blocks back from
+    # its end (0: none).
+    ram_ladder_blocks: int = 8
+    # RAM GDSF: a session idle this many times its turn gap (at least the
+    # floor) is abandoned (0: off).
+    abandon_gap_multiplier: float = 2.5
+    abandon_floor_s: float = 30.0
     ram_state_spacing_blocks: int = 0
     prune_gpu_states: bool = True
     # Exact-end and floor states (hybrids only).
@@ -149,6 +159,10 @@ class EngineSpec:
                 ram_state_spacing_blocks=self.ram_state_spacing_blocks,
                 prune_gpu_states=self.prune_gpu_states,
                 copy_ahead_blocks=self.copy_ahead_blocks,
+                restore_chunk_blocks=self.restore_chunk_blocks,
+                ram_ladder_blocks=self.ram_ladder_blocks,
+                abandon_gap_multiplier=self.abandon_gap_multiplier,
+                abandon_floor_seconds=self.abandon_floor_s,
             )
             if self.ram_eviction == "gdsf":
                 extra["prefill_cost_coefficients"] = list(_PREFILL_COST)
