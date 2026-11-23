@@ -607,11 +607,20 @@ class RamGreedyDualSizeFrequency:
                         self.stats.unranked += 1
                         if len(victims) >= num_blocks:
                             break
-        if was_leaving and (
-            dropped := [b for b in victims if b.block_id in was_leaving]
-        ):
-            self.stats.leaving += len(dropped)
-            if self.dropped is not None:
+        if was_leaving and (taken := [b for b in victims if b.block_id in was_leaving]):
+            self.stats.leaving += len(taken)
+            # A copy of a block the GPU keeps (a duplicate) drops nothing: the
+            # walk copies that block again once it is about to leave.
+            keeps = self.gpu_keeps() if self.gpu_keeps is not None else None
+            dropped = [
+                b
+                for b in taken
+                if keeps is None
+                or not all(
+                    keeps(key) for key in (b.block_hash, *extra.get(b.block_id, ()))
+                )
+            ]
+            if dropped and self.dropped is not None:
                 self.dropped(dropped)
         moved = [b for b in victims if b.prev_free_block is not None]
         for block in moved:
