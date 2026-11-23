@@ -707,6 +707,11 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
+            # A KV connector's checkpoints along the prompt: their states too.
+            min(
+                (b for b in request.retained_boundaries if start < b < end),
+                default=0,
+            ),
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

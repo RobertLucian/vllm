@@ -521,8 +521,9 @@ class SingleTypeKVCacheManager(ABC):
 
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: every position a replaying sibling can resume at (see
-        # ``replay_boundaries``) and any detected shared-prefix junction.
-        reachable_boundaries = [*replay_boundaries]
+        # ``replay_boundaries``), a KV connector's checkpoints
+        # (``retained_boundaries``) and any detected shared-prefix junction.
+        reachable_boundaries = [*replay_boundaries, *request.retained_boundaries]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
             if self.use_eagle:
@@ -2161,6 +2162,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 not is_prompt_checkpoint
                 and not is_retained_checkpoint
                 and checkpoint_position != request.shared_prefix_boundary
+                and checkpoint_position not in request.retained_boundaries
             ):
                 # The transient state overwrites this slot, so neither it nor
                 # the full-block hash registered earlier this step is reusable.
