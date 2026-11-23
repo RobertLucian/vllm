@@ -109,6 +109,10 @@ class RamEvictionStats:
     duplicates: int = 0
     # Blocks queued requests resume from (`queued`): nothing else could go.
     queued: int = 0
+    # Of all the above, copies of GPU blocks about to leave (`leaving`):
+    # nothing but queued requests' blocks could go otherwise. Their GPU
+    # blocks leave uncopied.
+    leaving: int = 0
     # Blocks with a key the pool took in its own LRU order: none of the above
     # could go (all in use).
     unranked: int = 0
@@ -130,6 +134,8 @@ class RamGreedyDualSizeFrequency:
         half_life_s: float,
         on_gpu: Callable[[BlockHashWithGroupId], bool],
         gpu_keeps: Callable[[], Callable[[BlockHashWithGroupId], bool]] | None = None,
+        leaving: Callable[[], Iterable[KVCacheBlock]] | None = None,
+        dropped: Callable[[list[KVCacheBlock]], None] | None = None,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
         self.pool = pool
@@ -142,6 +148,11 @@ class RamGreedyDualSizeFrequency:
         self.half_life_s = half_life_s
         self.on_gpu = on_gpu
         self.gpu_keeps = gpu_keeps
+        # Copies of GPU blocks about to leave, which the GPU waits for to drop
+        # them: victims only before queued requests' blocks, and then their
+        # GPU blocks may leave uncopied (`dropped`, with the victims).
+        self.leaving = leaving
+        self.dropped = dropped
         self.sessions: OrderedDict[BlockHash, _Session] = OrderedDict()
         # Hash unit -> the sessions that own it.
         self.owners: dict[BlockHash, set[BlockHash]] = {}
@@ -510,14 +521,23 @@ class RamGreedyDualSizeFrequency:
         sessions' blocks nothing reads, then the lowest-value sessions'
         exclusive blocks, deepest first, fresh copies last, and queued
         requests' blocks only after all of those, the back of the queue first
-        (`_take_queued`). The pool takes any shortfall in its LRU order, live
-        sessions' blocks included (`RamEvictionStats.unranked`)."""
+        (`_take_queued`). Any shortfall goes in the pool's LRU order, live
+        sessions' blocks included (`RamEvictionStats.unranked`). Copies whose
+        GPU blocks are about to leave (`leaving`) go only once nothing but
+        queued requests' blocks is left: the GPU would copy such a block
+        again, evicting another such copy, while the allocations held for
+        them wait on. When one goes all the same, its GPU block may leave
+        uncopied (`dropped`): RAM's value order chose it."""
         self._decay()
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
         seen: set[int] = set()
         fresh = self._fresh | self._fresher
         self._fresher, self._fresh = self._fresh, set()
+        leaving: set[int] = (
+            {b.block_id for b in self.leaving()} if self.leaving is not None else set()
+        )
+        was_leaving = set(leaving)
 
         def may_go(
             block: KVCacheBlock, even_fresh: bool = False, even_queued: bool = False
@@ -528,6 +548,7 @@ class RamGreedyDualSizeFrequency:
                 or block.is_null
                 or (block.block_id in fresh and not even_fresh)
                 or (not even_queued and self._is_queued(block))
+                or block.block_id in leaving
             )
 
         def take(
@@ -572,18 +593,30 @@ class RamGreedyDualSizeFrequency:
                 # the pool's LRU order would take a live session's.
                 fresh.clear()
                 take_ranked()
+            if len(victims) < num_blocks and leaving:
+                # Copies of blocks about to leave too, by value, before what
+                # queued requests resume from.
+                leaving.clear()
+                take_ranked()
             if len(victims) < num_blocks and self._queued:
                 self._take_queued(take, victims, num_blocks)
+            if len(victims) < num_blocks:
+                # The rest in the pool's LRU order, live sessions' blocks too.
+                for block in queue.iter_blocks_after(None):
+                    if take(block, True, True):
+                        self.stats.unranked += 1
+                        if len(victims) >= num_blocks:
+                            break
+        if was_leaving and (
+            dropped := [b for b in victims if b.block_id in was_leaving]
+        ):
+            self.stats.leaving += len(dropped)
+            if self.dropped is not None:
+                self.dropped(dropped)
         moved = [b for b in victims if b.prev_free_block is not None]
         for block in moved:
             queue.remove(block)
         queue.prepend_n(moved)
-        if len(victims) < num_blocks:
-            chosen = {b.block_id for b in victims}
-            self.stats.unranked += sum(
-                block.block_hash is not None and block.block_id not in chosen
-                for block in itertools.islice(queue.iter_blocks_after(None), num_blocks)
-            )
         self._retire_pending(self.now())
 
     def _take_queued(

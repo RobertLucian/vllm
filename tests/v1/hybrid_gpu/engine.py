@@ -27,6 +27,9 @@ from .probes import Probe
 # sizes.
 _KV_BYTES_BOUND = 8 << 30
 _CPU_BYTES_BOUND = 64 << 30
+# RAM GDSF's prefill cost model: production's fit (Qwen3.8-27B, 2x RTX 3090).
+# It only ranks sessions, so any model's tests can share it.
+_PREFILL_COST = (7.4893e-04, 6.4382e-04)
 
 Connector = Literal["none", "eager", "lazy", "tiered"]
 
@@ -147,6 +150,8 @@ class EngineSpec:
                 prune_gpu_states=self.prune_gpu_states,
                 copy_ahead_blocks=self.copy_ahead_blocks,
             )
+            if self.ram_eviction == "gdsf":
+                extra["prefill_cost_coefficients"] = list(_PREFILL_COST)
         else:
             name = "SimpleCPUOffloadConnector"
             extra["lazy_offload"] = self.connector == "lazy"

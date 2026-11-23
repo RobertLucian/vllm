@@ -654,7 +654,7 @@ class KVCacheManager:
             if need > 0:
                 safe = self.block_pool.num_spill_safe_free_blocks(need, touched)
                 if safe < need:
-                    guard.on_allocation_held(need - safe)
+                    guard.on_allocation_held(need - safe, need)
                     return None
 
         if (

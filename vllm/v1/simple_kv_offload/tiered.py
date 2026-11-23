@@ -168,6 +168,9 @@ class RestoreStats:
     pin_timeouts: int = 0
     # Restores whose request left before the load finished.
     orphaned: int = 0
+    # Times a waiting restore gave up its RAM pins: the spill guard had no
+    # other RAM block to copy into (`_relieve_spill_stall`).
+    unpinned_for_spill: int = 0
 
 
 RESTORE_EVENT_TO_FIELD = {f: f for f in RestoreStats.__dataclass_fields__}
@@ -432,6 +435,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 half_life_s=frequency_half_life_s,
                 on_gpu=self._on_gpu,
                 gpu_keeps=self._gpu_keeps,
+                leaving=self.leaving_copies,
+                dropped=self.drop_leaving,
             )
             self.cpu_block_pool.eviction_policy = self.ram_policy
             # The policy ranks RAM; a GPU eviction does not refresh it.
@@ -462,19 +467,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def _gpu_keeps(self) -> Callable[[BlockHashWithGroupId], bool]:
         """Whether the GPU holds the block under a key and will not drop it
         soon: a request holds it, or it is cached outside the eviction end the
-        lazy walk copies ahead (`_target_free` blocks). RAM's copy of such a
+        lazy walk copies ahead (`_leave_window` blocks). RAM's copy of such a
         block only mirrors it (`RamGreedyDualSizeFrequency._take_duplicates`);
         the walk copies the block again once it reaches that end."""
         pool = self._gpu_block_pool
         if pool is None:
             return lambda key: False
         policy = pool.eviction_policy
+        window = self._leave_window
         order = (
-            policy.peek_eviction_order(self._target_free)
+            policy.peek_eviction_order(window)
             if policy is not None
             else pool.free_block_queue.iter_blocks_after(None)
         )
-        leaving = {b.block_id for b in itertools.islice(order, self._target_free)}
+        leaving = {b.block_id for b in itertools.islice(order, window)}
         cached = pool.cached_block_hash_to_block
 
         def keeps(key: BlockHashWithGroupId) -> bool:
@@ -560,7 +566,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         """SpillGuard: also a block of an exact-end state whose other blocks
         RAM does not hold yet. The GPU drops such a state whole, so a block
         copied ahead of the others leaving first would take them along
-        uncopied."""
+        uncopied. Not a block whose copy RAM dropped by value as it left
+        (`drop_leaving`)."""
+        if block.block_hash in self._dropped_keys:
+            return False
         return self._uncopied(block) or (
             not block.ref_cnt and self._frontier_incomplete(block)
         )
@@ -788,6 +797,35 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self.cpu_block_pool.free_blocks(self._head_pins)
             self._head_pins = []
 
+    def _loads_in_flight(self) -> bool:
+        return bool(self._restores_by_event or self._unsent)
+
+    def _kept_for_queue(self, block: KVCacheBlock) -> bool:
+        """Queue protection keeps the block at the GPU's far end
+        (`observe_queue`)."""
+        units = self._queued_units
+        if not units or block.block_hash is None:
+            return False
+        pool = self._gpu_block_pool
+        assert pool is not None
+        return any(
+            get_block_hash(key) in units
+            for key in (
+                block.block_hash,
+                *pool.cached_block_hashes_by_block.get(block.block_id, ()),
+            )
+        )
+
+    def _relieve_spill_stall(self) -> bool:
+        """The waiting restore's pins on the RAM blocks it would load: RAM
+        has no other block to copy the GPU's into, and the restore waits for
+        those GPU blocks. RAM may then evict its blocks by value."""
+        if not self._head_pins:
+            return False
+        self._unpin_head()
+        self.restore_stats.unpinned_for_spill += 1
+        return True
+
     def observe_queue(self, waiting: Iterable["Request"]) -> None:
         """Keep what the queued requests resume from until they are admitted
         (`_resume_keys`): on the GPU at the far end of the LRU order and in
@@ -932,12 +970,16 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         safe = (
             pool.num_spill_safe_free_blocks(num_blocks, exclude=pinned)
             if self.holding
-            else pool.get_num_free_blocks() - sum(not b.ref_cnt for b in pinned)
+            else free
         )
         if safe < num_blocks:
             stats.waited_guard += 1
-            if self.holding:
-                self.on_allocation_held(num_blocks - safe)
+            # Only what copies can free: blocks the pool lacks altogether come
+            # back as requests finish, not from the walk.
+            if self.holding and min(num_blocks, free) > safe:
+                self.on_allocation_held(
+                    min(num_blocks, free) - safe, min(num_blocks, free)
+                )
             return self._wait(request, loads)
         self._stop_waiting(request_id)
         pool.touch(pinned)
@@ -979,9 +1021,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             self._unpin_head()
             self._head = (request_id, position)
             # The GPU blocks it waits for may need copies in RAM first: it
-            # pins its own only while the rest of RAM still takes those.
+            # pins its own only while the rest of RAM still takes those
+            # (copies of blocks about to leave take nothing: `leaving_copies`).
             cpu_pool = self.cpu_block_pool
-            if cpu_pool.get_num_free_blocks() - len(loads) >= len(loads):
+            free = cpu_pool.get_num_free_blocks() - len(self.leaving_copies())
+            if free - len(loads) >= len(loads):
                 cpu_pool.touch(loads)
                 self._head_pins = list(loads)
         return None, False

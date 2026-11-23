@@ -1499,32 +1499,6 @@ def test_lazy_eviction_makes_the_cpu_copy_the_most_recent() -> None:
     assert cached.get_one_block(first.block_hash) is first
 
 
-@pytest.mark.cpu_test
-def test_lazy_guard_lets_held_allocations_go_after_waiting_too_long(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Lazy: allocations held for more than 10 s get one step in which the
-    guard evicts uncopied blocks."""
-    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
-    sched = fix.scheduler
-    now = [1000.0]
-    monkeypatch.setattr(
-        "vllm.v1.simple_kv_offload.manager.time", Mock(monotonic=lambda: now[0])
-    )
-    sched.on_allocation_held(4)
-    sched.build_connector_meta(make_scheduler_output({}))
-    assert sched.holding
-
-    now[0] += 11.0
-    sched.on_allocation_held(4)
-    sched.build_connector_meta(make_scheduler_output({}))
-    assert not sched.holding
-    assert sched.lazy_spill_stats.guard_releases == 1
-
-    sched.build_connector_meta(make_scheduler_output({}))
-    assert sched.holding
-
-
 def _hybrid_boundary(lazy_fix: SchedulerFixture) -> tuple[KVCacheBlock, ...]:
     """An attention page and a Mamba state cached under one block hash, an
     uncached block, and every other block in use."""

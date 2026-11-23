@@ -23,9 +23,17 @@ from .workloads import Session, drive
 
 SPECS = [
     EngineSpec(
-        family="gdn_fat", connector="tiered", gpu_blocks=96, ram_blocks=384, tp=tp
+        family="gdn_fat",
+        connector="tiered",
+        ram_eviction=ram_eviction,
+        async_scheduling=ram_eviction == "gdsf",
+        gpu_blocks=96,
+        ram_blocks=384,
+        tp=tp,
     )
     for tp in (1, 2)
+    # "gdsf" with async scheduling: production's RAM policy and scheduling.
+    for ram_eviction in ("lru", "gdsf")
 ] + [
     EngineSpec(family=family, connector="tiered", gpu_blocks=96, ram_blocks=384)
     for family in ("gdn", "dense")

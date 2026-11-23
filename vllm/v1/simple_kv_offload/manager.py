@@ -68,8 +68,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Lazy mode: the most blocks a step stores beyond the walk's target for the
-# allocations held for a spill, and how long allocations may be held before
-# the spill guard lets them evict blocks the CPU pool does not hold.
+# allocations held for a spill, and how long allocations may be held with no
+# copy landing before the spill guard lets them evict blocks the CPU pool
+# does not hold (a backstop: a stall is found sooner, `_update_holding`).
 _MAX_SHORTFALL_STORE_BLOCKS = 256
 _MAX_SPILL_WAIT_S = 10.0
 
@@ -301,11 +302,20 @@ class SimpleCPUOffloadScheduler:
         else:
             self._target_free = 0
         # Lazy mode: the GPU pool's spill guard (`needs_spill`). Blocks the
-        # allocations held last step still need, when they were first held,
-        # and whether uncopied blocks are held back now.
+        # allocations held last step still need and the free blocks they need
+        # in all, when they were first held, when a store last landed, and
+        # whether uncopied blocks are held back now.
         self._spill_shortfall = 0
+        self._held_need = 0
         self._held_since: float | None = None
+        self._last_store_landed = 0.0
         self._holding = True
+        # The GPU eviction order's blocks about to leave: the walk's target
+        # and what the held allocations need. RAM keeps the copies of these
+        # (`leaving_copies`), unless its value order drops one: its GPU
+        # block's keys may then leave uncopied (`drop_leaving`).
+        self._leave_window = self._target_free
+        self._dropped_keys: set[BlockHashWithGroupId] = set()
         # Boundary siblings (`_boundary_siblings`) copied without a reference,
         # so they keep their place in the eviction order: GPU block id -> its
         # key when the copy started. The guard holds them back like any
@@ -451,11 +461,13 @@ class SimpleCPUOffloadScheduler:
         """Whether the free cached GPU `block` is one a CPU lookup could
         restore and the CPU pool does not hold yet. A page no GPU state needs
         any more still counts: it is the prefix of states the CPU pool
-        holds."""
+        holds. Not one whose copy RAM dropped by value as it left
+        (`drop_leaving`)."""
         if (
             block.block_hash is None
             or block.is_null
             or block.ref_cnt
+            or block.block_hash in self._dropped_keys
             or not self._restorable(block)
         ):
             return False
@@ -471,9 +483,12 @@ class SimpleCPUOffloadScheduler:
             and self._early_pages.get(block.block_id) == block.block_hash
         )
 
-    def on_allocation_held(self, num_blocks: int) -> None:
-        """SpillGuard: the next walk also stores `num_blocks` blocks."""
+    def on_allocation_held(self, num_blocks: int, num_needed: int = 0) -> None:
+        """SpillGuard: the next walk also stores `num_blocks` blocks, and RAM
+        keeps the copies of the `num_needed` the allocation takes
+        (`leaving_copies`)."""
         self._spill_shortfall += num_blocks
+        self._held_need += max(num_needed, num_blocks)
         self.lazy_spill_stats.held_allocations += 1
 
     def has_pending_block_frees(self) -> bool:
@@ -501,6 +516,7 @@ class SimpleCPUOffloadScheduler:
         session from both tiers."""
         assert block.block_hash is not None
         self._early_pages.pop(block.block_id, None)
+        self._forget_dropped(block)
         cpu = self.cpu_block_pool.cached_block_hash_to_block
         if (
             cpu.get_one_block(block.block_hash) is None
@@ -523,9 +539,100 @@ class SimpleCPUOffloadScheduler:
             self.cpu_block_pool.touch(copies)
             self.cpu_block_pool.free_blocks(copies)
 
-    def _update_holding(self, num_cpu_free: int) -> None:
-        """Hold back uncopied blocks unless allocations have waited for stores
-        too long or the CPU pool has no block to store into."""
+    def on_reused(self, block: "KVCacheBlock") -> None:
+        """SpillGuard: a hit reads the free GPU `block` again: it is a live
+        session's block once more, which the guard copies before it leaves."""
+        if self._dropped_keys:
+            self._forget_dropped(block)
+
+    def _forget_dropped(self, block: "KVCacheBlock") -> None:
+        if not self._dropped_keys or block.block_hash is None:
+            return
+        assert self._gpu_block_pool is not None
+        self._dropped_keys.discard(block.block_hash)
+        for key in self._gpu_block_pool.cached_block_hashes_by_block.get(
+            block.block_id, ()
+        ):
+            self._dropped_keys.discard(key)
+
+    def drop_leaving(self, cpu_blocks: list["KVCacheBlock"]) -> None:
+        """RAM evicts `cpu_blocks`, copies of GPU blocks about to leave
+        (`leaving_copies`), by value: nothing but queued requests' blocks
+        could go instead. Their GPU blocks then leave without a copy, as the
+        lowest-value blocks of both tiers, instead of being copied again
+        (which would evict another such copy)."""
+        for block in cpu_blocks:
+            if block.block_hash is None:
+                continue
+            self._dropped_keys.add(block.block_hash)
+            self._dropped_keys.update(
+                self.cpu_block_pool.cached_block_hashes_by_block.get(block.block_id, ())
+            )
+
+    def leaving_copies(self) -> list["KVCacheBlock"]:
+        """The free CPU blocks that copy GPU blocks about to leave: the first
+        `_leave_window` of the GPU's eviction order, the walk's target and
+        the free blocks the allocations held last need. RAM evicts none of
+        them (`RamGreedyDualSizeFrequency.leaving`). Evicting one would undo
+        the spill its GPU block waits for: the walk would copy the block
+        again, evicting another such copy, and allocations needing more than
+        RAM holds at once would never see enough of them (window D, TP 1:
+        a 30 s run took 294 s). Copies of the GPU's other blocks only mirror
+        them and may go, as do those of blocks the GPU keeps for queued
+        requests (`_kept_for_queue`): they leave last, if at all."""
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None or self._leave_window <= 0:
+            return []
+        policy = gpu_pool.eviction_policy
+        order: Iterable[KVCacheBlock] = (
+            policy.peek_eviction_order(self._leave_window)
+            if policy is not None
+            else gpu_pool.free_block_queue.iter_blocks_after(None)
+        )
+        cpu_pool = self.cpu_block_pool
+        cpu = cpu_pool.cached_block_hash_to_block
+        extra = gpu_pool.cached_block_hashes_by_block
+        copies: dict[int, KVCacheBlock] = {}
+        for block in itertools.islice(order, self._leave_window):
+            if block.block_hash is None or self._kept_for_queue(block):
+                continue
+            for key in (block.block_hash, *extra.get(block.block_id, ())):
+                for copy in cpu.get_all_blocks(key):
+                    if not copy.ref_cnt:
+                        copies[copy.block_id] = copy
+        return list(copies.values())
+
+    def _kept_for_queue(self, block: "KVCacheBlock") -> bool:
+        """Whether the GPU keeps the free cached `block` for a queued
+        request (none here)."""
+        return False
+
+    def _loads_in_flight(self) -> bool:
+        """Whether loads from the CPU pool are in flight: they release the CPU
+        blocks they read once they land."""
+        return bool(self._load_event_to_reqs)
+
+    def _relieve_spill_stall(self) -> bool:
+        """The walk can store nothing more while allocations are held: give
+        up a pin on CPU blocks that holds them back, if any. Whether one was
+        given up."""
+        return False
+
+    def _update_holding(self, num_stored: int, cpu_full: bool) -> None:
+        """After the walk stored `num_stored` blocks (`cpu_full`: the CPU
+        pool's free blocks ended it): hold back uncopied blocks while stores
+        can still free what the held allocations need. Letting
+        them go evicts blocks neither tier holds: a session loses a page or
+        its states and is read again whole. Stores in flight land within
+        steps, and their copies stay in RAM until the GPU drops their blocks
+        (`leaving_copies`), so each one frees a block for good: neither a busy
+        copy queue (allocations held for many steps under steady load) nor a
+        CPU pool with no free block lets them go. Only a stall does: no store
+        or load in flight, nothing the walk could store, and, when the CPU
+        pool's free blocks stopped it, no pin to give up there
+        (`_relieve_spill_stall`): the allocations held need more blocks than
+        the CPU pool can take at once. `_MAX_SPILL_WAIT_S` with no store
+        landing is a backstop."""
         if not self._spill_shortfall:
             self._held_since = None
             self._holding = True
@@ -533,7 +640,13 @@ class SimpleCPUOffloadScheduler:
         now = time.monotonic()
         if self._held_since is None:
             self._held_since = now
-        holding = num_cpu_free > 0 and now - self._held_since < _MAX_SPILL_WAIT_S
+        stalled = not (
+            num_stored or self._store_event_to_blocks or self._loads_in_flight()
+        )
+        if stalled and cpu_full and self._relieve_spill_stall():
+            stalled = False
+        waited = now - max(self._held_since, self._last_store_landed)
+        holding = not stalled and waited < _MAX_SPILL_WAIT_S
         if self._holding and not holding:
             self.lazy_spill_stats.guard_releases += 1
             self._held_since = None
@@ -833,10 +946,21 @@ class SimpleCPUOffloadScheduler:
             return [], [], [], None
 
         cpu_pool = self.cpu_block_pool
-        num_cpu_free = cpu_pool.get_num_free_blocks()
-        shortfall = min(self._spill_shortfall, _MAX_SHORTFALL_STORE_BLOCKS)
-        self._update_holding(num_cpu_free)
-        self._spill_shortfall = 0
+        # The GPU blocks about to leave: the walk's target and the free blocks
+        # the held allocations take. RAM keeps their copies.
+        self._leave_window = self._target_free + min(
+            self._held_need, gpu_pool.num_gpu_blocks
+        )
+        leaving = self.leaving_copies()
+        num_cpu_free = cpu_pool.get_num_free_blocks() - len(leaving)
+        # Blocks in flight free as many of what the held allocations need once
+        # they land: copying more for them would only evict RAM's blocks.
+        in_flight = sum(
+            len(t.gpu_block_ids) for t in self._store_event_to_blocks.values()
+        )
+        shortfall = min(
+            max(0, self._spill_shortfall - in_flight), _MAX_SHORTFALL_STORE_BLOCKS
+        )
 
         policy = gpu_pool.eviction_policy
         order: Iterable[KVCacheBlock] = (
@@ -847,10 +971,13 @@ class SimpleCPUOffloadScheduler:
         gpu_ids: list[int] = []
         pages: list[int] = []
         chosen: set[int] = set()
+        # Whether the CPU pool's free blocks ended the walk.
+        cpu_full = False
         for covered, node in enumerate(order):
-            if len(chosen) >= num_cpu_free or (
-                covered >= self._target_free and len(chosen) >= shortfall
-            ):
+            if covered >= self._target_free and len(chosen) >= shortfall:
+                break
+            if len(chosen) >= num_cpu_free:
+                cpu_full = True
                 break
             if (
                 node.block_id in chosen
@@ -869,6 +996,7 @@ class SimpleCPUOffloadScheduler:
             # The unit is copied whole or not at all, within the CPU pool's
             # free blocks: its siblings can take it past them.
             if len(chosen) + len(own) + len(siblings) > num_cpu_free:
+                cpu_full = True
                 break
             for block in own:
                 gpu_ids.append(block.block_id)
@@ -879,8 +1007,19 @@ class SimpleCPUOffloadScheduler:
                 chosen.add(page.block_id)
                 self._unpinned_stores[page.block_id] = page.block_hash
 
+        self._update_holding(len(chosen), cpu_full)
+        self._spill_shortfall = 0
+        self._held_need = 0
+
         # Batch-allocate CPU blocks.
         if chosen:
+            if cpu_pool.eviction_policy is None:
+                # Past the copies of blocks about to leave in LRU order (an
+                # eviction policy leaves them alone itself).
+                queue = cpu_pool.free_block_queue
+                for block in leaving:
+                    queue.remove(block)
+                    queue.append(block)
             self.lazy_spill_stats.stored_blocks += len(chosen)
             self.lazy_spill_stats.cpu_evicted_blocks += sum(
                 1
@@ -1407,6 +1546,8 @@ class SimpleCPUOffloadScheduler:
             transfer.cpu_block_ids,
             transfer.block_meta,
         )
+        if self._lazy_mode:
+            self._last_store_landed = time.monotonic()
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
@@ -1839,6 +1980,9 @@ class SimpleCPUOffloadScheduler:
         self._spill_shortfall = 0
         self._held_since = None
         self._holding = True
+        self._held_need = 0
+        self._leave_window = self._target_free
+        self._dropped_keys.clear()
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions

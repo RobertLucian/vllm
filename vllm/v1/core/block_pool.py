@@ -91,8 +91,9 @@ class SpillGuard(Protocol):
         it."""
         ...
 
-    def on_allocation_held(self, num_blocks: int) -> None:
-        """An allocation waits for `num_blocks` more blocks to be spilled."""
+    def on_allocation_held(self, num_blocks: int, num_needed: int) -> None:
+        """An allocation of `num_needed` free blocks waits for `num_blocks`
+        more of them to be spilled."""
         ...
 
     def on_unspilled_eviction(self, blocks: list[KVCacheBlock]) -> None:
@@ -103,6 +104,11 @@ class SpillGuard(Protocol):
     def on_evicted(self, block: KVCacheBlock) -> None:
         """The cached `block` loses its keys here: a copy the tier holds is now
         the only one."""
+        ...
+
+    def on_reused(self, block: KVCacheBlock) -> None:
+        """A cache hit takes the free cached `block` off the free queue: it is
+        read again."""
         ...
 
 
@@ -962,6 +968,7 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        guard = self.spill_guard
         for block in blocks:
             if block.is_null:
                 continue
@@ -969,6 +976,8 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
+                if guard is not None:
+                    guard.on_reused(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
