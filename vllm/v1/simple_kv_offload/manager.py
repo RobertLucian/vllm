@@ -73,6 +73,9 @@ logger = init_logger(__name__)
 # does not hold (a backstop: a stall is found sooner, `_update_holding`).
 _MAX_SHORTFALL_STORE_BLOCKS = 256
 _MAX_SPILL_WAIT_S = 10.0
+# Walks in a row that store nothing, with nothing in flight, before the guard
+# counts a stall: one such walk can follow a copy that landed this step.
+_STALL_WALKS = 3
 
 
 @dataclass
@@ -308,6 +311,7 @@ class SimpleCPUOffloadScheduler:
         self._spill_shortfall = 0
         self._held_since: float | None = None
         self._last_store_landed = 0.0
+        self._stalled_walks = 0
         self._holding = True
         # Copies the walk took for GPU blocks that wait, free, to leave
         # (`leaving_copies`): CPU block id -> GPU block id, and back. RAM
@@ -624,28 +628,34 @@ class SimpleCPUOffloadScheduler:
         (`leaving_copies`), so each one frees a block for good: neither a busy
         copy queue (allocations held for many steps under steady load) nor a
         CPU pool with no free block lets them go. Only a stall does: no store
-        or load in flight, nothing the walk could store, and, when the CPU
+        or load in flight and nothing the walk could store, `_STALL_WALKS`
+        walks in a row, and, when the CPU
         pool's free blocks stopped it, no pin to give up there
         (`_relieve_spill_stall`): the allocations held need more blocks than
         the CPU pool can take at once. `_MAX_SPILL_WAIT_S` with no store
         landing is a backstop."""
         if not self._spill_shortfall:
             self._held_since = None
+            self._stalled_walks = 0
             self._holding = True
             return
         now = time.monotonic()
         if self._held_since is None:
             self._held_since = now
-        stalled = not (
-            num_stored or self._store_event_to_blocks or self._loads_in_flight()
-        )
+        if num_stored or self._store_event_to_blocks or self._loads_in_flight():
+            self._stalled_walks = 0
+        else:
+            self._stalled_walks += 1
+        stalled = self._stalled_walks >= _STALL_WALKS
         if stalled and cpu_full and self._relieve_spill_stall():
+            self._stalled_walks = 0
             stalled = False
         waited = now - max(self._held_since, self._last_store_landed)
         holding = not stalled and waited < _MAX_SPILL_WAIT_S
         if self._holding and not holding:
             self.lazy_spill_stats.guard_releases += 1
             self._held_since = None
+            self._stalled_walks = 0
         self._holding = holding
 
     def get_num_new_matched_tokens(
@@ -1989,6 +1999,7 @@ class SimpleCPUOffloadScheduler:
         self._spill_twins.clear()
         self._spill_copies.clear()
         self._dropped_keys.clear()
+        self._stalled_walks = 0
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions
