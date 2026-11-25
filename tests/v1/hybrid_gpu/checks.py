@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+from typing import Any
+
 from .workloads import Result
 
 
@@ -30,3 +34,14 @@ def delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
     return {
         k: after[k] - before.get(k, 0) for k in after if after[k] != before.get(k, 0)
     }
+
+
+def save_result(test: str, arm: str, summary: dict[str, Any]) -> None:
+    """With `HYBRID_GPU_RESULTS` set, append one JSON line per measured arm
+    there as it finishes: a run cut off by its time limit keeps what it
+    measured (the JUnit report is written only at the end)."""
+    path = os.environ.get("HYBRID_GPU_RESULTS")
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(json.dumps({"test": test, "arm": arm, **summary}, default=str) + "\n")

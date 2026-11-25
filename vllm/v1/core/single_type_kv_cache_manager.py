@@ -1727,7 +1727,7 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> bool:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         checkpoint_idx = cdiv(query_end, self.block_size) - 2
-        blocks = self.req_to_blocks[request_id]
+        blocks = self.req_to_blocks.get(request_id, ())
         return (
             self.has_prefill_checkpoint_blocks
             and query_end >= prefill_end
@@ -1760,7 +1760,10 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        dry_run: bool = False,
     ) -> int:
+        """`dry_run`: count only, recording no checkpoint or unwritten block
+        for the request (a KV connector sizing a chunk before admission)."""
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
             len(new_computed_blocks) > 0
@@ -1804,7 +1807,7 @@ class MambaManager(SingleTypeKVCacheManager):
             num_new_blocks = (
                 num_required_blocks
                 - len(new_computed_blocks)
-                - len(self.req_to_blocks[request_id])
+                - len(self.req_to_blocks.get(request_id, ()))
             )
             has_partial_hit = (
                 self._has_partial_local_hit(
@@ -1834,7 +1837,7 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
-            if not apply_admission_cap:
+            if not apply_admission_cap and not dry_run:
                 if checkpoint_position > 0:
                     checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
                     self._checkpoints[request_id] = (

@@ -50,6 +50,16 @@ LAZY_SPILL_EVENT_TO_FIELD = {
     "guard_releases": "guard_releases",
     "cpu_evicted_blocks": "cpu_evicted_blocks",
     "uncopied_evicted_blocks": "uncopied_evicted_blocks",
+    "hold_episodes": "hold_episodes",
+    "hold_ms": "hold_ms",
+    "holds_over_100ms": "holds_over_100ms",
+    "holds_over_1s": "holds_over_1s",
+    "holds_over_5s": "holds_over_5s",
+    "held_stops_running": "held_stops_running",
+    "held_stops_waiting": "held_stops_waiting",
+    "held_skips_running": "held_skips_running",
+    "held_skips_waiting": "held_skips_waiting",
+    "held_stop_untried": "held_stop_untried",
 }
 
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]
@@ -69,6 +79,12 @@ class TieredMetricName:
     GPU_STATE_BLOCKS = "vllm:tiered_kv_gpu_state_blocks"
     RAM_STATES_DROPPED = "vllm:tiered_kv_ram_states_dropped_total"
     RAM_SESSIONS_LOST = "vllm:tiered_kv_ram_sessions_lost_total"
+    ADMISSION = "vllm:tiered_kv_admission_total"
+    SEARCH = "vllm:tiered_kv_search_total"
+    LOOKUPS = "vllm:tiered_kv_lookups_total"
+    LANDED_WAITS = "vllm:tiered_kv_landed_waits_total"
+    SCHEDULER_SECONDS = "vllm:tiered_kv_scheduler_seconds_total"
+    RESTORE_PEAKS = "vllm:tiered_kv_restore_peaks"
 
 
 class _MetricType:
@@ -225,7 +241,10 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
                 "they neared eviction, steps an admission waited for them, "
                 "blocks evicted without a copy (should stay 0), times a held "
                 "admission was let go, and cached CPU blocks evicted to "
-                "store new ones."
+                "store new ones; holds (runs of steps with allocations held), "
+                "their total ms and those over 100 ms / 1 s / 5 s; held "
+                "allocations that stopped the scheduler's running or waiting "
+                "loop or were skipped, and the requests stops left untried."
             ),
             labelnames=self._labelnames + ["event"],
         )
@@ -427,6 +446,78 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                     "Sessions RAM evictions left with no point to resume at "
                     "(their next turn re-reads them whole), by the kind of "
                     "eviction that took the last one."
+                ),
+                ["kind"],
+            ),
+            (
+                TieredMetricName.ADMISSION,
+                _MetricType.COUNTER,
+                (
+                    "How waiting requests got room, by event: steps a restore "
+                    "waited for room (asking for copies or not) and waits over "
+                    "1/10/60 s; requests that passed a waiting restore; restores "
+                    "admitted 0, 1, 2-4 or more steps after landing; the room a "
+                    "restore kept for its first chunk (exact, short and by how "
+                    "many blocks, unused blocks, released unadmitted, grown or "
+                    "shrunk as the load landed, 0-token chunks); admissions at "
+                    "another point than the restore's; steps starting several "
+                    "restores; the claim (steps, deferred, blocked admissions "
+                    "and restores, claimant changes); copies made a chunk ahead."
+                ),
+                ["event"],
+            ),
+            (
+                TieredMetricName.SEARCH,
+                _MetricType.COUNTER,
+                (
+                    "Searches for a resume point: calls, points visited and hash "
+                    "units scanned, the whole walk's (verify mode), and searches whose "
+                    "bounded result differed from the whole walk's (mismatches "
+                    "must stay 0) or only in the GPU-only point."
+                ),
+                ["event"],
+            ),
+            (
+                TieredMetricName.LOOKUPS,
+                _MetricType.COUNTER,
+                (
+                    "The connector's lookups for waiting requests, by outcome: "
+                    "GPU-only, a restore started (whole or in chunks), loading, "
+                    "landed, behind a restore, waiting for room beside other "
+                    "restores or the claimant, waiting for copies, the same RAM "
+                    "blocks loading, gave up, skipped."
+                ),
+                ["outcome"],
+            ),
+            (
+                TieredMetricName.LANDED_WAITS,
+                _MetricType.COUNTER,
+                (
+                    "Steps a restore that had landed went unadmitted, by why: "
+                    "its allocation found no room, would take room others keep "
+                    "(reserved) or the claimant's (claim), waited for copies, "
+                    "did not fit whole, needed a state cached this step; the "
+                    "scheduler allocated nothing for it, or did not reach it."
+                ),
+                ["reason"],
+            ),
+            (
+                TieredMetricName.SCHEDULER_SECONDS,
+                _MetricType.COUNTER,
+                (
+                    "Scheduler time the tiered connector took, by part: its "
+                    "lookups (of which the search, the junction's chain, the "
+                    "room checks), its queue observation, its per-step work, "
+                    "its stats, and the GPU pool's spill-guard scans."
+                ),
+                ["part"],
+            ),
+            (
+                TieredMetricName.RESTORE_PEAKS,
+                _MetricType.GAUGE,
+                (
+                    "Most restores started in one step, and most loading at "
+                    "once, since the engine started."
                 ),
                 ["kind"],
             ),

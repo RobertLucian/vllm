@@ -235,7 +235,38 @@ class Probe:
                 )
         for outcome, count in getattr(tier, "prune_outcomes", {}).items():
             out[f"prune.{outcome}"] = count
+        for prefix, counts in (
+            ("lookup", getattr(tier, "lookup_outcomes", {})),
+            ("landed", getattr(tier, "landed_waits", {})),
+        ):
+            for label, count in counts.items():
+                out[f"{prefix}.{label}"] = count
+        for name in (
+            "spill_scan_calls",
+            "spill_scan_blocks",
+            "spill_scan_ns",
+            "spill_reorder_ns",
+        ):
+            out[f"pool.{name}"] = getattr(self.gpu_pool, name, 0)
         return out
+
+    def internal_id(self, request_id: str) -> str:
+        """The scheduler's id of the live request added as `request_id`: the
+        engine appends a random suffix (`InputProcessor`)."""
+        ids = [
+            r
+            for r in self.scheduler.requests
+            if r == request_id or r.startswith(f"{request_id}-")
+        ]
+        assert len(ids) == 1, (request_id, ids)
+        return ids[0]
+
+    def peaks(self) -> dict[str, int]:
+        """The connector's maxima since the engine started (not deltas)."""
+        stats = getattr(self.tier, "restore_stats", None)
+        if stats is None:
+            return {}
+        return {k: v for k, v in vars(stats).items() if k.endswith("_max")}
 
     def wait_for_copies(self, timeout_s: float = 60.0) -> None:
         """Step the engine until no store is queued or in flight."""

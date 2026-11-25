@@ -385,6 +385,17 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             and self.scheduler_manager.has_pending_block_frees()
         )
 
+    def on_held_allocation(
+        self, request: "Request", loop: str, num_behind: int, may_skip: bool
+    ) -> bool:
+        """The spill guard held `request`'s allocation: whether the
+        scheduler's loop skips it instead of ending."""
+        return self.scheduler_manager is not None and (
+            self.scheduler_manager.on_held_allocation(
+                request, loop, num_behind, may_skip
+            )
+        )
+
     def update_connector_output(
         self,
         connector_output: KVConnectorOutput,

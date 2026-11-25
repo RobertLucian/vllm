@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import time
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol
@@ -109,6 +110,33 @@ class SpillGuard(Protocol):
         """A cache hit takes the free cached `block` off the free queue: it is
         read again, and a copy the tier took for its eviction only mirrors
         it."""
+        ...
+
+    def claim_against(self, request: Request) -> int:
+        """Free blocks `request`'s allocation must leave for others the tier
+        keeps room for (0: none)."""
+        ...
+
+    def release_reserved(self, request: Request, num_blocks: int) -> None:
+        """`request`'s allocation of `num_blocks` blocks goes ahead: room the
+        tier kept for it is its own now."""
+        ...
+
+    def note_held(self, request: Request, num_blocks: int) -> None:
+        """`request`'s allocation waits for `num_blocks` blocks to be
+        spilled."""
+        ...
+
+    def note_claim_blocked(self, request: Request) -> None:
+        """`request`'s allocation fits but would take room claimed for an
+        earlier request."""
+        ...
+
+    def note_refused(self, request: Request, reason: str) -> None:
+        """`allocate_slots` refused `request` this step: "full_sequence" (its
+        whole sequence does not fit), "no_room" (its step's blocks do not),
+        "claim" (they would take room the tier keeps for others) or "copies"
+        (they wait for spills)."""
         ...
 
 
@@ -267,6 +295,13 @@ class BlockPool:
         # only as they near eviction.
         self.lower_tier: LowerKVTier | None = None
         self.spill_guard: SpillGuard | None = None
+        # The spill guard's scans of the free queue: calls, blocks visited and
+        # time (ns), counting free blocks (`num_spill_safe_free_blocks`) and
+        # moving the safe ones first (`_take_spilled_first`).
+        self.spill_scan_calls = 0
+        self.spill_scan_blocks = 0
+        self.spill_scan_ns = 0
+        self.spill_reorder_ns = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -823,7 +858,9 @@ class BlockPool:
         if self.eviction_policy is not None and self.enable_caching:
             self.eviction_policy.prepare_eviction(num_blocks)
         if self.spill_guard is not None and self.enable_caching:
+            started = time.perf_counter_ns()
             self._take_spilled_first(num_blocks)
+            self.spill_reorder_ns += time.perf_counter_ns() - started
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         if self._reuse_watchers:
@@ -888,18 +925,24 @@ class BlockPool:
         guard = self.spill_guard
         if guard is None or not self.enable_caching:
             return min(limit, self.get_num_free_blocks())
+        started = time.perf_counter_ns()
         skip = {block.block_id for block in exclude}
         count = 0
+        visited = 0
         held = False
         for block in self.free_block_queue.iter_blocks_after(None):
             if count >= limit:
                 break
+            visited += 1
             if block.block_id in skip:
                 continue
             if guard.needs_spill(block) or (held and guard.keeps_order(block)):
                 held = True
             else:
                 count += 1
+        self.spill_scan_calls += 1
+        self.spill_scan_blocks += visited
+        self.spill_scan_ns += time.perf_counter_ns() - started
         return count
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:

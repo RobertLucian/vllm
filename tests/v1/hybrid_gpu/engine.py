@@ -54,6 +54,25 @@ class EngineSpec:
     # floor) is abandoned (0: off).
     abandon_gap_multiplier: float = 2.5
     abandon_floor_s: float = 30.0
+    # How waiting requests get room (the connector's default, "legacy", since
+    # window T): "pack" (every request that fits goes,
+    # the earliest that does not claims its room once it has waited
+    # `claim_after_s`), "legacy" (the requests behind a restore waiting for
+    # room wait with it) or "pass" (legacy, but those with nothing to restore
+    # pass it).
+    admission: Literal["pack", "pass", "legacy"] = "legacy"
+    claim_after_s: float = 1.0
+    # A lookup searches only as deep as the restore gain it checks (False:
+    # the whole session); `verify_search` checks each such search against the
+    # whole walk.
+    bounded_search: bool = True
+    verify_search: bool = False
+    # Each restore's start, landing and admission logged at INFO; the summary
+    # line's interval (0: none).
+    log_restores: bool = False
+    summary_log_s: float = 60.0
+    # vLLM's stat loggers, Prometheus's among them, observe every step's stats.
+    log_stats: bool = False
     ram_state_spacing_blocks: int = 0
     prune_gpu_states: bool = True
     # Exact-end and floor states (hybrids only).
@@ -66,7 +85,13 @@ class EngineSpec:
     max_num_seqs: int = 8
     # > 0: priority scheduling with this many running slots kept for chats.
     chat_slots: int = 0
+    # Priority scheduling without slots kept (production's policy).
+    priority_policy: bool = False
     low_priority_prefill_tokens: int | None = None
+    # Production's scheduler shape: only every this many steps read prompts;
+    # a long prefill's chunk is capped at this many tokens (0: no cap).
+    prefill_schedule_interval: int = 1
+    long_prefill_token_threshold: int = 0
     async_scheduling: bool = False
     cuda_graphs: bool = False
     seed: int = 0
@@ -118,7 +143,7 @@ class EngineSpec:
             kv_cache_memory_bytes=_KV_BYTES_BOUND,
             gpu_memory_utilization=0.2,
             async_scheduling=self.async_scheduling,
-            disable_log_stats=True,
+            disable_log_stats=not self.log_stats,
         )
         if model.hybrid:
             kwargs.update(
@@ -134,15 +159,18 @@ class EngineSpec:
                 "disable_eagle_block_drop": True,
                 "truncate_acceptance_at_stop": True,
             }
+        if self.chat_slots or self.priority_policy:
+            kwargs["scheduling_policy"] = "priority"
         if self.chat_slots:
-            kwargs.update(
-                scheduling_policy="priority",
-                reserved_priority_slots=self.chat_slots,
-            )
+            kwargs["reserved_priority_slots"] = self.chat_slots
             if self.low_priority_prefill_tokens is not None:
                 kwargs["low_priority_prefill_tokens_per_step"] = (
                     self.low_priority_prefill_tokens
                 )
+        if self.prefill_schedule_interval != 1:
+            kwargs["prefill_schedule_interval"] = self.prefill_schedule_interval
+        if self.long_prefill_token_threshold:
+            kwargs["long_prefill_token_threshold"] = self.long_prefill_token_threshold
         if self.connector != "none":
             kwargs["kv_transfer_config"] = self._kv_transfer_config()
         return kwargs
@@ -163,6 +191,12 @@ class EngineSpec:
                 ram_ladder_blocks=self.ram_ladder_blocks,
                 abandon_gap_multiplier=self.abandon_gap_multiplier,
                 abandon_floor_seconds=self.abandon_floor_s,
+                admission=self.admission,
+                claim_after_seconds=self.claim_after_s,
+                bounded_search=self.bounded_search,
+                verify_search=self.verify_search,
+                log_restores=self.log_restores,
+                summary_log_seconds=self.summary_log_s,
             )
             if self.ram_eviction == "gdsf":
                 extra["prefill_cost_coefficients"] = list(_PREFILL_COST)

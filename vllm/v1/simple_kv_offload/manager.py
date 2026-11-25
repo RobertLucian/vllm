@@ -174,6 +174,22 @@ class LazySpillStats:
     # without a copy on any path: an allocation, a released or dropped
     # hybrid state unit. Includes unspilled_evicted_blocks.
     uncopied_evicted_blocks: int = 0
+    # Holds: steps in a row with allocations held, from the first such step
+    # to the first without one or a guard release; how long they lasted.
+    hold_episodes: int = 0
+    hold_ms: int = 0
+    holds_over_100ms: int = 0
+    holds_over_1s: int = 0
+    holds_over_5s: int = 0
+    # A held allocation (`on_held_allocation`) ended the scheduler's loop
+    # over running or waiting requests, or the request was skipped instead
+    # (the tiered connector's pack admission); the requests a stop left
+    # untried.
+    held_stops_running: int = 0
+    held_stops_waiting: int = 0
+    held_skips_running: int = 0
+    held_skips_waiting: int = 0
+    held_stop_untried: int = 0
 
 
 class SimpleCPUOffloadScheduler:
@@ -309,6 +325,9 @@ class SimpleCPUOffloadScheduler:
         # when a store last landed, and whether uncopied blocks are held back
         # now.
         self._spill_shortfall = 0
+        # Blocks the next walk also copies with nothing held for them: a
+        # chunked restore's next chunk (the tiered connector's).
+        self._copy_ahead = 0
         self._held_since: float | None = None
         self._last_store_landed = 0.0
         self._stalled_walks = 0
@@ -498,6 +517,47 @@ class SimpleCPUOffloadScheduler:
         preempting a request."""
         return self._lazy_mode and self._holding and self._spill_shortfall > 0
 
+    def on_held_allocation(
+        self, request: "Request", loop: str, num_behind: int, may_skip: bool
+    ) -> bool:
+        """The scheduler's loop over `loop` ("running" or "waiting")
+        requests met `request`, whose allocation the spill guard holds, with
+        `num_behind` requests after it. Whether to skip it and go on with
+        those (`may_skip`: the scheduler allows it); else the loop ends."""
+        stats = self.lazy_spill_stats
+        if self._skips_held(request, may_skip):
+            if loop == "running":
+                stats.held_skips_running += 1
+            else:
+                stats.held_skips_waiting += 1
+            return True
+        if loop == "running":
+            stats.held_stops_running += 1
+        else:
+            stats.held_stops_waiting += 1
+        stats.held_stop_untried += num_behind
+        return False
+
+    def _skips_held(self, request: "Request", may_skip: bool) -> bool:
+        return False
+
+    def claim_against(self, request: "Request") -> int:
+        """SpillGuard: no request's room is claimed here (the tiered connector
+        claims it for the request it makes room for)."""
+        return 0
+
+    def release_reserved(self, request: "Request", num_blocks: int) -> None:
+        return
+
+    def note_held(self, request: "Request", num_blocks: int) -> None:
+        return
+
+    def note_claim_blocked(self, request: "Request") -> None:
+        return
+
+    def note_refused(self, request: "Request", reason: str) -> None:
+        return
+
     def on_unspilled_eviction(self, blocks: list["KVCacheBlock"]) -> None:
         """SpillGuard: `blocks` leave the GPU without a copy."""
         self.lazy_spill_stats.unspilled_evicted_blocks += len(blocks)
@@ -635,6 +695,8 @@ class SimpleCPUOffloadScheduler:
         the CPU pool can take at once. `_MAX_SPILL_WAIT_S` with no store
         landing is a backstop."""
         if not self._spill_shortfall:
+            if self._held_since is not None:
+                self._end_hold(time.monotonic())
             self._held_since = None
             self._stalled_walks = 0
             self._holding = True
@@ -654,9 +716,20 @@ class SimpleCPUOffloadScheduler:
         holding = not stalled and waited < _MAX_SPILL_WAIT_S
         if self._holding and not holding:
             self.lazy_spill_stats.guard_releases += 1
+            self._end_hold(now)
             self._held_since = None
             self._stalled_walks = 0
         self._holding = holding
+
+    def _end_hold(self, now: float) -> None:
+        assert self._held_since is not None
+        ms = int((now - self._held_since) * 1000)
+        stats = self.lazy_spill_stats
+        stats.hold_episodes += 1
+        stats.hold_ms += ms
+        stats.holds_over_100ms += ms >= 100
+        stats.holds_over_1s += ms >= 1000
+        stats.holds_over_5s += ms >= 5000
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -962,9 +1035,13 @@ class SimpleCPUOffloadScheduler:
         in_flight = sum(
             len(t.gpu_block_ids) for t in self._store_event_to_blocks.values()
         )
+        # Copies taken ahead of a need (`_copy_ahead`) count with the held
+        # allocations' but hold nothing back.
         shortfall = min(
-            max(0, self._spill_shortfall - in_flight), _MAX_SHORTFALL_STORE_BLOCKS
+            max(0, self._spill_shortfall + self._copy_ahead - in_flight),
+            _MAX_SHORTFALL_STORE_BLOCKS,
         )
+        self._copy_ahead = 0
 
         policy = gpu_pool.eviction_policy
         order: Iterable[KVCacheBlock] = (
@@ -1994,6 +2071,7 @@ class SimpleCPUOffloadScheduler:
         self.boundary_store_stats = undrained
         self._boundary_stats_snapshot = BoundaryStoreStats()
         self._spill_shortfall = 0
+        self._copy_ahead = 0
         self._held_since = None
         self._holding = True
         self._spill_twins.clear()

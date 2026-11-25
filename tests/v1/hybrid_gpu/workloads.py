@@ -11,8 +11,10 @@ engine under test, so one workload fits every model family.
 
 from __future__ import annotations
 
+import heapq
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -150,6 +152,16 @@ class Turn:
     # end less one resume unit (`Probe.resume_unit`).
     floor: int
     result: Result
+    request_id: str = ""
+    # time.monotonic() when the turn was submitted, its first token came
+    # back, and it finished.
+    submitted: float = 0.0
+    first_token: float = 0.0
+    finished: float = 0.0
+
+    @property
+    def ttft(self) -> float:
+        return self.first_token - self.submitted
 
     @property
     def short_by(self) -> int:
@@ -167,18 +179,33 @@ def drive(
     user_every: int = 0,
     max_blocks: float | None = None,
     restart_blocks: float = 4,
+    max_tokens: int = 1,
+    on_submit: Callable[[str, list[int], int], None] | None = None,
+    on_step: Callable[[float], None] | None = None,
+    think_s: tuple[float, float] | dict[int, tuple[float, float]] | None = None,
+    seed: int = 0,
+    priority: int = 0,
 ) -> list[Turn]:
     """Agents in a loop, out of phase like real ones: each session's next
-    turn is submitted the moment its last one finishes, until `seconds`
-    have passed, so allocations keep arriving while copies run. Every
-    `user_every`-th turn is a user turn; a session that would outgrow
+    turn is submitted the moment its last one finishes, or `think_s`
+    (seconds, drawn uniformly per turn from `seed`; by session index when a
+    dict, none for sessions it leaves out) after it, until `seconds` have
+    passed, so allocations keep arriving while copies run.
+    Every `user_every`-th turn is a user turn; a session that would outgrow
     `max_blocks` ends, and a new one of `restart_blocks` (a new seed) takes
-    its place."""
+    its place. Each turn generates `max_tokens` tokens, at `priority`
+    (production's agents send 10). `on_submit(request id, prompt, floor)`
+    runs before a turn is added, `on_step(started)` after each engine step
+    with the time it started."""
     engine = llm.llm_engine
-    params = greedy()
-    pending: dict[str, tuple[int, int]] = {}
+    params = greedy(max_tokens)
+    pending: dict[str, tuple[int, int, float]] = {}
+    first_token: dict[str, float] = {}
     turns: list[Turn] = []
     generation = [0] * len(sessions)
+    rng = random.Random(seed)
+    # (when, session): next turns due after their agent's pause.
+    due: list[tuple[float, int]] = []
 
     def submit(i: int) -> None:
         session = sessions[i]
@@ -208,17 +235,40 @@ def drive(
             else:
                 prompt = session.next_tool_turn(turn_blocks)
         request_id = f"s{i}g{generation[i]}-t{session.turns}"
-        engine.add_request(request_id, TokensPrompt(prompt_token_ids=prompt), params)
-        pending[request_id] = (i, floor)
+        if on_submit is not None:
+            on_submit(request_id, prompt, floor)
+        engine.add_request(
+            request_id,
+            TokensPrompt(prompt_token_ids=prompt),
+            params,
+            priority=priority,
+        )
+        pending[request_id] = (i, floor, time.monotonic())
 
     deadline = time.monotonic() + seconds
     for i in range(len(sessions)):
         submit(i)
-    while pending:
-        for out in engine.step():
+    while pending or due:
+        now = time.monotonic()
+        while due and due[0][0] <= now:
+            _, i = heapq.heappop(due)
+            if now < deadline:
+                submit(i)
+        if not pending:
+            if due:
+                time.sleep(min(0.01, max(0.0, due[0][0] - now)))
+            continue
+        started = time.monotonic()
+        outputs = engine.step()
+        now = time.monotonic()
+        if on_step is not None:
+            on_step(started)
+        for out in outputs:
+            if out.outputs and out.outputs[0].token_ids:
+                first_token.setdefault(out.request_id, now)
             if not out.finished:
                 continue
-            i, floor = pending.pop(out.request_id)
+            i, floor, submitted = pending.pop(out.request_id)
             result = Result(
                 list(out.prompt_token_ids),
                 list(out.outputs[0].token_ids),
@@ -226,9 +276,24 @@ def drive(
                 None,
             )
             sessions[i].record(result)
-            turns.append(Turn(i, floor, result))
-            if time.monotonic() < deadline:
+            turns.append(
+                Turn(
+                    i,
+                    floor,
+                    result,
+                    out.request_id,
+                    submitted,
+                    first_token.pop(out.request_id, now),
+                    now,
+                )
+            )
+            if time.monotonic() >= deadline:
+                continue
+            pause = think_s.get(i) if isinstance(think_s, dict) else think_s
+            if pause is None:
                 submit(i)
+            else:
+                heapq.heappush(due, (now + rng.uniform(*pause), i))
     return turns
 
 

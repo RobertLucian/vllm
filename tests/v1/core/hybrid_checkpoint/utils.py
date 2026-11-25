@@ -117,6 +117,9 @@ def tiered_cpu_connector(
             "ram_ladder_blocks": 0,
             # Its fake clock has no turn gaps to speak of.
             "abandon_gap_multiplier": 0,
+            # Its tests were written for the restore wait and the queue behind
+            # it; pack admission is tested on CUDA.
+            "admission": "legacy",
         },
     )
 

@@ -31,10 +31,18 @@ stretch from this many blocks back from its end, so RAM evicts its tail down
 to a rung, not all of it; 0, off) and ``abandon_gap_multiplier`` /
 ``abandon_floor_seconds`` (default 2.5 / 30: RAM GDSF evicts a session idle
 that many times its turn gap, at least the floor, before any live one; 0,
-off).
+off), ``admission`` (default ``legacy``; ``pack``, ``pass``: window T, 2026-11-24,
+had pack below legacy at TP 2) and
+``claim_after_seconds`` (default 1), ``bounded_search`` (default true: a
+lookup searches no deeper than the restore gain it checks; false walks the
+whole session), ``verify_search`` (default false: each bounded lookup is
+checked against the whole walk, for tests), ``log_restores`` (default false:
+each restore's start, landing and admission logged at INFO, else DEBUG) and
+``summary_log_seconds`` (default 60: a summary line at most this often after
+activity; 0, off).
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -104,6 +112,12 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
                 extra_config.get("abandon_gap_multiplier", 2.5)
             ),
             "abandon_floor_s": float(extra_config.get("abandon_floor_seconds", 30.0)),
+            "admission": str(extra_config.get("admission", "legacy")),
+            "claim_after_s": float(extra_config.get("claim_after_seconds", 1.0)),
+            "bounded_search": bool(extra_config.get("bounded_search", True)),
+            "verify_search": bool(extra_config.get("verify_search", False)),
+            "log_restores": bool(extra_config.get("log_restores", False)),
+            "summary_log_s": float(extra_config.get("summary_log_seconds", 60.0)),
         }
 
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
@@ -111,6 +125,16 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
         manager = self.scheduler_manager
         if isinstance(manager, TieredCPUOffloadScheduler):
             manager.bind_kv_cache_manager(kv_cache_manager)
+
+    def bind_first_chunk(
+        self,
+        first_chunk: Callable[["Request", int, int, tuple[int, ...]], tuple[int, int]],
+    ) -> None:
+        """The scheduler's sizing of a restored request's first chunk
+        (`Scheduler.first_chunk`)."""
+        manager = self.scheduler_manager
+        if isinstance(manager, TieredCPUOffloadScheduler):
+            manager.bind_first_chunk(first_chunk)
 
     def observe_admission(self, request: "Request", num_computed_tokens: int) -> None:
         """The scheduler admitted `request` `num_computed_tokens` tokens in."""

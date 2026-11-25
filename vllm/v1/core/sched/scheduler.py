@@ -408,8 +408,12 @@ class Scheduler(SchedulerInterface):
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
         # Bind after construction so connectors can access the cache manager.
+        self._step_prefill_thresholds = (0, 0)
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+            bind_first_chunk = getattr(self.connector, "bind_first_chunk", None)
+            if bind_first_chunk is not None:
+                bind_first_chunk(self.first_chunk)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
@@ -595,6 +599,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        junction: int | None = None,
+        retained_boundaries: tuple[int, ...] | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -603,6 +609,8 @@ class Scheduler(SchedulerInterface):
         boundary, a detected shared-prefix junction). If a block is larger
         than the configured prefill chunk limit, intermediate chunks keep
         private running state until they reach the next cacheable position.
+        `junction` and `retained_boundaries` stand in for the request's own
+        (`first_chunk`: the ones it will have after a restore).
         """
         start = (
             request.num_computed_tokens
@@ -680,7 +688,10 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )
-        junction = request.shared_prefix_boundary
+        if junction is None:
+            junction = request.shared_prefix_boundary
+        if retained_boundaries is None:
+            retained_boundaries = request.retained_boundaries
         # Block-floored: a sub-block junction's state is not separately cacheable.
         block_floored = start + (junction - start) // block_size * block_size
         # Past the prompt the manager writes nothing, so fall back to the
@@ -709,13 +720,78 @@ class Scheduler(SchedulerInterface):
             junction_stop if start < junction < end else 0,
             # A KV connector's checkpoints along the prompt: their states too.
             min(
-                (b for b in request.retained_boundaries if start < b < end),
+                (b for b in retained_boundaries if start < b < end),
                 default=0,
             ),
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def first_chunk(
+        self,
+        request: Request,
+        hit_tokens: int,
+        junction: int,
+        retained_boundaries: tuple[int, ...],
+    ) -> tuple[int, int]:
+        """The tokens and blocks of the waiting `request`'s first chunk once it
+        resumes at a cache hit of `hit_tokens` a KV connector holds, as the
+        waiting loop would schedule it with a step's whole budget and this
+        step's long-prefill caps; past the hit, its prefill stops at
+        `junction` and `retained_boundaries` (the request's own after a
+        restore). Not the low-priority cap, which applies only while an urgent
+        request waits: then an upper bound. A connector that restores the hit
+        keeps that many blocks for the request while it loads, so the request
+        is admitted the step its load lands (`TieredCPUOffloadScheduler`)."""
+        num_new_tokens = request.num_tokens - hit_tokens
+        if num_new_tokens <= 0:
+            return 0, 0
+        spec = self.vllm_config.speculative_config
+        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        budget = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens - draft_slots,
+        )
+        # The waiting loop pads a lone token to the spec decoding size.
+        padded = (
+            self.num_spec_tokens > 0
+            and self.dynamic_sd_lookup is None
+            and self.num_sampled_tokens_per_step > 0
+            and num_new_tokens == 1
+            and hit_tokens > 0
+            and hit_tokens
+            + 1
+            + self.num_spec_tokens
+            + self.num_sampled_tokens_per_step
+            <= self.max_model_len
+        )
+        if padded:
+            num_new_tokens = 1 + self.num_spec_tokens
+        urgent = request.priority <= 0 and self.policy == SchedulingPolicy.PRIORITY
+        threshold = self._step_prefill_thresholds[1 if urgent else 0]
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        num_new_tokens = min(num_new_tokens, budget)
+        if self.need_mamba_block_aligned_split and num_new_tokens > 0:
+            num_new_tokens = self._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                hit_tokens,
+                0,
+                junction=junction,
+                retained_boundaries=retained_boundaries,
+            )
+            if padded and num_new_tokens not in (0, 1 + self.num_spec_tokens):
+                num_new_tokens = 1
+        num_new_tokens = self._reserve_prefill_lookahead(
+            request, hit_tokens, num_new_tokens
+        )
+        if num_new_tokens <= 0:
+            return 0, 0
+        return num_new_tokens, self.kv_cache_manager.num_blocks_for_chunk(
+            request, hit_tokens, num_new_tokens, self.num_lookahead_tokens
+        )
 
     def _log_poor_resume(
         self,
@@ -878,6 +954,12 @@ class Scheduler(SchedulerInterface):
             max(self.urgent_long_prefill_threshold, long_prefill_token_threshold)
             if long_prefill_token_threshold > 0
             else 0
+        )
+        # This step's caps, for a KV connector sizing a restored request's
+        # first chunk (`first_chunk`).
+        self._step_prefill_thresholds = (
+            long_prefill_token_threshold,
+            urgent_long_prefill_threshold,
         )
         # While a request of priority 0 or less waits or prefills, the others
         # share this many prefill tokens, and its own prefill is not deferred.
@@ -1132,6 +1214,16 @@ class Scheduler(SchedulerInterface):
                     # priority and may still fit (it just freed its blocks);
                     # it was removed from `self.running`, so `req_index`
                     # already points at the next one.
+                    continue
+                if self.kv_cache_manager.spill_hold and self._skips_held_allocation(
+                    request,
+                    "running",
+                    len(self.running) - req_index - 1,
+                    not urgent and not preempted_reqs,
+                ):
+                    # The spill guard holds this request's new blocks only:
+                    # the requests after it may still run this step.
+                    req_index += 1
                     continue
                 # Cannot schedule this request.
                 break
@@ -1747,6 +1839,20 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    kv_cache_manager = self.kv_cache_manager
+                    if (
+                        kv_cache_manager.spill_hold or kv_cache_manager.claim_hold
+                    ) and self._skips_held_allocation(
+                        request,
+                        "waiting",
+                        len(request_queue) - 1,
+                        request_queue is self.waiting and not urgent,
+                    ):
+                        # The spill guard holds this request's new blocks, or
+                        # they are claimed for an earlier request: the requests
+                        # after it may still be admitted.
+                        skip_request(request_queue)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -3505,6 +3611,15 @@ class Scheduler(SchedulerInterface):
     def set_pause_state(self, pause_state: PauseState) -> None:
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
+
+    def _skips_held_allocation(
+        self, request: Request, loop: str, num_behind: int, may_skip: bool
+    ) -> bool:
+        """The spill guard held `request`'s allocation
+        (`KVCacheManager.spill_hold`): whether the connector has the loop over
+        `loop` requests skip it instead of ending there."""
+        hook = getattr(self.connector, "on_held_allocation", None)
+        return hook is not None and hook(request, loop, num_behind, may_skip)
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may

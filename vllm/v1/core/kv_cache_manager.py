@@ -208,6 +208,12 @@ class KVCacheManager:
         self.kv_cache_config = kv_cache_config
         # Set by the scheduler when Mamba frontier checkpoints are on.
         self.checkpoints: HybridCheckpointManager | None = None
+        # Blocks the spill guard lacked when the last `allocate_slots` returned
+        # None for it (0: it did not, or the pool lacked free blocks); whether
+        # it returned None only because the blocks were claimed for an earlier
+        # request (`SpillGuard.claim_against`).
+        self.spill_hold = 0
+        self.claim_hold = False
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -529,6 +535,8 @@ class KVCacheManager:
             A list of new allocated blocks.
 
         """
+        self.spill_hold = 0
+        self.claim_hold = False
         # A step may need no slots of its own while still adopting computed
         # tokens: an async KV load, or a chunk that ends inside the replayed
         # range of a hit (SWA bounded replay).
@@ -597,6 +605,13 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                self._note_refused(
+                    request,
+                    # Mamba's count for a state another request cached this step.
+                    "same_step_state"
+                    if num_blocks_to_allocate > self.block_pool.num_gpu_blocks
+                    else "full_sequence",
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -631,14 +646,49 @@ class KVCacheManager:
             prefill_end=prefill_end,
         )
 
+        guard = self.block_pool.spill_guard
+        # Free blocks this request must leave for others a lazily filled tier
+        # keeps room for (an earlier request it makes room for, restores'
+        # requests' tokens past their resume points).
+        claim = guard.claim_against(request) if guard is not None else 0
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            self._note_refused(
+                request,
+                # Mamba's count for a state another request cached this step.
+                "same_step_state"
+                if num_blocks_to_allocate > self.block_pool.num_gpu_blocks
+                else "no_room",
+            )
             return None
-        guard = self.block_pool.spill_guard
+        if claim:
+            assert guard is not None
+            # Behind a claim the rest of the sequence must fit as well: the
+            # running loop grows a chunked prefill without one.
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_blocks = self.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+                prefill_end=prefill_end,
+            )
+            if (
+                max(full_blocks, num_blocks_to_allocate) + watermark_blocks + claim
+                > available_blocks
+            ):
+                self.claim_hold = True
+                guard.note_claim_blocked(request)
+                guard.note_refused(request, "claim")
+                return None
         if guard is not None and guard.holding:
             # A request waits while its new blocks would evict cached blocks
             # that a lazily filled tier does not hold yet; the hit blocks it
@@ -652,10 +702,23 @@ class KVCacheManager:
             ]
             need = required_blocks - len(touched)
             if need > 0:
-                safe = self.block_pool.num_spill_safe_free_blocks(need, touched)
-                if safe < need:
+                safe = self.block_pool.num_spill_safe_free_blocks(
+                    need + claim, touched
+                )
+                if safe < need + claim:
+                    if safe >= need:
+                        # Enough for itself, not beyond the claimed room.
+                        self.claim_hold = True
+                        guard.note_claim_blocked(request)
+                        guard.note_refused(request, "claim")
+                        return None
                     guard.on_allocation_held(need - safe)
+                    guard.note_held(request, need)
+                    guard.note_refused(request, "copies")
+                    self.spill_hold = need - safe
                     return None
+        if guard is not None:
+            guard.release_reserved(request, num_blocks_to_allocate)
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -695,6 +758,44 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _note_refused(self, request: Request, reason: str) -> None:
+        guard = self.block_pool.spill_guard
+        if guard is not None:
+            guard.note_refused(request, reason)
+
+    def num_blocks_for_chunk(
+        self,
+        request: Request,
+        hit_tokens: int,
+        num_new_tokens: int,
+        num_lookahead_tokens: int,
+    ) -> int:
+        """The blocks `allocate_slots` would take for the waiting `request`
+        resuming at a cache hit of `hit_tokens` whose blocks a KV connector
+        holds (none of them evictable), with a chunk of `num_new_tokens`: its
+        per-step count, without the watermark or the full-sequence check.
+        Changes nothing: the hit is null placeholders, and Mamba's count
+        records no checkpoint for it (`dry_run`)."""
+        null_block = self.block_pool.null_block
+        hit = tuple(
+            [null_block] * cdiv(hit_tokens, manager.block_size)
+            for manager in self.coordinator.single_type_managers
+        )
+        num_tokens_main_model = hit_tokens + num_new_tokens
+        return self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(
+                num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+            ),
+            new_computed_blocks=hit,
+            num_encoder_tokens=0,
+            total_computed_tokens=hit_tokens,
+            num_local_computed_tokens=hit_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+            dry_run=True,
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

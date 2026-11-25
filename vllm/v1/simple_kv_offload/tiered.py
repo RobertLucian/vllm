@@ -41,6 +41,7 @@ shorter ones: resuming from the GPU alone would recompute what RAM holds.
 
 import bisect
 import itertools
+import logging
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator
@@ -62,6 +63,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -83,6 +85,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RAM_EVICTION_POLICIES = ("lru", "gdsf")
+ADMISSION_MODES = ("pack", "pass", "legacy")
 
 # A restore is worth a load only when it resumes this many tokens deeper than
 # the GPU alone.
@@ -190,9 +193,201 @@ class RestoreStats:
     chunked: int = 0
     chunks: int = 0
     chunked_aborted: int = 0
+    # The fields below are exported as `ADMISSION_EVENT_TO_FIELD` events,
+    # `SEARCH_EVENT_TO_FIELD` events, `SCHEDULER_PART_TO_FIELD` seconds and
+    # `PEAK_KIND_TO_FIELD` gauges.
+    # Steps a restore waited for room, split by whether it asked the walk to
+    # copy GPU blocks out for it; and restores that waited that long, from
+    # their first wait to their start or giving up (`_stop_waiting`).
+    head_waits_copying: int = 0
+    head_waits_not_copying: int = 0
+    head_waits_over_1s: int = 0
+    head_waits_over_10s: int = 0
+    head_waits_over_60s: int = 0
+    # Requests with nothing to restore that `admission="pack"` let past a
+    # waiting restore (legacy admission held them), and of those, the ones
+    # with no resume point at all.
+    passed_head: int = 0
+    passed_head_cold: int = 0
+    # Pack admission. Restores admitted in the first scheduling pass after
+    # their load landed, the next, within four, later.
+    admit_steps_0: int = 0
+    admit_steps_1: int = 0
+    admit_steps_2_4: int = 0
+    admit_steps_over_4: int = 0
+    # The blocks a restore held for its tokens past the resume point
+    # (`_estimate_extra`): admissions that took exactly as many, that needed
+    # more (and how many more), blocks they did not need, blocks released
+    # with no admission; re-estimates as the load landed that grew or shrank
+    # the room, and by how many blocks; estimates whose first chunk the
+    # scheduler would not schedule (0 tokens).
+    extra_exact_admissions: int = 0
+    extra_short: int = 0
+    extra_short_blocks: int = 0
+    extra_unused_blocks: int = 0
+    extra_released_unadmitted: int = 0
+    extra_regrown: int = 0
+    extra_regrown_blocks: int = 0
+    extra_shrunk: int = 0
+    extra_shrunk_blocks: int = 0
+    extra_zero_chunk: int = 0
+    # Restored requests admitted at another point than the restore's: short
+    # of it (the GPU lost a piece meanwhile), past it.
+    admitted_hit_short: int = 0
+    admitted_hit_past: int = 0
+    # Restores started in one step: the most, and steps with two or more;
+    # the most restores loading at once.
+    starts_per_step_max: int = 0
+    multi_start_steps: int = 0
+    concurrent_restores_max: int = 0
+    # Steps with a claimant (`_update_claim`), allocations and restores that
+    # fit but would have taken its room, and changes of claimant.
+    claim_wait_steps: int = 0
+    # Steps whose earliest request that did not fit had not yet waited
+    # `claim_after_s`: no one left it room.
+    claim_deferred_steps: int = 0
+    claim_blocked_admissions: int = 0
+    claim_blocked_restores: int = 0
+    claimant_changes: int = 0
+    # Blocks the walk copied out one chunk ahead of a chunked restore.
+    copy_ahead_blocks: int = 0
+    # Searches for a resume point (`_search`): calls and points visited; with
+    # `verify_search`, the whole walk's points too, and lookups whose bounded
+    # search found another decision or point than the whole walk (must stay
+    # 0), or the same with another GPU-only point (the pin timeout's).
+    search_calls: int = 0
+    search_points: int = 0
+    search_points_whole: int = 0
+    # Hash units the searches scanned (and, verifying, the whole walks).
+    search_units: int = 0
+    search_units_whole: int = 0
+    search_mismatches: int = 0
+    search_gpu_only_differs: int = 0
+    # Scheduler time the connector took (ns): its lookups for waiting
+    # requests (of which: the search, the junction's chain, the room checks
+    # of a restore), its queue observation, its per-step work, its stats.
+    lookup_ns: int = 0
+    lookup_search_ns: int = 0
+    lookup_junction_ns: int = 0
+    lookup_room_ns: int = 0
+    # The room estimates' share of that (`_estimate_extra`: the junction, the
+    # scheduler's sizing and block count), at landing too.
+    estimate_ns: int = 0
+    observe_queue_ns: int = 0
+    step_ns: int = 0
+    stats_ns: int = 0
 
 
-RESTORE_EVENT_TO_FIELD = {f: f for f in RestoreStats.__dataclass_fields__}
+# event label value -> RestoreStats field name: the fields above the
+# unexported ones.
+RESTORE_EVENT_TO_FIELD = {
+    f: f
+    for f in (
+        "started",
+        "completed",
+        "restored_blocks",
+        "restored_frontiers",
+        "waited_guard",
+        "waited_cap",
+        "waited_behind",
+        "gave_up",
+        "pin_timeouts",
+        "orphaned",
+        "unpinned_for_spill",
+        "chunked",
+        "chunks",
+        "chunked_aborted",
+    )
+}
+# `vllm:tiered_kv_admission_total{event}`: how waiting requests got room.
+ADMISSION_EVENT_TO_FIELD = {
+    f: f
+    for f in (
+        "head_waits_copying",
+        "head_waits_not_copying",
+        "head_waits_over_1s",
+        "head_waits_over_10s",
+        "head_waits_over_60s",
+        "passed_head",
+        "passed_head_cold",
+        "admit_steps_0",
+        "admit_steps_1",
+        "admit_steps_2_4",
+        "admit_steps_over_4",
+        "extra_exact_admissions",
+        "extra_short",
+        "extra_short_blocks",
+        "extra_unused_blocks",
+        "extra_released_unadmitted",
+        "extra_regrown",
+        "extra_regrown_blocks",
+        "extra_shrunk",
+        "extra_shrunk_blocks",
+        "extra_zero_chunk",
+        "admitted_hit_short",
+        "admitted_hit_past",
+        "multi_start_steps",
+        "claim_wait_steps",
+        "claim_deferred_steps",
+        "claim_blocked_admissions",
+        "claim_blocked_restores",
+        "claimant_changes",
+        "copy_ahead_blocks",
+    )
+}
+# `vllm:tiered_kv_search_total{event}`.
+SEARCH_EVENT_TO_FIELD = {
+    "calls": "search_calls",
+    "points": "search_points",
+    "points_whole": "search_points_whole",
+    "units": "search_units",
+    "units_whole": "search_units_whole",
+    "mismatches": "search_mismatches",
+    "gpu_only_differs": "search_gpu_only_differs",
+}
+# `vllm:tiered_kv_scheduler_seconds_total{part}`, from ns.
+SCHEDULER_PART_TO_FIELD = {
+    "lookup": "lookup_ns",
+    "lookup_search": "lookup_search_ns",
+    "lookup_junction": "lookup_junction_ns",
+    "lookup_room": "lookup_room_ns",
+    "estimate": "estimate_ns",
+    "observe_queue": "observe_queue_ns",
+    "step": "step_ns",
+    "stats": "stats_ns",
+}
+# `vllm:tiered_kv_restore_peaks{kind}` gauges: maxima since start.
+PEAK_KIND_TO_FIELD = {
+    "starts_per_step": "starts_per_step_max",
+    "concurrent_restores": "concurrent_restores_max",
+}
+# Why a waiting request did not go this step (`_last_wait`), and why a restore
+# that had landed was not admitted (`landed_waits`): its restore loads, waits
+# behind another (legacy), waits for room beside other restores' pins and
+# room or for the claimant's, waits for copies, or another restore loads its
+# RAM blocks; its allocation found no room, would take room others keep
+# ("reserved") or the claimant's ("claim"), waits for copies, did not fit
+# whole, or needs a state cached this step; the scheduler did not allocate
+# for it ("scheduler": a token budget, a cap, a chunk of 0 tokens) or did not
+# reach it ("not_reached").
+WAIT_REASONS = (
+    "loading",
+    "behind",
+    "room_restores",
+    "room_claim",
+    "copies_restore",
+    "same_blocks",
+    "no_room",
+    "reserved",
+    "claim",
+    "copies",
+    "full_sequence",
+    "same_step_state",
+    "scheduler",
+    "not_reached",
+)
+# Admissions remembered, the most recent (`recent_resumes`).
+_RECENT_RESUMES = 4096
 
 
 @dataclass(slots=True)
@@ -271,6 +466,17 @@ class _Plan:
 
 
 @dataclass(slots=True)
+class _Bound:
+    """A search's line (`_search`): points of `floor` tokens or fewer cannot
+    change a bounded search's decision, so `_resume_points` stops before the
+    hash units that hold only such points (`stopped`). The units it scanned."""
+
+    floor: int = -1
+    stopped: bool = False
+    units: int = 0
+
+
+@dataclass(slots=True)
 class _Restore:
     request_id: str
     num_tokens: int
@@ -297,6 +503,21 @@ class _Restore:
     position: tuple[int, float, str] = (0, 0.0, "")
     progress_at: float = 0.0
     aborted: bool = False
+    # Pack admission: spill-safe free GPU blocks the others leave for the
+    # request's tokens past the point (`_estimate_extra`, a count: the blocks
+    # stay cached, and in the free queue, until its allocation takes them),
+    # and the first chunk's tokens they are for; the scheduling step its load
+    # landed in; the request, for the re-estimate as it lands; when it began
+    # waiting for room (logs).
+    extra: int = 0
+    chunk_tokens: int = 0
+    done_step: int = 0
+    request: "Request | None" = None
+    started_at: float = 0.0
+    # At admission, the room it kept and the blocks its request's allocation
+    # took (-1: not yet).
+    kept: int = 0
+    used: int = -1
 
     @property
     def num_pinned(self) -> int:
@@ -336,6 +557,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         ram_ladder_blocks: int = 8,
         abandon_gap_multiplier: float = 2.5,
         abandon_floor_s: float = 30.0,
+        admission: str = "legacy",
+        claim_after_s: float = 1.0,
+        bounded_search: bool = True,
+        verify_search: bool = False,
+        log_restores: bool = False,
+        summary_log_s: float = 60.0,
         **kwargs: Any,
     ) -> None:
         kwargs["lazy_offload"] = True
@@ -344,6 +571,79 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             raise ValueError("restore_chunk_blocks must be 0 (off) or more")
         if ram_ladder_blocks < 0:
             raise ValueError("ram_ladder_blocks must be 0 (off) or more")
+        if admission not in ADMISSION_MODES:
+            raise ValueError(
+                f"admission must be one of {ADMISSION_MODES}, got {admission!r}"
+            )
+        if claim_after_s < 0:
+            raise ValueError("claim_after_s must be 0 or more")
+        # How waiting requests get room (module docstring). "pack": every
+        # request that fits goes, restores side by side, each with room for
+        # its tokens past the point; the earliest that does not fit claims
+        # the room it waits for once it has waited `claim_after_s`
+        # (`_update_claim`). "legacy": the requests behind a restore waiting
+        # for room wait with it (`_behind_head`). "pass": legacy, but those
+        # with nothing to restore pass it.
+        self._pack = admission == "pack"
+        self._pass = admission in ("pack", "pass")
+        # Claiming at once kept restores that fit out whenever a session of
+        # similar size waited (window R, 2026-11-24: 292 turns against 359
+        # for "pass" in window Q at TP 1, 288 against legacy's 343 at TP 2);
+        # most of those got room within a step or two anyway.
+        self._claim_after_s = claim_after_s
+        # Pack: the claimant (request id, queue position, blocks it needs),
+        # the restores waiting for room and the blocks each needs, the
+        # waiting requests whose allocation the spill guard held this step
+        # (position, blocks), the scheduling step, and restores started in it.
+        self._claim: tuple[str, tuple[int, float, str], int] | None = None
+        # Pack: the room restores keep for their requests' tokens past the
+        # point (the sum of `_Restore.extra`).
+        self._reserved = 0
+        self._waiting_need: dict[str, int] = {}
+        self._held_now: dict[str, tuple[tuple[int, float, str], int]] = {}
+        # Since when each queued request's allocation has been held.
+        self._alloc_held_since: dict[str, float] = {}
+        self._step = 0
+        self._starts_this_step = 0
+        # The scheduler's sizing of a restored request's first chunk past the
+        # point, its tokens and blocks (`Scheduler.first_chunk`): the room a
+        # restore keeps for it (`_estimate_extra`).
+        self._first_chunk: (
+            Callable[["Request", int, int, tuple[int, ...]], tuple[int, int]] | None
+        ) = None
+        # A lookup searches down from the deepest point only as far as the
+        # restore gain it checks (`_search`); `verify_search` checks each such
+        # search against the whole walk.
+        self._bounded_search = bounded_search
+        self._verify_search = verify_search
+        # Why each waiting request did not go this step (`WAIT_REASONS`), and
+        # why landed restores were not admitted, by reason; lookups by outcome.
+        # The landed restores eligible in this step's scheduling, those it
+        # looked up, and those `allocate_slots` refused.
+        self._last_wait: dict[str, str] = {}
+        self.landed_waits: Counter[str] = Counter()
+        self._landed_waits_snapshot: Counter[str] = Counter()
+        self.lookup_outcomes: Counter[str] = Counter()
+        self._lookup_outcomes_snapshot: Counter[str] = Counter()
+        self._landed_eligible: set[str] = set()
+        self._landed_looked_up: set[str] = set()
+        self._landed_refused: set[str] = set()
+        # The point each restored request's restore loaded, from its admission
+        # to `observe_admission`; the most recent admissions' tier and point.
+        self._admitted_points: dict[str, int] = {}
+        self.recent_resumes: OrderedDict[str, tuple[str, int]] = OrderedDict()
+        # Logs: each restore's start, landing and admission at this level; a
+        # summary line at most every `summary_log_s` after activity.
+        self._restore_log_level = logging.INFO if log_restores else logging.DEBUG
+        self._summary_log_s = summary_log_s
+        self._summary_at = time.monotonic()
+        self._summary_step = 0
+        self._summary_snapshot = RestoreStats()
+        self._summary_outcomes: Counter[str] = Counter()
+        self._summary_landed: Counter[str] = Counter()
+        self._summary_spill = (0, 0, 0, 0)
+        self._summary_held_allocations = 0
+        self._spill_ns_snapshot = (0, 0)
         # A session's checkpoint ladder (`_ladder`): its first rung this many
         # blocks back from its end, each further one twice as far.
         self._ladder_blocks = ram_ladder_blocks
@@ -525,6 +825,12 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
 
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
         self._kv_cache_manager = kv_cache_manager
+
+    def bind_first_chunk(
+        self,
+        first_chunk: Callable[["Request", int, int, tuple[int, ...]], tuple[int, int]],
+    ) -> None:
+        self._first_chunk = first_chunk
 
     @property
     def _checkpoints(self) -> "HybridCheckpointManager | None":
@@ -797,36 +1103,86 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         """Never an external hit: (None, False) while a restore for the
         request is pending or the request waits behind one (the scheduler
         retries it next step), else (0, False)."""
+        started = time.perf_counter_ns()
+        try:
+            return self._lookup(request, num_computed_tokens)
+        finally:
+            self.restore_stats.lookup_ns += time.perf_counter_ns() - started
+
+    def _lookup(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
         request_id = request.request_id
         restore = self._restores.get(request_id)
         if restore is not None:
             if not restore.done:
+                self._outcome(request_id, "loading")
                 return None, False
-            self._raise_junction(request, num_computed_tokens)
-            self._set_rungs(request, num_computed_tokens)
+            self._outcome(request_id, "landed")
+            self._landed_looked_up.add(request_id)
+            # From the restore's own point: the scheduler's hit can run past
+            # it (pages without their state), which would drop the rungs in
+            # between and run the chunk past the room kept for it.
+            point = restore.num_tokens - restore.num_tokens % self.block_size
+            self._raise_junction(request, point)
+            self._set_rungs(request, point)
             return 0, False
         if self._gpu_block_pool is None:
             return 0, False
+        plan: _Plan | None = None
+        chain: list[_Piece] | None = None
+        planned = False
         if self._behind_head(request):
-            self.restore_stats.waited_behind += 1
-            return None, False
+            if not self._pass:
+                self.restore_stats.waited_behind += 1
+                self._outcome(request_id, "behind")
+                return None, False
+            # Pack admission holds no one behind a waiting restore: what that
+            # one waits for is claimed (`claim_against`). "pass" holds only
+            # those that would restore too.
+            if not request.skip_reading_external_kv:
+                plan, chain = self._plan(request, num_computed_tokens)
+                planned = True
+            if plan is not None and not self._pack:
+                self.restore_stats.waited_behind += 1
+                self._outcome(request_id, "behind")
+                return None, False
+            if plan is None:
+                self.restore_stats.passed_head += 1
+                self.restore_stats.passed_head_cold += not num_computed_tokens
         if request.skip_reading_external_kv:
+            self._outcome(request_id, "skip")
             return 0, False
-        plan = self._plan(request)
+        if not planned:
+            plan, chain = self._plan(request, num_computed_tokens)
         if plan is None:
             self._stop_waiting(request_id)
-            self._raise_junction(request, num_computed_tokens)
+            self._outcome(request_id, "gpu_only")
+            self._raise_junction(request, num_computed_tokens, chain)
             self._set_rungs(request, num_computed_tokens)
             return 0, False
-        return self._start_restore(request, plan)
+        started = time.perf_counter_ns()
+        try:
+            return self._start_restore(request, plan, chain)
+        finally:
+            self.restore_stats.lookup_room_ns += time.perf_counter_ns() - started
 
-    def _set_rungs(self, request: "Request", num_computed_tokens: int) -> None:
-        """The checkpoint ladder's rungs inside what the request computes
-        (`_ladder`): the prefill stops a chunk at each and the GPU keeps its
-        state (`Request.retained_boundaries`), which production's sparse Mamba
-        retention would not otherwise cache inside a prefill."""
+    def _outcome(self, request_id: str, outcome: str) -> None:
+        """Count a lookup's outcome; one that leaves the request waiting is
+        its reason this step (`WAIT_REASONS`)."""
+        self.lookup_outcomes[outcome] += 1
+        if outcome in WAIT_REASONS:
+            self._last_wait[request_id] = outcome
+        else:
+            self._last_wait.pop(request_id, None)
+
+    def _rungs(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, ...] | None:
+        """The checkpoint ladder's rungs past `num_computed_tokens` (None:
+        no ladder, the request keeps its own)."""
         if not self._ladder_blocks or not self.mamba_gids:
-            return
+            return None
         block_size = self.block_size
         end_block = request.num_prompt_tokens // block_size
         first = num_computed_tokens // block_size
@@ -835,9 +1191,49 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         while end_block - distance > first:
             rungs.append((end_block - distance) * block_size)
             distance *= 2
-        request.retained_boundaries = tuple(sorted(rungs))
+        return tuple(sorted(rungs))
 
-    def _raise_junction(self, request: "Request", num_computed_tokens: int) -> None:
+    def _set_rungs(self, request: "Request", num_computed_tokens: int) -> None:
+        """The checkpoint ladder's rungs inside what the request computes
+        (`_ladder`): the prefill stops a chunk at each and the GPU keeps its
+        state (`Request.retained_boundaries`), which production's sparse Mamba
+        retention would not otherwise cache inside a prefill."""
+        rungs = self._rungs(request, num_computed_tokens)
+        if rungs is not None:
+            request.retained_boundaries = rungs
+
+    def _junction(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        chain: list[_Piece] | None = None,
+    ) -> int | None:
+        """Where `_raise_junction` would put the request's junction (None:
+        where it is). `chain`: the request's page chain, if this lookup found
+        it already."""
+        started = time.perf_counter_ns()
+        try:
+            if chain is None:
+                chain = self._page_chain(request)
+            end = len(chain) * self.block_size
+            if end <= max(num_computed_tokens, request.shared_prefix_boundary):
+                return None
+            key = request.block_hashes[end // self.hash_block_size - 1]
+            if all(
+                self._find(make_block_hash_with_group_id(key, group_id))
+                for group_id in self.mamba_gids
+            ):
+                return None
+            return end
+        finally:
+            self.restore_stats.lookup_junction_ns += time.perf_counter_ns() - started
+
+    def _raise_junction(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        chain: list[_Piece] | None = None,
+    ) -> None:
         """The scheduler marks a shared prefix's junction from the GPU alone
         (`Request.shared_prefix_boundary`): where the pages run past the
         point the request resumes at, which another request wrote. With
@@ -846,17 +1242,9 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         one both tiers keep (`_note_junction`). Not where a state is cached
         already (the request resumes short of it only because restoring it
         would gain too little)."""
-        chain = self._page_chain(request)
-        end = len(chain) * self.block_size
-        if end <= max(num_computed_tokens, request.shared_prefix_boundary):
-            return
-        key = request.block_hashes[end // self.hash_block_size - 1]
-        if all(
-            self._find(make_block_hash_with_group_id(key, group_id))
-            for group_id in self.mamba_gids
-        ):
-            return
-        request.shared_prefix_boundary = end
+        end = self._junction(request, num_computed_tokens, chain)
+        if end is not None:
+            request.shared_prefix_boundary = end
 
     def _queue_position(self, request: "Request") -> tuple[int, float, str]:
         """Where `request` stands in the scheduler's waiting queue (ties go by
@@ -890,11 +1278,25 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         since = self._waiting_since.get(head[0])
         return since is not None and time.monotonic() - since >= _HEAD_PASS_S
 
-    def _stop_waiting(self, request_id: str) -> None:
-        self._waiting_since.pop(request_id, None)
+    def _stop_waiting(self, request_id: str) -> float:
+        """The request no longer waits for room to restore into; how long it
+        did (0 if it did not)."""
+        since = self._waiting_since.pop(request_id, None)
+        waited = 0.0
+        if since is not None:
+            waited = time.monotonic() - since
+            stats = self.restore_stats
+            stats.head_waits_over_1s += waited >= 1.0
+            stats.head_waits_over_10s += waited >= 10.0
+            stats.head_waits_over_60s += waited >= 60.0
+        self._waiting_need.pop(request_id, None)
+        if self._claim is not None and self._claim[0] == request_id:
+            # It has its room, or gave up waiting for it.
+            self._claim = None
         if self._head is not None and self._head[0] == request_id:
             self._head = None
             self._unpin_head()
+        return waited
 
     def _unpin_head(self) -> None:
         if self._head_pins:
@@ -919,7 +1321,174 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             return True
         return False
 
+    def _skips_held(self, request: "Request", may_skip: bool) -> bool:
+        """Pack admission: the scheduler goes on past a request whose
+        allocation waits, for copies or for claimed room. The claim keeps the
+        room the earliest of them waits for (`claim_against`), and a landed
+        restore leaves its own room for it (`claim_against`)."""
+        return self._pack and may_skip
+
+    # ------------------------------------------------------------------
+    # Pack admission: the claim and the restores' room
+
+    def claim_against(self, request: "Request") -> int:
+        """SpillGuard: spill-safe free blocks `request`'s allocation, or
+        restore, must leave: the room restores keep for their requests'
+        tokens past the point (`_Restore.extra`), but its own; and the
+        claimant's room, unless it is the claimant, comes before it in the
+        queue (an urgent chat, a preempted request), or has a restore of its
+        own. Running requests and those holding blocks leave none: their
+        decode never waits on a claim."""
+        if not self._pack or (
+            request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            or request.num_computed_tokens > 0
+        ):
+            return 0
+        restore = self._restores.get(request.request_id)
+        num_blocks = self._reserved - (restore.extra if restore is not None else 0)
+        claim = self._claim
+        if (
+            claim is not None
+            and restore is None
+            and request.request_id != claim[0]
+            and self._queue_position(request) >= claim[1]
+        ):
+            num_blocks += claim[2]
+        # Never negative: a negative claim would let an allocation past the
+        # spill guard (`num_spill_safe_free_blocks` counts up to it).
+        return max(0, num_blocks)
+
+    def release_reserved(self, request: "Request", num_blocks: int) -> None:
+        """SpillGuard: the request's allocation of `num_blocks` goes ahead:
+        the room its restore kept for it is the allocation's now."""
+        restore = self._restores.get(request.request_id)
+        if restore is None or not self._pack:
+            return
+        stats = self.restore_stats
+        restore.kept, restore.used = restore.extra, num_blocks
+        if num_blocks > restore.extra:
+            stats.extra_short += 1
+            stats.extra_short_blocks += num_blocks - restore.extra
+        elif num_blocks < restore.extra:
+            stats.extra_unused_blocks += restore.extra - num_blocks
+        else:
+            stats.extra_exact_admissions += 1
+        self._reserved -= restore.extra
+        restore.extra = 0
+
+    def note_refused(self, request: "Request", reason: str) -> None:
+        """SpillGuard: `allocate_slots` refused the request this step. Room
+        others keep splits into the claimant's ("claim") and the room
+        restores keep for their requests ("reserved")."""
+        request_id = request.request_id
+        restore = self._restores.get(request_id)
+        if reason == "claim":
+            own = restore.extra if restore is not None else 0
+            if self.claim_against(request) <= self._reserved - own:
+                reason = "reserved"
+        self._last_wait[request_id] = reason
+        if restore is not None and restore.done:
+            self.landed_waits[reason] += 1
+            self._landed_refused.add(request_id)
+
+    def note_held(self, request: "Request", num_blocks: int) -> None:
+        """SpillGuard: a waiting request's allocation waits for copies; the
+        earliest such request may be the next claimant."""
+        if self._pack and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            self._held_now[request.request_id] = (
+                self._queue_position(request),
+                num_blocks,
+            )
+            self._alloc_held_since.setdefault(request.request_id, time.monotonic())
+
+    def note_claim_blocked(self, request: "Request") -> None:
+        self.restore_stats.claim_blocked_admissions += 1
+
+    def _update_claim(self, waiting: Iterable["Request"]) -> None:
+        """Before the step allocates: the request the others leave room for.
+        The chunked restore under way (it holds part of its room already),
+        else the earliest queued of the restores waiting for room and the
+        allocations the spill guard held last step. Its room is what it
+        needs, once it has waited `claim_after_s` (a chunked restore: since
+        its last chunk); the walk copies for it first (`_start_restore`)."""
+        held, self._held_now = self._held_now, {}
+        if not self._pack:
+            return
+        queued = {r.request_id for r in waiting}
+        for request_id in [r for r in self._alloc_held_since if r not in queued]:
+            del self._alloc_held_since[request_id]
+        claim = None
+        since = None
+        restore = self._chunked
+        if restore is not None and restore.pending:
+            claim = (restore.request_id, restore.position, len(restore.pending))
+            since = restore.progress_at
+        else:
+            candidates = []
+            head = self._head
+            if head is not None and head[0] in queued:
+                need = self._waiting_need.get(head[0], 0)
+                candidates.append((head[1], head[0], need))
+            for request_id, (position, num_blocks) in held.items():
+                if request_id in queued and request_id not in self._restores:
+                    candidates.append((position, request_id, num_blocks))
+            if candidates:
+                position, request_id, num_blocks = min(candidates)
+                claim = (request_id, position, num_blocks)
+                since = self._waiting_since.get(
+                    request_id, self._alloc_held_since.get(request_id)
+                )
+        stats = self.restore_stats
+        if (
+            claim is not None
+            and since is not None
+            and time.monotonic() - since < self._claim_after_s
+        ):
+            stats.claim_deferred_steps += 1
+            claim = None
+        if claim is not None:
+            stats.claim_wait_steps += 1
+            if self._claim is None or self._claim[0] != claim[0]:
+                stats.claimant_changes += 1
+        self._claim = claim
+
     def observe_queue(self, waiting: Iterable["Request"]) -> None:
+        started = time.perf_counter_ns()
+        try:
+            self._account_landed()
+            self._last_wait.clear()
+            self._observe_queue(waiting)
+            self._update_claim(waiting)
+        finally:
+            self.restore_stats.observe_queue_ns += time.perf_counter_ns() - started
+
+    def _account_landed(self) -> None:
+        """As a scheduling step starts: why each restore that had landed
+        before the last one began is still not admitted, when its allocation
+        was not refused (`note_refused` counted those): the scheduler looked
+        it up but allocated nothing for it, or never reached it."""
+        for request_id in self._landed_eligible:
+            restore = self._restores.get(request_id)
+            if (
+                restore is None
+                or not restore.done
+                or request_id in self._landed_refused
+            ):
+                continue
+            reason = (
+                "scheduler" if request_id in self._landed_looked_up else "not_reached"
+            )
+            self.landed_waits[reason] += 1
+        self._landed_eligible = {
+            request_id for request_id, r in self._restores.items() if r.done
+        }
+        self._landed_looked_up.clear()
+        self._landed_refused.clear()
+
+    def _observe_queue(self, waiting: Iterable["Request"]) -> None:
         """Keep what the queued requests resume from until they are admitted
         (`_resume_keys`): on the GPU at the far end of the LRU order and in
         RAM out of eviction's reach (`RamGreedyDualSizeFrequency.queued`).
@@ -1058,7 +1627,10 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         return tuple(keys)
 
     def _start_restore(
-        self, request: "Request", plan: _Plan
+        self,
+        request: "Request",
+        plan: _Plan,
+        chain: list[_Piece] | None = None,
     ) -> tuple[int | None, bool]:
         request_id = request.request_id
         pool = self._gpu_block_pool
@@ -1067,44 +1639,101 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         pinned = [p.block for p in plan.pieces if p.on_gpu]
         if any(b.block_id in self._loading_cpu for b in loads):
             # Another request's restore is loading the same RAM blocks.
+            self._outcome(request_id, "same_blocks")
             return None, False
         num_blocks = len(loads)
         stats = self.restore_stats
+        # Pack admission: the restore keeps room for the request's tokens
+        # past the point too, so the request is admitted the step its load
+        # lands; and leaves the room the other restores keep and the
+        # claimant's (none for the claimant).
+        extra = chunk_tokens = 0
+        if self._pack:
+            chunk_tokens, extra = self._estimate_extra(
+                request, plan.num_tokens, chain
+            )
+            # Never more than the GPU holds beside the loads and a step's
+            # blocks: what does not fit is allocated at admission, as before.
+            extra = max(
+                0, min(extra, pool.num_gpu_blocks - num_blocks - self._target_free)
+            )
+        want = num_blocks + extra
+        claim = self.claim_against(request)
+        behind_claimant = claim > self._reserved
+        # The claim's part beyond the room other restores keep: the
+        # claimant's.
+        claimant_room = max(0, claim - self._reserved)
         # Restores waiting for admission run side by side while the running
         # requests keep a step's blocks free (the lazy walk's target); a
         # restore alone may pin a whole session. A cap of a quarter of the
         # pool let one 60-120-block session restore at a time in production.
         free = pool.get_num_free_blocks() - sum(not b.ref_cnt for b in pinned)
-        if self._num_pinned and free - num_blocks < self._target_free:
+        if (self._num_pinned or claim) and free - want - claim < self._target_free:
             stats.waited_cap += 1
-            return self._wait(request, loads)
+            stats.head_waits_not_copying += 1
+            stats.claim_blocked_restores += bool(claim) and (
+                not self._num_pinned or free - want >= self._target_free
+            )
+            by_claimant = bool(claimant_room) and (
+                free - want - (claim - claimant_room) >= self._target_free
+            )
+            return self._wait(
+                request,
+                loads,
+                want,
+                "room_claim" if by_claimant else "room_restores",
+            )
         # Blocks pinned below leave the free queue: they are not safe to take.
         # Once the spill guard lets held allocations go, neither does this one
         # wait for copies (`KVCacheManager.allocate_slots`).
         safe = (
-            pool.num_spill_safe_free_blocks(num_blocks, exclude=pinned)
+            pool.num_spill_safe_free_blocks(want + claim, exclude=pinned)
             if self.holding
             else free
         )
-        if safe < num_blocks:
-            if request_id not in self._no_chunk and self._can_chunk(
-                num_blocks, free, loads
+        if safe < want + claim:
+            stats.claim_blocked_restores += safe >= want
+            # Only one restore holds part of its room: the claimant (pack), or
+            # whichever chunks first (legacy).
+            if (
+                not behind_claimant
+                and request_id not in self._no_chunk
+                and self._can_chunk(num_blocks, free, loads, extra + claim)
             ):
-                return self._start_chunked(request, plan, loads, pinned)
+                return self._start_chunked(
+                    request, plan, loads, pinned, extra, chunk_tokens
+                )
             stats.waited_guard += 1
             # Only what copies can free: blocks the pool lacks altogether come
-            # back as requests finish, not from the walk. With chunks, no more
-            # than one: the rest would only evict RAM's blocks while this one
-            # waits.
-            need = min(num_blocks, free) - safe
-            if self._chunk_blocks():
-                need = min(need, self._chunk_blocks())
-                if free < num_blocks + self._target_free:
-                    need = 0
+            # back as requests finish, not from the walk.
+            if self._pack:
+                # Copies for every waiting restore the GPU has room for, so
+                # those that fit start side by side next step; the claimant's
+                # room stays its own (`claim_against`). (Beside other pinned
+                # restores or a claim, the cap above left a step's blocks.)
+                fits = free >= want + claim
+                need = want - max(0, safe - claim) if fits else 0
+            else:
+                # With chunks, no more than one: the rest would only evict
+                # RAM's blocks while this one waits.
+                need = min(want, free) - safe
+                if self._chunk_blocks():
+                    need = min(need, self._chunk_blocks())
+                    if free < want + self._target_free:
+                        need = 0
             if self.holding and need > 0:
                 self.on_allocation_held(need)
-            return self._wait(request, loads)
-        self._stop_waiting(request_id)
+                stats.head_waits_copying += 1
+            else:
+                stats.head_waits_not_copying += 1
+            if safe >= want + claim - claimant_room and claimant_room:
+                reason = "room_claim"
+            elif safe >= want:
+                reason = "room_restores"
+            else:
+                reason = "copies_restore"
+            return self._wait(request, loads, want, reason)
+        waited_s = self._stop_waiting(request_id)
         pool.touch(pinned)
         gpu_blocks = pool.get_new_blocks(num_blocks)
         self.cpu_block_pool.touch(loads)
@@ -1117,13 +1746,213 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             plan.frontier,
             plan.state,
             pin_timeout_s=max(_PIN_TIMEOUT_S, wait_s),
+            extra=extra,
+            chunk_tokens=chunk_tokens,
+            request=request,
+            started_at=time.monotonic(),
         )
+        self._reserved += extra
         self._restores[request_id] = restore
         self._unsent.append((restore, restore.loads))
         self._loading_cpu.update(b.block_id for b in loads)
         self._num_pinned += restore.num_pinned
         stats.started += 1
+        self._note_start()
+        self._outcome(request_id, "started")
+        self._log_restore_start(restore, plan, waited_s)
         return None, False
+
+    def _log_restore(
+        self, event: str, restore: _Restore, message: str, *args: Any
+    ) -> None:
+        level = self._restore_log_level
+        if logger.isEnabledFor(level):
+            logger.log(
+                level,
+                "Tiered KV restore %s for %s at %d tokens: " + message,
+                event,
+                restore.request_id,
+                restore.num_tokens,
+                *args,
+            )
+
+    def _log_restore_start(
+        self, restore: _Restore, plan: _Plan, waited_s: float
+    ) -> None:
+        if not logger.isEnabledFor(self._restore_log_level):
+            return
+        self._log_restore(
+            "started",
+            restore,
+            "%d RAM blocks to load, %d on the GPU, %s; GPU alone resumes at %d; "
+            "room %d blocks for a first chunk of %d tokens; waited %.0f ms; "
+            "%d restores loading, %d blocks kept for others",
+            len(restore.pending) + len(restore.loads),
+            len(restore.pinned),
+            "in chunks" if restore.chunked else "whole",
+            plan.gpu_only_tokens,
+            restore.extra,
+            restore.chunk_tokens,
+            1000 * waited_s,
+            sum(not r.done for r in self._restores.values()),
+            self._reserved - restore.extra,
+        )
+
+    def _log_summary(self) -> None:
+        """At most every `summary_log_s`, after activity: what restores and
+        admissions did since the last line."""
+        now = time.monotonic()
+        if not self._summary_log_s or now - self._summary_at < self._summary_log_s:
+            return
+        current, last = self.restore_stats, self._summary_snapshot
+
+        def delta(name: str) -> int:
+            return getattr(current, name) - getattr(last, name)
+
+        outcomes = self.lookup_outcomes - self._summary_outcomes
+        landed = self.landed_waits - self._summary_landed
+        pool = self._gpu_block_pool
+        spill = (
+            (0, 0, 0, 0)
+            if pool is None
+            else (
+                pool.spill_scan_calls,
+                pool.spill_scan_blocks,
+                pool.spill_scan_ns,
+                pool.spill_reorder_ns,
+            )
+        )
+        scans = spill[0] - self._summary_spill[0]
+        if delta("started") or sum(outcomes.values()):
+            steps = max(1, self._step - self._summary_step)
+            elapsed_ns = max(1, int(1e9 * (now - self._summary_at)))
+            connector_ns = delta("lookup_ns") + delta("observe_queue_ns")
+            connector_ns += delta("step_ns") + delta("stats_ns")
+            admitted = sum(
+                delta(f)
+                for f in ("admit_steps_0", "admit_steps_1", "admit_steps_2_4")
+            ) + delta("admit_steps_over_4")
+            logger.info(
+                "Tiered KV, last %.0f s, %d steps: restores %d started (%d in "
+                "chunks), %d landed, %d admitted (%d the step they landed), "
+                "%d gave up; room for their first chunk exact %d, over %d "
+                "blocks, short %d (%d blocks); lookups %s; landed restores "
+                "waiting, steps: %s; claim %d steps (%d deferred); connector "
+                "%.2f ms per step, %.1f%% of the time (search %.2f, room "
+                "%.2f, junction %.2f, queue %.2f, step %.2f, stats %.2f ms per "
+                "step); spill scans %d (%.0f blocks each, %.2f ms per step); "
+                "allocations held for copies %d",
+                now - self._summary_at,
+                steps,
+                delta("started"),
+                delta("chunked"),
+                delta("completed"),
+                admitted,
+                delta("admit_steps_0"),
+                delta("gave_up"),
+                delta("extra_exact_admissions"),
+                delta("extra_unused_blocks"),
+                delta("extra_short"),
+                delta("extra_short_blocks"),
+                dict(outcomes.most_common()) or "{}",
+                dict(landed.most_common()) or "{}",
+                delta("claim_wait_steps"),
+                delta("claim_deferred_steps"),
+                connector_ns / 1e6 / steps,
+                100 * connector_ns / elapsed_ns,
+                delta("lookup_search_ns") / 1e6 / steps,
+                delta("lookup_room_ns") / 1e6 / steps,
+                delta("lookup_junction_ns") / 1e6 / steps,
+                delta("observe_queue_ns") / 1e6 / steps,
+                delta("step_ns") / 1e6 / steps,
+                delta("stats_ns") / 1e6 / steps,
+                scans,
+                (spill[1] - self._summary_spill[1]) / max(1, scans),
+                (spill[2] - self._summary_spill[2] + spill[3] - self._summary_spill[3])
+                / 1e6
+                / steps,
+                self.lazy_spill_stats.held_allocations
+                - self._summary_held_allocations,
+            )
+        self._summary_at, self._summary_step = now, self._step
+        self._summary_snapshot = replace(current)
+        self._summary_outcomes = Counter(self.lookup_outcomes)
+        self._summary_landed = Counter(self.landed_waits)
+        self._summary_spill = spill
+        self._summary_held_allocations = self.lazy_spill_stats.held_allocations
+
+    def _note_start(self) -> None:
+        stats = self.restore_stats
+        self._starts_this_step += 1
+        stats.starts_per_step_max = max(
+            stats.starts_per_step_max, self._starts_this_step
+        )
+        stats.multi_start_steps += self._starts_this_step == 2
+        loading = sum(not r.done for r in self._restores.values())
+        stats.concurrent_restores_max = max(stats.concurrent_restores_max, loading)
+
+    def _estimate_extra(
+        self,
+        request: "Request",
+        num_tokens: int,
+        chain: list[_Piece] | None = None,
+    ) -> tuple[int, int]:
+        """The tokens and blocks of the request's first chunk past a point of
+        `num_tokens`, as the scheduler schedules it (`Scheduler.first_chunk`,
+        vLLM's own block count): past the rungs and the junction the request
+        will have once restored there (`_lookup`). The room is kept as a
+        count, so an estimate too high only keeps others out a step, one too
+        low makes the request wait at admission (`release_reserved` counts
+        both). The watermark is not kept: admission checks it on its own.
+        `chain`: the request's page chain, if this lookup found it."""
+        first_chunk = self._first_chunk
+        if first_chunk is None:
+            return 0, 0
+        started = time.perf_counter_ns()
+        point = num_tokens - num_tokens % self.block_size
+        junction = self._junction(request, point, chain)
+        rungs = self._rungs(request, point)
+        tokens, blocks = first_chunk(
+            request,
+            num_tokens,
+            request.shared_prefix_boundary if junction is None else junction,
+            request.retained_boundaries if rungs is None else rungs,
+        )
+        stats = self.restore_stats
+        if not tokens:
+            stats.extra_zero_chunk += 1
+        stats.estimate_ns += time.perf_counter_ns() - started
+        return tokens, blocks
+
+    def _reestimate_extra(self, restore: _Restore) -> None:
+        """As the restore's load lands: the room for its request's first chunk
+        again, as the session's blocks around it may have changed since it
+        started (its chain, a junction, a duplicate key). It grows only into
+        free blocks others do not keep; what it cannot is counted short at
+        admission."""
+        request = restore.request
+        pool = self._gpu_block_pool
+        if not self._pack or request is None or pool is None:
+            return
+        _, estimate = self._estimate_extra(request, restore.num_tokens)
+        estimate = max(
+            0,
+            min(estimate, pool.num_gpu_blocks - restore.num_pinned - self._target_free),
+        )
+        stats = self.restore_stats
+        if estimate > restore.extra:
+            room = pool.get_num_free_blocks() - self._reserved - self._target_free
+            grow = min(estimate - restore.extra, max(0, room))
+            if grow:
+                stats.extra_regrown += 1
+                stats.extra_regrown_blocks += grow
+                restore.extra += grow
+                self._reserved += grow
+        elif estimate < restore.extra:
+            stats.extra_shrunk += 1
+            stats.extra_shrunk_blocks += restore.extra - estimate
+            self._reserved -= restore.extra - estimate
+            restore.extra = estimate
 
     def _kept_copies(self) -> int:
         """Free RAM blocks RAM never takes for the walk's copies: copies of
@@ -1138,17 +1967,19 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         RAM, which must take the GPU's blocks it spills meanwhile."""
         return min(self._restore_chunk_blocks, self.cpu_block_pool.num_gpu_blocks // 4)
 
-    def _can_chunk(self, num_blocks: int, free: int, loads: list[KVCacheBlock]) -> bool:
+    def _can_chunk(
+        self, num_blocks: int, free: int, loads: list[KVCacheBlock], extra: int = 0
+    ) -> bool:
         """Whether a restore of `num_blocks` RAM blocks the GPU has no safe
         room for yet may load in chunks: none other does (two partial
         restores could each hold blocks the other waits for), the GPU has
-        room for it beside the running requests' step (`free` excludes the
-        pieces it holds already), and RAM, its sources pinned, can still take
-        one chunk of the GPU's blocks."""
+        room for it and its `extra` blocks beside the running requests' step
+        (`free` excludes the pieces it holds already), and RAM, its sources
+        pinned, can still take one chunk of the GPU's blocks."""
         k = self._chunk_blocks()
         if not k or num_blocks <= k or self._chunked is not None:
             return False
-        if free - num_blocks < self._target_free:
+        if free - num_blocks - extra < self._target_free:
             return False
         cpu_free = (
             self.cpu_block_pool.get_num_free_blocks()
@@ -1163,6 +1994,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         plan: _Plan,
         loads: list[KVCacheBlock],
         pinned: list[KVCacheBlock],
+        extra: int = 0,
+        chunk_tokens: int = 0,
     ) -> tuple[int | None, bool]:
         """Restore in chunks: a swap. The GPU's blocks spilled for each chunk
         land in RAM blocks the previous chunk's load freed: once loaded, the
@@ -1172,11 +2005,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         while its RAM blocks were still pinned for the load, and RAM evicted
         other sessions for them (window 5: 80 restores of 58 blocks on
         average). The pages load first, the point's own blocks last together
-        (`_advance_chunked`); the request waits until all landed."""
+        (`_advance_chunked`); the request waits until all landed. Under pack
+        admission it keeps the room for its tokens past the point (`extra`)
+        from the start, as a count the chunks leave alone too."""
         pool = self._gpu_block_pool
         assert pool is not None
         request_id = request.request_id
-        self._stop_waiting(request_id)
+        waited_s = self._stop_waiting(request_id)
         pool.touch(pinned)
         self.cpu_block_pool.touch(loads)
         tail = [p.block for p in plan.pieces[plan.num_chain :] if not p.on_gpu]
@@ -1193,21 +2028,36 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             num_tail=len(tail),
             position=self._queue_position(request),
             progress_at=time.monotonic(),
+            extra=extra,
+            chunk_tokens=chunk_tokens,
+            request=request,
+            started_at=time.monotonic(),
         )
+        self._reserved += extra
         self._restores[request_id] = restore
         self._chunked = restore
+        if self._pack and not self._claim_after_s:
+            # It holds part of its room from now on: the rest is claimed (with
+            # `claim_after_s`, once a chunk waits that long: `_update_claim`).
+            self._claim = (request_id, restore.position, len(loads))
         self._loading_cpu.update(b.block_id for b in loads)
         self._num_pinned += len(pinned)
         self.restore_stats.started += 1
         self.restore_stats.chunked += 1
+        self._note_start()
+        self._outcome(request_id, "started_chunked")
+        self._log_restore_start(restore, plan, waited_s)
         return None, False
 
     def _advance_chunked(self) -> None:
         """Before the walk: the chunked restore takes GPU blocks for its next
         chunks while the spill guard lets it, leaving the running requests a
-        step's blocks (`_target_free`), and queues their loads. What its next
-        chunk still lacks the walk spills this step (`on_allocation_held`). It
-        gives up the rest after `_CHUNK_STALL_S` without a chunk."""
+        step's blocks (`_target_free`) and the room restores keep for their
+        requests' tokens past the point (`_reserved`, its own too), and queues
+        their loads. What its next chunk still lacks the walk spills this
+        step: under pack admission as copies ahead (`_copy_ahead`), which hold
+        no allocation back, so the next chunk's copies run while this one
+        loads. It gives up the rest after `_CHUNK_STALL_S` without a chunk."""
         restore = self._chunked
         if restore is None or not restore.pending:
             return
@@ -1215,15 +2065,22 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         assert pool is not None
         k = max(1, self._chunk_blocks())
         now = time.monotonic()
+        kept = self._reserved
         while restore.pending:
             pages = len(restore.pending) - restore.num_tail
             n = min(k, pages) if pages > 0 else len(restore.pending)
             free = pool.get_num_free_blocks()
-            safe = pool.num_spill_safe_free_blocks(n) if self.holding else free
-            if safe < n or free - n < self._target_free:
-                need = min(n, free - self._target_free) - safe
+            safe = (
+                pool.num_spill_safe_free_blocks(n + kept) if self.holding else free
+            )
+            if safe < n + kept or free - n - kept < self._target_free:
+                need = min(n + kept, free - self._target_free) - safe
                 if self.holding and need > 0:
-                    self.on_allocation_held(need)
+                    if self._pack:
+                        self._copy_ahead += need
+                        self.restore_stats.copy_ahead_blocks += need
+                    else:
+                        self.on_allocation_held(need)
                 break
             sources, restore.pending = restore.pending[:n], restore.pending[n:]
             pairs = list(zip(pool.get_new_blocks(n), sources))
@@ -1258,23 +2115,38 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         restore.aborted = True
         if count:
             self.restore_stats.chunked_aborted += 1
-            self._no_chunk.add(restore.request_id)
+            # Pack admission chunks the claimant's restore again: a session
+            # larger than the free pool has no other way in.
+            if not self._pack:
+                self._no_chunk.add(restore.request_id)
         if not restore.in_flight:
             self._release(restore)
 
     def _wait(
-        self, request: "Request", loads: list[KVCacheBlock]
+        self,
+        request: "Request",
+        loads: list[KVCacheBlock],
+        want: int = -1,
+        reason: str = "room_restores",
     ) -> tuple[int | None, bool]:
-        """Wait a step for room to restore into (`_MAX_RESTORE_WAIT_S`). The
-        first such request in the queue holds the requests behind it back
-        and pins the RAM blocks it would load."""
+        """Wait a step for room to restore into (`_MAX_RESTORE_WAIT_S`): room
+        for `want` blocks (its loads, and under pack admission the blocks for
+        its tokens past the point), for `reason` (`WAIT_REASONS`). The first
+        such request in the queue pins the RAM blocks it would load; under
+        legacy admission it holds the requests behind it back, under pack it
+        may claim its room (`_update_claim`)."""
         request_id = request.request_id
+        if want < 0:
+            want = len(loads)
         now = time.monotonic()
         since = self._waiting_since.setdefault(request_id, now)
         if now - since >= _MAX_RESTORE_WAIT_S:
             self._stop_waiting(request_id)
             self.restore_stats.gave_up += 1
+            self._outcome(request_id, "gave_up")
             return 0, False
+        self._outcome(request_id, reason)
+        self._waiting_need[request_id] = want
         head = self._head
         position = self._queue_position(request)
         if head is None or head[0] == request_id or position < head[1]:
@@ -1285,33 +2157,103 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # (copies of blocks about to leave take nothing: `leaving_copies`).
             cpu_pool = self.cpu_block_pool
             free = cpu_pool.get_num_free_blocks() - self._kept_copies()
-            if free - len(loads) >= len(loads):
+            if free - len(loads) >= want:
                 cpu_pool.touch(loads)
                 self._head_pins = list(loads)
         return None, False
 
-    def _plan(self, request: "Request") -> _Plan | None:
+    def _plan(
+        self, request: "Request", gpu_hit: int
+    ) -> tuple[_Plan | None, list[_Piece]]:
         """The deepest point `request` can resume at with blocks from either
         tier, when RAM holds some of them and it resumes deeper than the GPU
-        alone; else None."""
+        alone; else None. And its page chain (`_page_chain`), for this
+        lookup's junction. `gpu_hit`: the GPU's own hit, block-aligned."""
+        started = time.perf_counter_ns()
+        stats = self.restore_stats
+        try:
+            chain = self._page_chain(request)
+            plan, visited, units = self._search(
+                request, chain, gpu_hit, self._bounded_search
+            )
+            stats.search_calls += 1
+            stats.search_points += visited
+            stats.search_units += units
+            if self._verify_search and self._bounded_search:
+                whole, whole_visited, whole_units = self._search(
+                    request, chain, gpu_hit, False
+                )
+                stats.search_points_whole += whole_visited
+                stats.search_units_whole += whole_units
+                if (plan is None) != (whole is None) or (
+                    plan is not None
+                    and whole is not None
+                    and (
+                        plan.num_tokens != whole.num_tokens
+                        or [p.block.block_id for p in plan.pieces]
+                        != [p.block.block_id for p in whole.pieces]
+                    )
+                ):
+                    stats.search_mismatches += 1
+                    logger.warning(
+                        "Bounded resume search disagrees with the whole walk "
+                        "for request %s: %s vs %s tokens",
+                        request.request_id,
+                        None if plan is None else plan.num_tokens,
+                        None if whole is None else whole.num_tokens,
+                    )
+                elif (
+                    plan is not None
+                    and whole is not None
+                    and plan.gpu_only_tokens != whole.gpu_only_tokens
+                ):
+                    stats.search_gpu_only_differs += 1
+            return plan, chain
+        finally:
+            stats.lookup_search_ns += time.perf_counter_ns() - started
+
+    def _search(
+        self,
+        request: "Request",
+        chain: list[_Piece],
+        gpu_hit: int,
+        bounded: bool,
+    ) -> tuple[_Plan | None, int, int]:
+        """`_plan`'s search, the points it visited and the hash units it
+        scanned. Points come deepest first. The deepest, if RAM holds part of
+        it, is worth a restore when the deepest point the GPU alone holds is
+        `_MIN_RESTORE_GAIN_TOKENS` short of it or more. Bounded, the search
+        stops at that line, at a point below it or, with none, before the
+        units below it (`_Bound`): nothing below changes that, so the plan is
+        the whole walk's. Only where the GPU alone would resume, which sets
+        the pin timeout, is then taken from `gpu_hit`, below the line."""
         deepest = None
-        for plan in self._resume_points(request):
+        visited = 0
+        gpu_only = None
+        bound = _Bound()
+        for plan in self._resume_points(request, chain, bound):
+            visited += 1
             if deepest is None:
                 if plan.on_gpu_only:
-                    return None
+                    return None, visited, bound.units
                 deepest = plan
+                if bounded:
+                    bound.floor = deepest.num_tokens - _MIN_RESTORE_GAIN_TOKENS
                 continue
             if plan.on_gpu_only:
+                gpu_only = plan.num_tokens
                 break
-        else:
-            plan = None
+            if bounded and plan.num_tokens <= bound.floor:
+                gpu_only = min(gpu_hit, bound.floor)
+                break
         if deepest is None:
-            return None
-        gpu_only = 0 if plan is None else plan.num_tokens
+            return None, visited, bound.units
+        if gpu_only is None:
+            gpu_only = min(gpu_hit, bound.floor) if bound.stopped else 0
         if deepest.num_tokens - gpu_only < _MIN_RESTORE_GAIN_TOKENS:
-            return None
+            return None, visited, bound.units
         deepest.gpu_only_tokens = gpu_only
-        return deepest
+        return deepest, visited, bound.units
 
     def _restore_wait_s(self, plan: _Plan) -> float:
         return pin_timeout_s(self._cost, plan.gpu_only_tokens, plan.num_tokens)
@@ -1346,12 +2288,19 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             chain.append(piece)
         return chain
 
-    def _resume_points(self, request: "Request") -> Iterator[_Plan]:
+    def _resume_points(
+        self,
+        request: "Request",
+        chain: list[_Piece] | None = None,
+        bound: _Bound | None = None,
+    ) -> Iterator[_Plan]:
         """Points `request` can resume at with blocks from either tier,
         deepest first: exact-end states (GPU frontiers and RAM ones), then
         states at hash-unit boundaries. With sliding-window groups, only
         block boundaries whose windows either tier holds (`_window_pieces`):
-        the GPU's lookup after the restore finds a hit there only with them."""
+        the GPU's lookup after the restore finds a hit there only with them.
+        `chain`: its page chain, if found already. `bound`: the caller's
+        line, set as it goes; the units scanned."""
         windows = self._window_blocks
         if windows and not self._windows_restorable:
             return
@@ -1359,7 +2308,8 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         unit = self.hash_block_size
         hashes = request.block_hashes
         max_length = request.num_tokens - 1
-        chain = self._page_chain(request)
+        if chain is None:
+            chain = self._page_chain(request)
         checkpoints = self._checkpoints
         frontiers = None if checkpoints is None else checkpoints.frontiers
         hash_fn = None if frontiers is None else frontiers.hash_fn
@@ -1371,6 +2321,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             ((len(chain) + 1) * self.block_size - 1) // unit,
         )
         for h in range(top, -1, -1):
+            if bound is not None:
+                # Unit h's points (its exact ends, its boundary) have fewer
+                # than (h + 1) * unit tokens: none past the line, none after.
+                if 0 <= bound.floor and (h + 1) * unit <= bound.floor + 1:
+                    bound.stopped = True
+                    return
+                bound.units += 1
             anchor = hashes[h - 1] if h else None
             # An exact end inside a block would need a window's partial page.
             if hash_fn is not None and not windows:
@@ -1493,11 +2450,23 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> SimpleCPUOffloadMetadata:
+        started = time.perf_counter_ns()
+        try:
+            return self._build_connector_meta(scheduler_output)
+        finally:
+            self.restore_stats.step_ns += time.perf_counter_ns() - started
+
+    def _build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> SimpleCPUOffloadMetadata:
         self._advance_chunked()
         meta = super().build_connector_meta(scheduler_output)
         self._report_losses()
         self._apply_prunes()
         self._expire_pins()
+        self._step += 1
+        self._starts_this_step = 0
+        self._log_summary()
         if not self._unsent:
             return meta
         assert meta.load_event < 0, "the tiered connector loads only restores"
@@ -1553,6 +2522,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        started = time.perf_counter_ns()
+        try:
+            self._update_connector_output(connector_output)
+        finally:
+            self.restore_stats.step_ns += time.perf_counter_ns() - started
+
+    def _update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         super().update_connector_output(connector_output)
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
@@ -1590,10 +2566,20 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 self.restore_stats.completed += 1
             restore.done = True
             restore.done_at = time.monotonic()
+            restore.done_step = self._step
             if self._chunked is restore:
                 self._chunked = None
             if restore.orphaned or restore.reset or restore.aborted:
                 self._release(restore)
+                continue
+            self._reestimate_extra(restore)
+            self._log_restore(
+                "landed",
+                restore,
+                "after %.0f ms, room %d blocks",
+                1000 * (restore.done_at - restore.started_at),
+                restore.extra,
+            )
 
     def _adopt_block(self, gpu_block: KVCacheBlock, cpu_block: KVCacheBlock) -> None:
         """Cache the loaded GPU block under every key its RAM copy holds."""
@@ -1647,11 +2633,35 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     ) -> None:
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         self._no_chunk.discard(request.request_id)
+        self._alloc_held_since.pop(request.request_id, None)
+        if self._claim is not None and self._claim[0] == request.request_id:
+            self._claim = None
         restore = self._restores.get(request.request_id)
         if restore is not None and restore.done:
-            # The request holds its blocks now.
+            # The request holds its blocks now, the step after its load landed
+            # at the earliest (`done_step`: a step's loads land after it).
+            steps = self._step - restore.done_step
+            stats = self.restore_stats
+            if steps <= 0:
+                stats.admit_steps_0 += 1
+            elif steps == 1:
+                stats.admit_steps_1 += 1
+            elif steps <= 4:
+                stats.admit_steps_2_4 += 1
+            else:
+                stats.admit_steps_over_4 += 1
+            self._log_restore(
+                "admitted",
+                restore,
+                "%d steps after landing, room %d blocks for %d tokens, took %d",
+                steps,
+                restore.kept,
+                restore.chunk_tokens,
+                restore.used,
+            )
             self._release(restore)
             self._admitted_from_ram.add(request.request_id)
+            self._admitted_points[request.request_id] = restore.num_tokens
 
     def _release(self, restore: _Restore) -> None:
         if self._restores.get(restore.request_id) is restore:
@@ -1664,6 +2674,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             # The session's deepest blocks go first, its prefix last.
             pool.free_blocks(reversed(blocks))
         self._num_pinned -= len(blocks)
+        if restore.extra:
+            # Kept for an admission that did not come (`release_reserved`).
+            self.restore_stats.extra_released_unadmitted += restore.extra
+            self._reserved -= restore.extra
+            restore.extra = 0
         if restore.pending:
             self._loading_cpu.difference_update(b.block_id for b in restore.pending)
             self.cpu_block_pool.free_blocks(restore.pending)
@@ -1694,8 +2709,21 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
                 restore.orphaned = True
                 self.restore_stats.orphaned += 1
                 del self._restores[request_id]
+                # Its load lands later (`_complete` releases its blocks); the
+                # room it kept for its request goes now.
+                if restore.extra:
+                    self.restore_stats.extra_released_unadmitted += restore.extra
+                    self._reserved -= restore.extra
+                    restore.extra = 0
         self._stop_waiting(request_id)
         self._no_chunk.discard(request_id)
+        self._held_now.pop(request_id, None)
+        self._alloc_held_since.pop(request_id, None)
+        self._last_wait.pop(request_id, None)
+        self._admitted_points.pop(request_id, None)
+        self._landed_eligible.discard(request_id)
+        if self._claim is not None and self._claim[0] == request_id:
+            self._claim = None
         arrived = self._arrived.pop(request_id, None)
         if arrived is not None and self.ram_policy is not None:
             self.ram_policy.departed(arrived)
@@ -2040,6 +3068,11 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         self._unsent = []
         self._no_chunk.clear()
         self._arrived.clear()
+        # The room restores keep goes with them: `_reserved` restarts at 0, so
+        # one whose release waits for its load (`_complete`) gives none back.
+        for pending in self._restores_by_event.values():
+            for restore, _ in pending:
+                restore.extra = 0
         for restore in list(self._restores.values()):
             del self._restores[restore.request_id]
             restore.reset = True
@@ -2065,6 +3098,16 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         if self.ram_policy is not None:
             self.ram_policy.reset()
         self._waiting_since.clear()
+        self._waiting_need.clear()
+        self._held_now.clear()
+        self._alloc_held_since.clear()
+        self._last_wait.clear()
+        self._landed_eligible.clear()
+        self._landed_looked_up.clear()
+        self._landed_refused.clear()
+        self._admitted_points.clear()
+        self._claim = None
+        self._reserved = 0
         self._head = None
         self._unpin_head()
         self._queued.clear()
@@ -2198,11 +3241,25 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         """Record how many tokens the admitted request recomputes that a
         finished request had already processed, by the tier it resumed from."""
         request_id = request.request_id
+        # Every admission, a preempted request's again too: where it resumed.
+        restored = request_id in self._admitted_from_ram
+        self._admitted_from_ram.discard(request_id)
+        point = self._admitted_points.pop(request_id, None)
+        if point is not None:
+            stats = self.restore_stats
+            stats.admitted_hit_short += num_computed_tokens < point
+            stats.admitted_hit_past += num_computed_tokens > point
+        resumes = self.recent_resumes
+        resumes[request_id] = (
+            "ram" if restored else "gpu" if num_computed_tokens else "cold",
+            num_computed_tokens,
+        )
+        resumes.move_to_end(request_id)
+        while len(resumes) > _RECENT_RESUMES:
+            resumes.popitem(last=False)
         if request_id in self._observed:
             return
         self._observed.add(request_id)
-        restored = request_id in self._admitted_from_ram
-        self._admitted_from_ram.discard(request_id)
         seen, key, extends_end = self._seen_end(request)
         self._hold_prefill_points(request, key, extends_end)
         self._note_junction(request, num_computed_tokens, seen)
@@ -2265,15 +3322,64 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
     # Stats
 
     def get_stats(self) -> SimpleCPUOffloadStats:
+        started = time.perf_counter_ns()
+        try:
+            return self._get_stats()
+        finally:
+            self.restore_stats.stats_ns += time.perf_counter_ns() - started
+
+    def _get_stats(self) -> SimpleCPUOffloadStats:
         stats = super().get_stats()
-        current = self.restore_stats
-        for event, field_name in RESTORE_EVENT_TO_FIELD.items():
-            delta = getattr(current, field_name) - getattr(
-                self._restore_snapshot, field_name
-            )
+        current, previous = self.restore_stats, self._restore_snapshot
+        for metric, fields in (
+            (TieredMetricName.RESTORES, RESTORE_EVENT_TO_FIELD),
+            (TieredMetricName.ADMISSION, ADMISSION_EVENT_TO_FIELD),
+            (TieredMetricName.SEARCH, SEARCH_EVENT_TO_FIELD),
+        ):
+            for event, field_name in fields.items():
+                delta = getattr(current, field_name) - getattr(previous, field_name)
+                if delta > 0:
+                    stats.increase_counter(metric, delta, (event,))
+        for part, field_name in SCHEDULER_PART_TO_FIELD.items():
+            delta = getattr(current, field_name) - getattr(previous, field_name)
             if delta > 0:
-                stats.increase_counter(TieredMetricName.RESTORES, delta, (event,))
+                stats.increase_counter(
+                    TieredMetricName.SCHEDULER_SECONDS, delta / 1e9, (part,)
+                )
+        pool = self._gpu_block_pool
+        if pool is not None:
+            spill = (pool.spill_scan_ns, pool.spill_reorder_ns)
+            for part, now, then in zip(
+                ("spill_scan", "spill_reorder"), spill, self._spill_ns_snapshot
+            ):
+                if now > then:
+                    stats.increase_counter(
+                        TieredMetricName.SCHEDULER_SECONDS, (now - then) / 1e9, (part,)
+                    )
+            self._spill_ns_snapshot = spill
+        for kind, field_name in PEAK_KIND_TO_FIELD.items():
+            stats.set_gauge(
+                TieredMetricName.RESTORE_PEAKS, getattr(current, field_name), (kind,)
+            )
         self._restore_snapshot = replace(current)
+        for metric, counts, snapshot in (
+            (
+                TieredMetricName.LOOKUPS,
+                self.lookup_outcomes,
+                self._lookup_outcomes_snapshot,
+            ),
+            (
+                TieredMetricName.LANDED_WAITS,
+                self.landed_waits,
+                self._landed_waits_snapshot,
+            ),
+        ):
+            for label, count in counts.items():
+                delta = count - snapshot[label]
+                if delta > 0:
+                    stats.increase_counter(metric, delta, (label,))
+        self._lookup_outcomes_snapshot = Counter(self.lookup_outcomes)
+        self._landed_waits_snapshot = Counter(self.landed_waits)
         resumes, previous = self.resume_stats, self._resume_snapshot
         for tier, count in resumes.counts.items():
             delta = count - previous.counts.get(tier, 0)
