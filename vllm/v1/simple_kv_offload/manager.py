@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashWithGroupId,
     ExternalBlockHash,
     get_block_hash,
@@ -76,6 +77,18 @@ _MAX_SPILL_WAIT_S = 10.0
 # Walks in a row that store nothing, with nothing in flight, before the guard
 # counts a stall: one such walk can follow a copy that landed this step.
 _STALL_WALKS = 3
+# With a copy in flight the wait is its acknowledgement's, which takes
+# scheduling passes, not seconds (three with speculative decoding and
+# async scheduling, each as long as its step's prefill): GPU window B
+# (2026-11-25) hit `_MAX_SPILL_WAIT_S` with 32 blocks in flight and the GPU
+# dropped 11 blocks uncopied. Only one that never lands lets go then: no copy
+# landing for this many walks and seconds.
+_MAX_TRANSFER_WAIT_WALKS = 16
+_MAX_TRANSFER_WAIT_S = 60.0
+# A hold this long is logged when it ends (`_end_hold`); a release always is.
+_LOG_HOLD_MS = 5000
+# Walks from the one that issued a store to the first that sees it landed.
+STORE_ACK_BUCKETS = ("1", "2", "3", "4", "5+")
 
 
 @dataclass
@@ -166,8 +179,10 @@ class LazySpillStats:
     # had let held allocations go, or no other free block was left.
     unspilled_evicted_blocks: int = 0
     # Times the guard let held allocations go (they waited too long, or the
-    # CPU pool had no block to store into).
+    # CPU pool had no block to store into); of those, with a copy still in
+    # flight (one that never landed: `_MAX_TRANSFER_WAIT_S`).
     guard_releases: int = 0
+    guard_releases_in_flight: int = 0
     # Cached CPU blocks evicted to store new ones.
     cpu_evicted_blocks: int = 0
     # Free blocks the CPU pool could restore that lost their GPU keys
@@ -190,6 +205,21 @@ class LazySpillStats:
     held_skips_running: int = 0
     held_skips_waiting: int = 0
     held_stop_untried: int = 0
+    # Stores acknowledged and the time from their issue to that, in ms.
+    store_acks: int = 0
+    store_ack_ms: int = 0
+    # Inline spills (`before_reuse`): blocks copied in the step that reused
+    # them (counted as stored_blocks too), exact-end states the GPU dropped
+    # uncopied with a block of theirs in use, blocks that left uncopied
+    # because nothing had written them yet (taken, cached under their keys
+    # and freed again within one scheduling pass; counted in
+    # uncopied_evicted_blocks too), and the hook's calls and time
+    # (microseconds).
+    inline_spilled_blocks: int = 0
+    inline_units_lost: int = 0
+    inline_unwritten_blocks: int = 0
+    inline_spill_calls: int = 0
+    inline_spill_us: int = 0
 
 
 class SimpleCPUOffloadScheduler:
@@ -212,6 +242,7 @@ class SimpleCPUOffloadScheduler:
         use_page_cache: bool = False,
         num_cpu_blocks: int | None = None,
         aligned_num_cpu_blocks: int | None = None,
+        spill: str = "walk",
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -332,6 +363,18 @@ class SimpleCPUOffloadScheduler:
         self._last_store_landed = 0.0
         self._stalled_walks = 0
         self._holding = True
+        # Walks so far (one per `build_connector_meta`), the walk a hold began
+        # at and the one the last store landed before, the most blocks a walk
+        # of the hold was short of, and each store in flight's walk and time
+        # of issue.
+        self._walks = 0
+        self._held_walk = 0
+        self._landed_walk = 0
+        self._hold_short = 0
+        self._store_issued: dict[int, tuple[int, float]] = {}
+        # Acknowledged stores by `STORE_ACK_BUCKETS`.
+        self.store_ack_walks: dict[str, int] = dict.fromkeys(STORE_ACK_BUCKETS, 0)
+        self._store_ack_snapshot: dict[str, int] = dict(self.store_ack_walks)
         # Copies the walk took for GPU blocks that wait, free, to leave
         # (`leaving_copies`): CPU block id -> GPU block id, and back. RAM
         # keeps them unless its value order drops one: that GPU block's keys
@@ -347,6 +390,17 @@ class SimpleCPUOffloadScheduler:
         # (`keeps_order`).
         self._unpinned_stores: dict[int, BlockHashWithGroupId] = {}
         self._early_pages: dict[int, BlockHashWithGroupId] = {}
+        # Lazy mode, `spill="inline"`: no walk, hold or acknowledgement. A
+        # cached block the CPU pool lacks is copied in the step that reuses it
+        # (`before_reuse`). The (GPU, CPU) block ids registered since the last
+        # step's metadata, which takes them to the worker; the GPU blocks
+        # taken or copied since then; the hook's time (ns).
+        if spill == "inline" and not lazy_offload:
+            raise ValueError('spill="inline" requires lazy_offload')
+        self._inline = spill == "inline"
+        self._inline_pairs: list[tuple[int, int]] = []
+        self._inline_taken: set[int] = set()
+        self._inline_spill_ns = 0
         self.lazy_spill_stats = LazySpillStats()
         self._lazy_spill_snapshot = LazySpillStats()
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
@@ -472,8 +526,15 @@ class SimpleCPUOffloadScheduler:
 
     @property
     def holding(self) -> bool:
-        """SpillGuard: whether uncopied blocks are held back now."""
-        return self._holding
+        """SpillGuard: whether uncopied blocks are held back now. Never with
+        inline spills: they are copied as they leave (`before_reuse`)."""
+        return self._holding and not self._inline
+
+    @property
+    def spills_at_reuse(self) -> bool:
+        """SpillGuard: whether an uncopied block is copied in the step that
+        reuses it (`before_reuse`), not ahead of it by the walk."""
+        return self._inline
 
     def needs_spill(self, block: "KVCacheBlock") -> bool:
         """SpillGuard: whether evicting the free cached GPU `block` now would
@@ -514,8 +575,8 @@ class SimpleCPUOffloadScheduler:
     def has_pending_block_frees(self) -> bool:
         """Whether stores in flight, or the next walk, will let go blocks an
         allocation was held for: the scheduler then waits a step instead of
-        preempting a request."""
-        return self._lazy_mode and self._holding and self._spill_shortfall > 0
+        preempting a request. Never with inline spills, which hold none."""
+        return self._lazy_mode and self.holding and self._spill_shortfall > 0
 
     def on_held_allocation(
         self, request: "Request", loop: str, num_behind: int, may_skip: bool
@@ -587,6 +648,7 @@ class SimpleCPUOffloadScheduler:
             and self._restorable(block)
         ):
             self.lazy_spill_stats.uncopied_evicted_blocks += 1
+            self._note_uncopied(block)
         if not self.refresh_cpu_on_gpu_eviction:
             return
         block_hash = get_block_hash(block.block_hash)
@@ -600,6 +662,10 @@ class SimpleCPUOffloadScheduler:
         if copies:
             self.cpu_block_pool.touch(copies)
             self.cpu_block_pool.free_blocks(copies)
+
+    def _note_uncopied(self, block: "KVCacheBlock") -> None:
+        """`block` leaves the GPU with no copy though a CPU lookup could
+        restore it (`uncopied_evicted_blocks`)."""
 
     def on_reused(self, block: "KVCacheBlock") -> None:
         """SpillGuard: a hit reads the free GPU `block` again: the copy the
@@ -648,7 +714,9 @@ class SimpleCPUOffloadScheduler:
         GPU drops its block, and only mirrors it once a hit takes the block
         back (`on_reused`)."""
         gpu_pool = self._gpu_block_pool
-        if gpu_pool is None or not self._spill_twins:
+        if self._inline or gpu_pool is None or not self._spill_twins:
+            # Inline spills leave none waiting: the GPU drops a block in the
+            # allocation that copies it.
             return []
         cpu_blocks = self.cpu_block_pool.blocks
         copies = []
@@ -666,6 +734,190 @@ class SimpleCPUOffloadScheduler:
             if not cpu_block.ref_cnt:
                 copies.append(cpu_block)
         return copies
+
+    def leaves_last(self, block: "KVCacheBlock") -> bool:
+        """SpillGuard (inline spills): no block waits here (the tiered
+        connector's exact-end states with a block in use do)."""
+        return False
+
+    def before_reuse(self, blocks: list["KVCacheBlock"]) -> None:
+        """SpillGuard (inline spills): `blocks` just left the GPU free queue,
+        keys still on them, for an allocation. Those a CPU lookup could
+        restore and the CPU pool does not hold are copied in the step that
+        reuses them: each gets a CPU block that is cached under its keys at
+        once, and the worker launches the copy before anything in that step
+        writes the GPU block (`SimpleCPUOffloadWorker.spill_before_reuse`),
+        loads from the CPU block behind it. Nothing waits for an
+        acknowledgement. Unlike the walk it copies no boundary sibling that
+        stays on the GPU: a lookup that mixes the tiers per key finds it
+        there, and its copy would only duplicate it."""
+        started = time.perf_counter_ns()
+        self._spill_at_reuse(blocks)
+        stats = self.lazy_spill_stats
+        stats.inline_spill_calls += 1
+        self._inline_spill_ns += time.perf_counter_ns() - started
+        stats.inline_spill_us = self._inline_spill_ns // 1000
+
+    def _spill_at_reuse(self, blocks: list["KVCacheBlock"]) -> None:
+        stats = self.lazy_spill_stats
+        taken = self._inline_taken
+        cached = [block for block in blocks if block.block_hash is not None]
+        # A block taken since the last step's metadata holds, under a key it
+        # has again, content this step has yet to write (a request scheduled,
+        # then preempted, in one pass): not copied, like a block in use. Nor
+        # is one copied since then: a GPU block is the source of one pair a
+        # step at most.
+        live = [block for block in cached if block.block_id not in taken]
+        stats.inline_unwritten_blocks += sum(
+            self._uncopied(block) for block in cached if block.block_id in taken
+        )
+        # Exact-end states RAM can take whole, and those it cannot: a block
+        # of theirs is in use (it may not be written yet), or was just taken.
+        states: list[tuple[Any, list[BlockHashWithGroupId], list[KVCacheBlock]]] = []
+        skipped: set[BlockHash] = set()
+        for state, keys, members in self._reuse_units(cached) if cached else ():
+            if members is None:
+                stats.inline_units_lost += 1
+            elif not any(member.block_id in taken for member in members):
+                states.append((state, keys, members))
+                continue
+            skipped.add(get_block_hash(keys[0]))
+        pages = [block for block in live if self._uncopied(block)]
+        gpu_ids: list[int] = []
+        cpu_ids: list[int] = []
+        if pages or any(members for _, _, members in states):
+            gpu_ids, cpu_ids = self._copy_at_reuse(blocks, states, pages, skipped)
+        if cpu_ids or states:
+            self._index_stored([state for state, _, _ in states], cpu_ids)
+        taken.update(block.block_id for block in blocks)
+        taken.update(gpu_ids)
+        if lost := [block for block in live if self.needs_spill(block)]:
+            self.on_unspilled_eviction(lost)
+
+    def _copy_at_reuse(
+        self,
+        leaving: list["KVCacheBlock"],
+        states: list[tuple[Any, list[BlockHashWithGroupId], list["KVCacheBlock"]]],
+        pages: list["KVCacheBlock"],
+        skipped: set[BlockHash],
+    ) -> tuple[list[int], list[int]]:
+        """Of the blocks `leaving` the GPU: take CPU blocks for the copies of
+        `states` (each whole or not at all) and `pages` that fit the CPU
+        pool's free blocks, cache them under the GPU blocks' keys and queue
+        the pairs for the worker. Returns the GPU block ids copied and the
+        CPU block ids they go to. A block whose own key is a state's that is
+        not copied (`skipped`, or no room for it whole) is no page: alone it
+        serves no lookup."""
+        gpu_pool = self._gpu_block_pool
+        assert gpu_pool is not None
+        cpu_pool = self.cpu_block_pool
+        cpu = cpu_pool.cached_block_hash_to_block
+        extra = gpu_pool.cached_block_hashes_by_block
+        stats = self.lazy_spill_stats
+        # The CPU blocks under the leaving blocks' keys and the states' are
+        # all that is left of them once the GPU drops these blocks, which its
+        # queue no longer shows: pinned so that making room evicts none of
+        # them, as a duplicate of a GPU block or as an old block.
+        pins: dict[int, KVCacheBlock] = {}
+        for block in leaving:
+            if block.block_hash is None:
+                continue
+            for key in (block.block_hash, *extra.get(block.block_id, ())):
+                for cpu_block in cpu.get_all_blocks(key):
+                    pins[cpu_block.block_id] = cpu_block
+        for _, keys, _ in states:
+            for key in keys:
+                for cpu_block in cpu.get_all_blocks(key):
+                    pins[cpu_block.block_id] = cpu_block
+        pinned = list(pins.values())
+        cpu_pool.touch(pinned)
+
+        def fit(room: int) -> tuple[dict[int, "KVCacheBlock"], bool]:
+            """The blocks to copy into `room` CPU blocks, and whether some
+            were left out."""
+            chosen: dict[int, KVCacheBlock] = {}
+            left_out = set(skipped)
+            for _, keys, members in states:
+                new = [m for m in members if m.block_id not in chosen]
+                if len(chosen) + len(new) > room:
+                    left_out.add(get_block_hash(keys[0]))
+                else:
+                    chosen.update((m.block_id, m) for m in new)
+            short = len(left_out) > len(skipped)
+            for block in pages:
+                assert block.block_hash is not None
+                if (
+                    block.block_id in chosen
+                    or get_block_hash(block.block_hash) in left_out
+                ):
+                    continue
+                if len(chosen) >= room:
+                    short = True
+                    break
+                chosen[block.block_id] = block
+            return chosen, short
+
+        chosen, short = fit(cpu_pool.get_num_free_blocks())
+        if short and self._free_ram_pins():
+            chosen, short = fit(cpu_pool.get_num_free_blocks())
+        gpu_ids = list(chosen)
+        cpu_blocks: list[KVCacheBlock] = []
+        if gpu_ids:
+            num_copies = len(gpu_ids)
+            stats.inline_spilled_blocks += num_copies
+            # As the walk counts them.
+            stats.stored_blocks += num_copies
+            stats.cpu_evicted_blocks += sum(
+                1
+                for block in itertools.islice(
+                    cpu_pool.free_block_queue.iter_blocks_after(None), num_copies
+                )
+                if block.block_hash is not None
+            )
+            cpu_blocks = cpu_pool.get_new_blocks(num_copies)
+            self._register_copies(gpu_ids, cpu_blocks)
+        cpu_ids = [block.block_id for block in cpu_blocks]
+        self._inline_pairs.extend(zip(gpu_ids, cpu_ids))
+        cpu_pool.free_blocks(pinned)
+        # Cached from now on: a lookup finds them before their copy has run.
+        cpu_pool.free_blocks(cpu_blocks)
+        return gpu_ids, cpu_ids
+
+    def _reuse_units(
+        self, blocks: list["KVCacheBlock"]
+    ) -> list[tuple[Any, list[BlockHashWithGroupId], list["KVCacheBlock"] | None]]:
+        """Inline spills: the units that leave the GPU whole with any of the
+        leaving cached `blocks` (none here; the tiered connector's exact-end
+        states). Each with its keys and the blocks to copy for the CPU pool
+        to hold it whole, None if one of them is in use."""
+        return []
+
+    def _index_stored(self, units: list[Any], cpu_block_ids: list[int]) -> None:
+        """Inline spills: copies into `cpu_block_ids` were just cached, the
+        missing blocks of `units` (`_reuse_units`) among them."""
+        return
+
+    def _free_ram_pins(self) -> bool:
+        """Inline spills: the CPU pool lacks free blocks for the copies of
+        the blocks leaving the GPU: give up a pin on CPU blocks, if any.
+        Whether one was given up."""
+        return False
+
+    def _take_inline_pairs(self) -> tuple[list[int], list[int]]:
+        """The inline spills registered since the last step's metadata, for
+        this step's worker: GPU block ids and the CPU block ids they are
+        copied to. The CPU pool may have evicted a copy registered earlier in
+        the pass and taken its block again: only that block's last pair
+        runs."""
+        pairs, self._inline_pairs = self._inline_pairs, []
+        self._inline_taken.clear()
+        last = {cpu_block_id: i for i, (_, cpu_block_id) in enumerate(pairs)}
+        pairs = [pair for i, pair in enumerate(pairs) if last[pair[1]] == i]
+        gpu_ids = [gpu_block_id for gpu_block_id, _ in pairs]
+        cpu_ids = [cpu_block_id for _, cpu_block_id in pairs]
+        assert len(set(cpu_ids)) == len(cpu_ids)
+        assert len(set(gpu_ids)) == len(gpu_ids), "a GPU block is copied once"
+        return gpu_ids, cpu_ids
 
     def _loads_in_flight(self) -> bool:
         """Whether loads from the CPU pool are in flight: they release the CPU
@@ -693,10 +945,13 @@ class SimpleCPUOffloadScheduler:
         pool's free blocks stopped it, no pin to give up there
         (`_relieve_spill_stall`): the allocations held need more blocks than
         the CPU pool can take at once. `_MAX_SPILL_WAIT_S` with no store
-        landing is a backstop."""
+        landing is a backstop while no copy is in flight; one in flight
+        lands within scheduling passes, however long those take, so only
+        `_MAX_TRANSFER_WAIT_WALKS` walks and `_MAX_TRANSFER_WAIT_S` without a
+        store landing let go then."""
         if not self._spill_shortfall:
             if self._held_since is not None:
-                self._end_hold(time.monotonic())
+                self._end_hold(time.monotonic(), "ended")
             self._held_since = None
             self._stalled_walks = 0
             self._holding = True
@@ -704,7 +959,13 @@ class SimpleCPUOffloadScheduler:
         now = time.monotonic()
         if self._held_since is None:
             self._held_since = now
-        if num_stored or self._store_event_to_blocks or self._loads_in_flight():
+            self._held_walk = self._walks
+            self._hold_short = 0
+        self._hold_short = max(self._hold_short, self._spill_shortfall)
+        in_flight = bool(
+            num_stored or self._store_event_to_blocks or self._loads_in_flight()
+        )
+        if in_flight:
             self._stalled_walks = 0
         else:
             self._stalled_walks += 1
@@ -713,15 +974,26 @@ class SimpleCPUOffloadScheduler:
             self._stalled_walks = 0
             stalled = False
         waited = now - max(self._held_since, self._last_store_landed)
-        holding = not stalled and waited < _MAX_SPILL_WAIT_S
+        storing = bool(num_stored or self._store_event_to_blocks)
+        if storing:
+            walks = self._walks - max(self._held_walk, self._landed_walk)
+            timed_out = (
+                waited >= _MAX_TRANSFER_WAIT_S and walks >= _MAX_TRANSFER_WAIT_WALKS
+            )
+        else:
+            timed_out = waited >= _MAX_SPILL_WAIT_S
+        holding = not stalled and not timed_out
         if self._holding and not holding:
             self.lazy_spill_stats.guard_releases += 1
-            self._end_hold(now)
+            self.lazy_spill_stats.guard_releases_in_flight += storing
+            self._end_hold(
+                now, "released, stalled" if stalled else "released, timed out"
+            )
             self._held_since = None
             self._stalled_walks = 0
         self._holding = holding
 
-    def _end_hold(self, now: float) -> None:
+    def _end_hold(self, now: float, how: str) -> None:
         assert self._held_since is not None
         ms = int((now - self._held_since) * 1000)
         stats = self.lazy_spill_stats
@@ -730,6 +1002,26 @@ class SimpleCPUOffloadScheduler:
         stats.holds_over_100ms += ms >= 100
         stats.holds_over_1s += ms >= 1000
         stats.holds_over_5s += ms >= 5000
+        if ms < _LOG_HOLD_MS and how == "ended":
+            return
+        in_flight = self._store_event_to_blocks
+        issued = [self._store_issued[e] for e in in_flight if e in self._store_issued]
+        oldest_walk, oldest_at = min(issued, default=(self._walks, now))
+        logger.info(
+            "Spill hold %s after %.1f s and %d walks: at most %d blocks short; "
+            "%d blocks in %d stores in flight, the oldest issued %d walks and "
+            "%.1f s ago; %d loads in flight; %.1f s since a store landed",
+            how,
+            ms / 1000,
+            self._walks - self._held_walk + 1,
+            self._hold_short,
+            sum(len(t.gpu_block_ids) for t in in_flight.values()),
+            len(in_flight),
+            self._walks - oldest_walk,
+            now - oldest_at,
+            len(self._load_event_to_reqs),
+            now - self._last_store_landed if self._last_store_landed else float("inf"),
+        )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -930,6 +1222,7 @@ class SimpleCPUOffloadScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
+        self._walks += 1
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids, store_meta = self.prepare_store_specs(
@@ -949,6 +1242,7 @@ class SimpleCPUOffloadScheduler:
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu, store_cpu, store_meta
             )
+            self._store_issued[store_event] = (self._walks, time.monotonic())
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -988,6 +1282,10 @@ class SimpleCPUOffloadScheduler:
             store_cpu_blocks=store_cpu,
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
+        if self._inline:
+            spill_gpu, spill_cpu = self._take_inline_pairs()
+            result.spill_gpu_blocks = spill_gpu
+            result.spill_cpu_blocks = spill_cpu
         return result
 
     def prepare_store_specs(
@@ -1019,9 +1317,11 @@ class SimpleCPUOffloadScheduler:
         (`needs_spill`). Stops once target_free blocks are covered (free or
         stored) and as many blocks are stored as the allocations held in the
         last step still need (up to a per-step cap), or at CPU capacity.
+        Not with inline spills: blocks are copied as they are reused
+        (`before_reuse`), and nothing is held for a walk to free.
         """
         gpu_pool = self._gpu_block_pool
-        if gpu_pool is None or self._target_free <= 0:
+        if gpu_pool is None or self._target_free <= 0 or self._inline:
             return [], [], [], None
 
         cpu_pool = self.cpu_block_pool
@@ -1558,6 +1858,11 @@ class SimpleCPUOffloadScheduler:
             if delta > 0:
                 stats.increase_counter(MetricName.LAZY_SPILL, delta, (event,))
         self._lazy_spill_snapshot = replace(spill)
+        for bucket, count in self.store_ack_walks.items():
+            delta = count - self._store_ack_snapshot[bucket]
+            if delta > 0:
+                stats.increase_counter(MetricName.STORE_ACK_PASSES, delta, (bucket,))
+        self._store_ack_snapshot = dict(self.store_ack_walks)
 
         if self._interval_load_blocks_completed:
             stats.increase_counter(
@@ -1578,6 +1883,8 @@ class SimpleCPUOffloadScheduler:
                 *self._abandoned_store_event_to_blocks.values(),
             )
         )
+        # Inline spills taken outside a scheduling pass wait for the next.
+        pending += len(self._inline_pairs)
         stats.set_gauge(MetricName.PENDING_STORE_BLOCKS, pending)
         stats.set_gauge(MetricName.INFO, 1, self._info_labelvalues)
         return stats
@@ -1610,6 +1917,7 @@ class SimpleCPUOffloadScheduler:
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
+        issued = self._store_issued.pop(event_idx, None)
         transfer = self._store_event_to_blocks.pop(event_idx, None)
         if transfer is None:
             transfer = self._abandoned_store_event_to_blocks.pop(event_idx, None)
@@ -1628,6 +1936,16 @@ class SimpleCPUOffloadScheduler:
         )
         if self._lazy_mode:
             self._last_store_landed = time.monotonic()
+            self._landed_walk = self._walks
+        if issued is not None:
+            # The next walk is the first to see it.
+            walks = self._walks + 1 - issued[0]
+            bucket = STORE_ACK_BUCKETS[min(walks, len(STORE_ACK_BUCKETS)) - 1]
+            self.store_ack_walks[bucket] += 1
+            self.lazy_spill_stats.store_acks += 1
+            self.lazy_spill_stats.store_ack_ms += int(
+                (time.monotonic() - issued[1]) * 1000
+            )
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
@@ -1657,19 +1975,70 @@ class SimpleCPUOffloadScheduler:
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
 
         assert self._gpu_block_pool is not None
-        stored: list[BlockHashWithGroupId] = []
         pinned: list[int] = []
+        # The copies that may back keys, with their metadata.
+        copied_ids: list[int] = []
+        copies: list[KVCacheBlock] = []
+        copied_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = (
+            None if block_meta is None else []
+        )
         for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
-            gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
-            primary_hash = gpu_block.block_hash
             unpinned_key = self._unpinned_stores.pop(gpu_block_id, None)
             if unpinned_key is None:
                 pinned.append(gpu_block_id)
-            elif primary_hash != unpinned_key:
+            elif self._gpu_block_pool.blocks[gpu_block_id].block_hash != unpinned_key:
                 # Evicted (and maybe reused) while copied without a reference.
                 continue
             else:
                 self._early_pages[gpu_block_id] = unpinned_key
+            copied_ids.append(gpu_block_id)
+            copies.append(cpu_block)
+            if copied_meta is not None:
+                assert block_meta is not None
+                copied_meta.append(block_meta[i])
+        stored = self._register_copies(copied_ids, copies, copied_meta)
+
+        policy = self._gpu_block_pool.eviction_policy
+        if policy is not None and stored and not self._lazy_mode:
+            # Lazy mode counts every restorable block as stored already.
+            policy.lower_tier_stored(stored)
+
+        # Free CPU and GPU blocks' ref counts to turn them into prefix cache.
+        # Lazy stores come from the GPU eviction end; return them there.
+        self.cpu_block_pool.free_blocks(cpu_blocks)
+        self._gpu_block_pool.free_blocks(
+            (self._gpu_block_pool.blocks[bid] for bid in pinned),
+            evict_first=self._lazy_mode,
+        )
+        if self._lazy_mode:
+            # The copies of blocks that now wait, free, to leave the GPU.
+            gpu_blocks = self._gpu_block_pool.blocks
+            for gpu_block_id, cpu_block in zip(gpu_block_ids, cpu_blocks):
+                gpu_block = gpu_blocks[gpu_block_id]
+                if (
+                    cpu_block.block_hash is not None
+                    and not gpu_block.ref_cnt
+                    and gpu_block.block_hash == cpu_block.block_hash
+                ):
+                    self._forget_spill_copy(gpu_block_id)
+                    self._spill_copies[gpu_block_id] = cpu_block.block_id
+                    self._spill_twins[cpu_block.block_id] = gpu_block_id
+
+    def _register_copies(
+        self,
+        gpu_block_ids: list[int],
+        cpu_blocks: list["KVCacheBlock"],
+        block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None,
+    ) -> list[BlockHashWithGroupId]:
+        """Cache each CPU block under every key of the GPU block it copies
+        and emit the keys' KV events. Returns the blocks' own keys stored.
+        Shared by the stores that landed (`_process_store_completion`) and
+        the inline spills, cached before their copy runs (`before_reuse`)."""
+        assert self._gpu_block_pool is not None
+        stored: list[BlockHashWithGroupId] = []
+        for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
+            gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
+            primary_hash = gpu_block.block_hash
             if primary_hash is None:
                 # Hybrid state checkpoints drop a unit's keys from all of its
                 # blocks when one of them is evicted, also from a block being
@@ -1758,32 +2127,7 @@ class SimpleCPUOffloadScheduler:
                             ),
                         )
                     )
-
-        policy = self._gpu_block_pool.eviction_policy
-        if policy is not None and stored and not self._lazy_mode:
-            # Lazy mode counts every restorable block as stored already.
-            policy.lower_tier_stored(stored)
-
-        # Free CPU and GPU blocks' ref counts to turn them into prefix cache.
-        # Lazy stores come from the GPU eviction end; return them there.
-        self.cpu_block_pool.free_blocks(cpu_blocks)
-        self._gpu_block_pool.free_blocks(
-            (self._gpu_block_pool.blocks[bid] for bid in pinned),
-            evict_first=self._lazy_mode,
-        )
-        if self._lazy_mode:
-            # The copies of blocks that now wait, free, to leave the GPU.
-            gpu_blocks = self._gpu_block_pool.blocks
-            for gpu_block_id, cpu_block in zip(gpu_block_ids, cpu_blocks):
-                gpu_block = gpu_blocks[gpu_block_id]
-                if (
-                    cpu_block.block_hash is not None
-                    and not gpu_block.ref_cnt
-                    and gpu_block.block_hash == cpu_block.block_hash
-                ):
-                    self._forget_spill_copy(gpu_block_id)
-                    self._spill_copies[gpu_block_id] = cpu_block.block_id
-                    self._spill_twins[cpu_block.block_id] = gpu_block_id
+        return stored
 
     def _release_transfer_refs(self, transfer: TransferMeta) -> None:
         """Release transfer refs without making copied data cacheable."""
@@ -1797,11 +2141,14 @@ class SimpleCPUOffloadScheduler:
         )
 
     def has_pending_stores(self) -> bool:
-        """Return True if a store transfer is queued or in flight."""
+        """Return True if a store transfer is queued or in flight, or inline
+        spills wait for the next step's metadata (blocks taken outside a
+        scheduling pass: a decode-boundary snapshot's)."""
         return bool(
             self._pending_finished_stores
             or self._store_event_to_blocks
             or self._abandoned_store_event_to_blocks
+            or self._inline_pairs
         )
 
     def request_finished(
@@ -2038,6 +2385,14 @@ class SimpleCPUOffloadScheduler:
 
         self._store_event_to_blocks.clear()
         self._in_flight_store_gpu_blocks.clear()
+
+        # Inline spills not sent to the worker never run: the keys of their
+        # CPU blocks would cover bytes no copy writes.
+        for _, cpu_block_id in self._inline_pairs:
+            self.cpu_block_pool._maybe_evict_cached_block(
+                self.cpu_block_pool.blocks[cpu_block_id]
+            )
+        self._inline_pairs.clear()
 
         # Loads that have not been sent to the worker cannot have running DMA.
         # In-flight loads stay pinned and are cleaned up on completion.

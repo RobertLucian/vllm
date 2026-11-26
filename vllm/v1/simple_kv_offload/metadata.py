@@ -33,6 +33,12 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)
 
+    # Inline spills (lazy mode, spill="inline"): GPU blocks this step reuses,
+    # copied to these CPU blocks before anything in the step writes them. No
+    # event: the worker reports nothing back.
+    spill_gpu_blocks: list[int] = field(default_factory=list)
+    spill_cpu_blocks: list[int] = field(default_factory=list)
+
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
 

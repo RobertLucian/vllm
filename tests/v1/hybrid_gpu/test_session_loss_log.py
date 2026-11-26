@@ -3,8 +3,9 @@
 """A session RAM's evictions leave with no point to resume at is logged once
 and counted (`ram.sessions_lost`), and only such a session.
 
-GPU window 5 (2026-11-23) found nine sessions re-read whole with nothing in
-either tier, and no record of when or why RAM let them go. Here unrelated
+GPU window 5 (2026-11-23) found nine sessions re-read whole and no record of
+when or why RAM let any of them go (at least three it had not: their
+restores gave up waiting for room). Here unrelated
 prompts push an agent's session out of both tiers: its log line, if any,
 must match what its next turn finds (nothing to resume from, or a point
 inside it)."""

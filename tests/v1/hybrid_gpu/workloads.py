@@ -12,6 +12,7 @@ engine under test, so one workload fits every model family.
 from __future__ import annotations
 
 import heapq
+import itertools
 import random
 import time
 from collections.abc import Callable
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 
 # Token ids below this are left alone (BOS, EOS, padding in most vocabularies).
 _FIRST_ID = 3
+_stepwise_ids = itertools.count()
 
 
 def token_ids(seed: int, n: int, vocab_size: int) -> list[int]:
@@ -89,6 +91,69 @@ def run(
             )
         )
     return results
+
+
+class Stepwise:
+    """Requests submitted at any moment and run one engine step at a time,
+    for tests that read the engine between steps (`run` returns only once
+    every request is done)."""
+
+    def __init__(self, llm: LLM):
+        self.engine = llm.llm_engine
+        # Request id -> prompt, for the requests not done yet.
+        self.live: dict[str, list[int]] = {}
+        self.results: dict[str, Result] = {}
+        self.steps = 0
+
+    def submit(
+        self,
+        prompt: list[int],
+        params: SamplingParams | None = None,
+        priority: int = 0,
+    ) -> str:
+        request_id = f"stepwise-{next(_stepwise_ids)}"
+        self.engine.add_request(
+            request_id,
+            TokensPrompt(prompt_token_ids=prompt),
+            params or greedy(),
+            priority=priority,
+        )
+        self.live[request_id] = prompt
+        return request_id
+
+    def step(self) -> None:
+        self.steps += 1
+        for out in self.engine.step():
+            # Only its own requests: another's last output may still come.
+            if not out.finished or out.request_id not in self.live:
+                continue
+            completion = out.outputs[0]
+            logprobs = None
+            if completion.logprobs is not None:
+                logprobs = [
+                    {token: lp.logprob for token, lp in position.items()}
+                    for position in completion.logprobs
+                ]
+            self.results[out.request_id] = Result(
+                self.live.pop(out.request_id),
+                list(completion.token_ids),
+                out.num_cached_tokens or 0,
+                logprobs,
+            )
+
+    def finish(
+        self, on_step: Callable[[], None] | None = None, timeout_s: float = 600.0
+    ) -> None:
+        """Step until every request is done; `on_step()` runs after each
+        step. Past `timeout_s` it fails, not hangs."""
+        deadline = time.monotonic() + timeout_s
+        while self.live:
+            assert time.monotonic() < deadline, (
+                f"{len(self.live)} requests not done after {timeout_s:.0f} s"
+            )
+            self.step()
+            if on_step is not None:
+                on_step()
 
 
 @dataclass
@@ -185,6 +250,7 @@ def drive(
     think_s: tuple[float, float] | dict[int, tuple[float, float]] | None = None,
     seed: int = 0,
     priority: int = 0,
+    stall_s: float = 90.0,
 ) -> list[Turn]:
     """Agents in a loop, out of phase like real ones: each session's next
     turn is submitted the moment its last one finishes, or `think_s`
@@ -196,7 +262,9 @@ def drive(
     its place. Each turn generates `max_tokens` tokens, at `priority`
     (production's agents send 10). `on_submit(request id, prompt, floor)`
     runs before a turn is added, `on_step(started)` after each engine step
-    with the time it started."""
+    with the time it started. If no turn finishes for `stall_s` seconds the
+    run fails with the scheduler's and the connector's state
+    (`stall_report`), not by the test's time limit, which leaves no trace."""
     engine = llm.llm_engine
     params = greedy(max_tokens)
     pending: dict[str, tuple[int, int, float]] = {}
@@ -248,6 +316,7 @@ def drive(
     deadline = time.monotonic() + seconds
     for i in range(len(sessions)):
         submit(i)
+    progress_at = time.monotonic()
     while pending or due:
         now = time.monotonic()
         while due and due[0][0] <= now:
@@ -257,10 +326,19 @@ def drive(
         if not pending:
             if due:
                 time.sleep(min(0.01, max(0.0, due[0][0] - now)))
+            progress_at = time.monotonic()
             continue
         started = time.monotonic()
         outputs = engine.step()
         now = time.monotonic()
+        if any(out.finished for out in outputs):
+            progress_at = now
+        elif now - progress_at > stall_s:
+            raise AssertionError(
+                f"no turn finished for {now - progress_at:.0f} s after "
+                f"{len(turns)} turns ({now - deadline + seconds:.0f} s in): "
+                + stall_report(llm, sorted(pending))
+            )
         if on_step is not None:
             on_step(started)
         for out in outputs:
@@ -295,6 +373,85 @@ def drive(
             else:
                 heapq.heappush(due, (now + rng.uniform(*pause), i))
     return turns
+
+
+def stall_report(llm: LLM, pending: list[str]) -> str:
+    """What the scheduler and the connector hold while `pending` requests make
+    no progress: the queues, both pools, and the tiered connector's waits,
+    restores and transfers."""
+    scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+    gpu_pool = scheduler.kv_cache_manager.block_pool
+    report: dict[str, object] = {
+        "pending": pending,
+        "running": [r.request_id for r in scheduler.running],
+        "waiting": [
+            (r.request_id, r.status.name, r.num_computed_tokens, r.num_tokens)
+            for r in scheduler.waiting
+        ],
+        "deferred_waiting": [r.request_id for r in scheduler.deferred_waiting],
+        "gpu_free": gpu_pool.get_num_free_blocks(),
+        "gpu_blocks": gpu_pool.num_gpu_blocks,
+        "deferred_frees": [
+            (fence, len(blocks)) for fence, blocks in scheduler.deferred_frees
+        ],
+        "steps": (
+            getattr(scheduler, "sched_step_seq", None),
+            getattr(scheduler, "processed_step_seq", None),
+        ),
+    }
+    connector = scheduler.connector
+    tier = connector.scheduler_manager if connector is not None else None
+    if tier is not None:
+        cpu_pool = tier.cpu_block_pool
+        report["ram_free"] = cpu_pool.get_num_free_blocks()
+        report["ram_in_use"] = sum(1 for b in cpu_pool.blocks if b.ref_cnt)
+        for name in (
+            "_last_wait",
+            "_wait_steps",
+            "_waiting_since",
+            "_head",
+            "_claim",
+            "_reserved",
+            "_num_pinned",
+            "_loading_cpu",
+            "_load_event_pending_counts",
+            "_inline_pairs",
+            "_store_event_to_blocks",
+            "_no_chunk",
+            "lookup_outcomes",
+            "landed_waits",
+        ):
+            if hasattr(tier, name):
+                report[name] = getattr(tier, name)
+        chunked = getattr(tier, "_chunked", None)
+        report["chunked"] = chunked.request_id if chunked is not None else None
+        restores = getattr(tier, "_restores", {})
+        report["restores"] = {
+            request_id: {
+                "tokens": r.num_tokens,
+                "loads": len(r.loads),
+                "pinned": len(r.pinned),
+                "event": r.event,
+                "done": r.done,
+                "chunked": r.chunked,
+                "pending": len(r.pending),
+                "in_flight": r.in_flight,
+                "aborted": r.aborted,
+                "age_s": round(time.monotonic() - r.started_at, 1),
+            }
+            for request_id, r in restores.items()
+        }
+        for prefix, stats in (
+            ("spill", getattr(tier, "lazy_spill_stats", None)),
+            ("restore", getattr(tier, "restore_stats", None)),
+        ):
+            if stats is not None:
+                report[prefix] = {
+                    k: v
+                    for k, v in vars(stats).items()
+                    if isinstance(v, int) and v and not k.endswith("_ns")
+                }
+    return repr(report)
 
 
 def fillers(

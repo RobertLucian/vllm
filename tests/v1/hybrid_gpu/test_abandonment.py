@@ -4,7 +4,7 @@
 
 RAM GDSF halved a session's resume count every ten minutes, so a slow agent
 with long but steady gaps between turns looked cold: 7 of the 9 sessions GPU
-window 5 (2026-11-23) lost whole were slow agents. Now a session with turn
+window 5 (2026-11-23) re-read whole were slow agents. Now a session with turn
 gaps on record keeps its count while it is not overdue, and one idle longer
 than its patience (a multiple of its longer gap) goes before every live
 session. Here a slow agent (gap ~6 s) and a fast one (gap ~0.5 s, resumed

@@ -35,8 +35,17 @@ SPECS = [
     # "gdsf" with async scheduling: production's RAM policy and scheduling.
     for ram_eviction in ("lru", "gdsf")
 ] + [
-    EngineSpec(family=family, connector="tiered", gpu_blocks=96, ram_blocks=384)
+    EngineSpec(
+        family=family,
+        connector="tiered",
+        gpu_blocks=96,
+        ram_blocks=384,
+        spill=spill,
+    )
     for family in ("gdn", "dense")
+    # "inline": no guard, the block is copied in the step that reuses it
+    # (test_inline_no_hold.py runs the fat pages that way).
+    for spill in ("walk", "inline")
 ]
 
 _AGENTS = 8

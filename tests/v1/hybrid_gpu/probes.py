@@ -24,12 +24,17 @@ if TYPE_CHECKING:
 
 
 def _worker_digests(worker: Any, tier: str, block_ids: list[int]) -> list[str]:
-    """On a worker: a digest of each block's bytes across all its KV tensors."""
+    """On a worker: a digest of each block's bytes across all its KV tensors,
+    once the copies issued so far have run: they run on streams of their own,
+    which reading a tensor on this one does not wait for."""
     import hashlib
 
     from vllm.distributed.kv_transfer import get_kv_transfer_group
 
     handler = get_kv_transfer_group().worker_handler
+    for stream in (handler.load_stream, handler.store_stream):
+        if stream is not None:
+            stream.synchronize()
     caches = handler.gpu_kv_caches if tier == "gpu" else handler.cpu_kv_caches
     digests = []
     for block_id in block_ids:
@@ -203,6 +208,66 @@ class Probe:
                 out[unit] = block.block_id
         return out
 
+    def key_block_id(self, block_hash: Any, group_id: int, tier: str) -> int | None:
+        """The id of the block `tier` caches under `block_hash` for
+        `group_id`, or None: a prefix-match unit's key (`block_hashes`) or an
+        exact-end state's (`exact_ends`)."""
+        pool = self.gpu_pool if tier == "gpu" else self.cpu_pool
+        assert pool is not None
+        block = pool.cached_block_hash_to_block.get_one_block(
+            make_block_hash_with_group_id(block_hash, group_id)
+        )
+        return None if block is None else block.block_id
+
+    def exact_ends(self) -> dict[Any, dict[int, int]]:
+        """The exact-end states the GPU holds (hybrids with `frontier`): key
+        -> group id -> the block caching that group's part of it, an attention
+        page or a recurrent state. A state is usable only whole."""
+        checkpoints = self.scheduler.mamba_checkpoints
+        if checkpoints is None:
+            return {}
+        return {
+            key: {g: block.block_id for g, block in entry.blocks.items()}
+            for key, entry in checkpoints.frontiers.entries.items()
+        }
+
+    def ram_exact_ends(self) -> set:
+        """The keys of the exact-end states RAM lists as held whole."""
+        assert self.tier is not None
+        return set(self.tier.ram_frontiers.entries)
+
+    def gpu_keys(self) -> dict[int, frozenset]:
+        """GPU block id -> every key the GPU caches that block under."""
+        extra = self.gpu_pool.cached_block_hashes_by_block
+        return {
+            block.block_id: frozenset(
+                (block.block_hash, *extra.get(block.block_id, ()))
+            )
+            for block in self.gpu_pool.blocks
+            if block.block_hash is not None
+        }
+
+    def in_ram(self, key: Any) -> bool:
+        """Whether RAM caches a block under `key` (a key with its group id,
+        as `gpu_keys` lists them)."""
+        assert self.cpu_pool is not None
+        return self.cpu_pool.cached_block_hash_to_block.get_one_block(key) is not None
+
+    def referenced(self, block_id: int) -> bool:
+        """Whether anything holds the GPU block: a request, a restore, a
+        pending copy. The GPU cannot reuse it meanwhile."""
+        return self.gpu_pool.blocks[block_id].ref_cnt > 0
+
+    def holders(self) -> dict[int, int]:
+        """GPU block id -> the KV cache group a live request holds it for."""
+        managers = self.scheduler.kv_cache_manager.coordinator.single_type_managers
+        return {
+            block.block_id: group_id
+            for group_id, manager in enumerate(managers)
+            for blocks in manager.req_to_blocks.values()
+            for block in blocks
+        }
+
     # ------------------------------------------------------------------
     # Bytes
 
@@ -238,6 +303,8 @@ class Probe:
         for prefix, counts in (
             ("lookup", getattr(tier, "lookup_outcomes", {})),
             ("landed", getattr(tier, "landed_waits", {})),
+            ("ladder", getattr(tier, "ladder_events", {})),
+            ("uncopied", getattr(tier, "uncopied_kinds", {})),
         ):
             for label, count in counts.items():
                 out[f"{prefix}.{label}"] = count
@@ -249,6 +316,15 @@ class Probe:
         ):
             out[f"pool.{name}"] = getattr(self.gpu_pool, name, 0)
         return out
+
+    def tier_contents(self) -> tuple[dict[tuple[str, str], int], dict[str, int]]:
+        """What each tier holds by kind and the RAM blocks the GPU caches too
+        (the connector's `vllm:tiered_kv_tier_blocks` and duplicates), counted
+        now."""
+        tier = self.tier
+        assert tier is not None
+        tier._tier_contents()
+        return dict(tier.tier_blocks), dict(tier.duplicate_blocks)
 
     def internal_id(self, request_id: str) -> str:
         """The scheduler's id of the live request added as `request_id`: the

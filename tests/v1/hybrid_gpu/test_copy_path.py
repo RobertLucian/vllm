@@ -12,6 +12,10 @@ SimpleCPU's eager mirror (upstream's design) stores recurrent states only as
 a live request hands them off and drops a finishing request's: on a hybrid
 it may resume short of the end. Its arm checks the pages, and the states
 only where RAM holds them.
+
+With `spill="inline"` a block is copied as the GPU reuses it, not ahead: the
+blocks the GPU has not reused yet are still there, and RAM is read for the
+others.
 """
 
 import pytest
@@ -21,15 +25,23 @@ from .engine import EngineSpec
 from .probes import Probe
 from .workloads import Session, fillers, greedy, run
 
-SPECS = [
-    EngineSpec(family=family, connector=connector)
-    for family in ("gdn", "gdn_fat", "gdn_mtp", "dense", "swa")
-    for connector in ("eager", "tiered")
-] + [
-    EngineSpec(family=family, connector="tiered", tp=tp)
-    for family in ("gdn", "dense")
-    for tp in (2, 4, 8)
-]
+SPECS = (
+    [
+        EngineSpec(family=family, connector=connector)
+        for family in ("gdn", "gdn_fat", "gdn_mtp", "dense", "swa")
+        for connector in ("eager", "tiered")
+    ]
+    + [
+        EngineSpec(family=family, connector="tiered", tp=tp)
+        for family in ("gdn", "dense")
+        for tp in (2, 4, 8)
+    ]
+    + [
+        # Copied in the step that reuses the block (test_inline_bytes.py).
+        EngineSpec(family=family, connector="tiered", spill="inline")
+        for family in ("gdn", "gdn_fat", "gdn_mtp", "dense", "swa")
+    ]
+)
 
 # Most filler prompts it may take to push the session out of the GPU.
 _MAX_FILLERS = 16
@@ -102,6 +114,11 @@ def test_restore_is_byte_exact(engine, record_property):
 
     in_ram = _session_blocks(probe, session.prompt, "ram", state_units)
     missing = [k for k, v in in_ram.items() if v is None and (whole or k[1] != "state")]
+    if spec.spill == "inline":
+        # An inline copy is made as its block is reused: until then the GPU
+        # still holds the key.
+        left = _session_blocks(probe, session.prompt, "gpu", state_units)
+        missing = [k for k in missing if left[k] is None]
     assert not missing, (
         f"lost from RAM after {used} fillers: {missing}; "
         f"{probe.residency(session.prompt)}"

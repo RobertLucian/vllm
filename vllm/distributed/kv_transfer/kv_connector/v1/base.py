@@ -360,6 +360,18 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def spill_before_reuse(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Copy out the KV blocks this step reuses whose contents the
+        connector still wants (`spills_at_reuse`).
+
+        Called once per step with the step's metadata, not bound yet, before
+        anything in the step writes KV blocks (zeroing of new blocks, block
+        copies, the forward), also on steps without a forward. The copy must
+        be ordered on the device before those writes; the connector need not
+        wait for it. Nothing is reported back to the scheduler.
+        """
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector to vLLM's paged
@@ -716,6 +728,14 @@ class KVConnectorBase_V1(ABC):
 
     def has_pending_block_frees(self) -> bool:
         """Whether pending transfers can release blocks instead of preemption."""
+        return False
+
+    @property
+    def spills_at_reuse(self) -> bool:
+        """Whether the connector copies a cached block out in the step that
+        reuses it (`spill_before_reuse`). The scheduler then defers block
+        frees: no step in flight may still write a block that is free.
+        """
         return False
 
     def has_pending_push_work(self) -> bool:

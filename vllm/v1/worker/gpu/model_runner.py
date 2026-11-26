@@ -1366,6 +1366,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.apply_mamba_state_gathers(
                 scheduler_output.mamba_state_gathers
             )
+        # A KV connector copies out the blocks this step reuses before
+        # anything below (zeroing, block copies) or the forward writes them.
+        self.kv_connector.before_block_writes(scheduler_output)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np

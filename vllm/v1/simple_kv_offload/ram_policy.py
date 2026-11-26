@@ -40,13 +40,33 @@ left cached):
   back of the queue goes first, each request's deepest units first and
   whole, and first only what no block the GPU still holds rests on
   (`_take_queued`).
+- Ladder points (`ladder_ranking`, the checkpoint ladder tiered.py keeps
+  inside a session: `rungs`): their states go on their own, the pages above
+  them staying. With "safe", a rung no cut could stop at goes at once: cuts
+  go deepest first, and a segment worth less per block than every one above
+  it goes right after them, so the point on top of it is resumed at only
+  until RAM gets to that segment (`_records`); it goes only while the points
+  that can be resumed at stay the same (`_safe_drops`). Cheaper victims
+  (orphans, duplicates, dead pages) can put that off: in GPU window A
+  (2026-11-25) a one-turn session's far rung served its next turn, and
+  without it the turn re-read the session; across a busy run "safe" still
+  recomputed ~12% less than keeping every rung, which held 13% of RAM. On
+  production's trace (window B, same day) seven turns resumed below a rung
+  it had dropped, most from the start of their session, against one that
+  resumed at a rung it kept: the connector's default is "fixed". A
+  rung that can be resumed at is ranked with the pages by the seconds its
+  segment saves per state block, a GPU-resident
+  session's too, whose tail RAM cannot take. With "expected" a rung is worth
+  what losing it adds to the session's expected recompute at its next turn,
+  its return raced against the clock's rise (`_expected_recompute`).
 """
 
 import heapq
 import itertools
+import math
 import time
-from collections import Counter, OrderedDict
-from collections.abc import Callable, Collection, Iterable
+from collections import Counter, OrderedDict, deque
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 
 from vllm.v1.core.block_pool import BlockPool
@@ -75,6 +95,24 @@ _GAP_WEIGHT = 0.5
 # (`_scored`); live sessions score from 0 up.
 _DEAD_SCORE = -2.0
 _OVERDUE_SCORE = -1.0
+# How ladder points are valued (module docstring).
+LADDER_RANKINGS = ("fixed", "safe", "expected")
+# The clock's rise per second is measured over this window, from samples at
+# most a second apart, once it spans at least `_RATE_MIN_SPAN_S`; scores are
+# rebuilt when it changes by more than `_RATE_REBUILD_RATIO`.
+_RATE_WINDOW_S = 120.0
+_RATE_MIN_SPAN_S = 30.0
+_RATE_REBUILD_RATIO = 2.0
+# Two values per block this close are a tie (`_records`).
+_EPS = 1e-12
+# The weight of the latest gap in the average across sessions (`_gap_avg`):
+# about the last twenty.
+_GAP_AVG_WEIGHT = 0.05
+
+
+def _averaged(average: float, value: float, weight: float) -> float:
+    """An exponentially weighted average (0: none yet)."""
+    return value if not average else weight * value + (1 - weight) * average
 
 
 @dataclass(slots=True)
@@ -94,6 +132,31 @@ class _Session:
     gap_tool: float = 0.0
     gap_user: float = 0.0
     active: int = 0
+    # Its ladder points (hash unit -> position) whose states may still go on
+    # their own (`ladder_ranking`).
+    rungs: dict[BlockHash, int] = field(default_factory=dict)
+    # The chance its tail is cut before its next turn, as estimated when it
+    # was added (None: no estimate), and the point it resumed at then: its
+    # next turn checks the estimate (`ladder_p`).
+    p_cut: float | None = None
+    reach_at_add: int = 0
+
+
+@dataclass(slots=True)
+class _Point:
+    """A point a session resumes at, above what it shares (`_Walk.points`)."""
+
+    position: int
+    unit: BlockHash
+    # The segment under it (from the point below, or the shared point): the
+    # seconds it saves and its exclusive blocks in both tiers.
+    gain: float
+    size: int
+    # A ladder point: its state groups' blocks in either tier, and its RAM
+    # ones.
+    rung: bool = False
+    states: int = 0
+    ram_states: list[KVCacheBlock] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -114,6 +177,11 @@ class _Walk:
     # deepest it shares with other sessions.
     reach: int = 0
     shared: int = 0
+    # Its points above `shared`, shallowest first: the last is `reach`.
+    points: list[_Point] = field(default_factory=list)
+    # Its exclusive RAM blocks: attention pages, and states.
+    ram_pages: int = 0
+    ram_states: int = 0
 
 
 @dataclass
@@ -139,6 +207,14 @@ class RamEvictionStats:
     # could go (all in use).
     unranked: int = 0
     retired: int = 0
+    # Ladder points whose states went by value (`ladder_ranking`), their
+    # blocks, and of those the copies stored since the last two evictions
+    # (copied only to be dropped); ladder points no cut could stop at,
+    # dropped at once (`_safe_drops`).
+    rungs: int = 0
+    rung_blocks: int = 0
+    rung_fresh: int = 0
+    rungs_safe: int = 0
     counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -161,6 +237,91 @@ class SessionLoss:
     idle_s: float
 
 
+# A session's points as (position, seconds its segment saves, its blocks,
+# the point's state blocks), shallowest first, the last its reach.
+_Segments = list[tuple[int, float, int, int]]
+
+
+def _segments(points: list[_Point]) -> _Segments:
+    return [(p.position, p.gain, p.size, p.states) for p in points]
+
+
+def _records(segments: _Segments) -> frozenset[int]:
+    """The points below the reach a session can be resumed at: cuts take
+    segments deepest first at their value per block, and once one goes, every
+    segment under it worth no more per block goes too. A point is resumed at
+    only if the segment under it is worth more per block than every one above
+    it (stamp and frequency are the session's, the same for all)."""
+    records: list[int] = []
+    # Walking down: the most any segment above point k - 1 is worth.
+    above = -math.inf
+    for k in range(len(segments) - 1, 0, -1):
+        _, gain, size, _ = segments[k]
+        above = max(above, gain / max(1, size))
+        position, gain_k, size_k, _ = segments[k - 1]
+        if gain_k / max(1, size_k) > above + _EPS:
+            records.append(position)
+    return frozenset(records)
+
+
+def _merged(segments: _Segments, k: int) -> _Segments:
+    """`segments` without point `k`'s states: its segment joins the next."""
+    position, gain, size, states = segments[k]
+    upper = segments[k + 1]
+    return [
+        *segments[:k],
+        (upper[0], gain + upper[1], size + upper[2] - states, upper[3]),
+        *segments[k + 2 :],
+    ]
+
+
+def _safe_drops(segments: _Segments, candidates: Collection[int]) -> list[int]:
+    """The ladder points among `candidates` (positions) whose states can go
+    with the points the session can be resumed at staying the same
+    (`_records`), deepest first, each checked with the drops before it: a
+    rung under a record keeps the record worth stopping at, so of two such
+    rungs one may go but not both."""
+    current = list(segments)
+    keep = _records(current)
+    drops: list[int] = []
+    for position in sorted(candidates, reverse=True):
+        if position in keep:
+            continue
+        k = next((i for i, s in enumerate(current) if s[0] == position), None)
+        if k is None or k >= len(current) - 1:
+            continue
+        merged = _merged(current, k)
+        if _records(merged) == keep:
+            current = merged
+            drops.append(position)
+    return drops
+
+
+def _expected_recompute(
+    segments: _Segments,
+    level: Callable[[float, int], float],
+    chance_cut: Callable[[float], float],
+) -> float:
+    """The seconds a session's next turn is expected to recompute: it
+    resumes at point k when, at its return, the cuts reached past every
+    segment above k but not the one under it, and at the shared point under
+    them all past every segment. `level(seconds, blocks)` is the clock at
+    which a segment goes, `chance_cut(level)` the chance the clock reaches it
+    before the session returns."""
+    expected = above_seconds = 0.0
+    reached_above = -math.inf
+    chance_above = 1.0
+    for _, gain, size, _ in reversed(segments):
+        # The clock at which this segment goes, at the latest with those above.
+        reached = max(level(gain, size), reached_above)
+        chance = chance_cut(reached)
+        # Resumes at this segment's point: everything above it cut, not it.
+        expected += (chance_above - chance) * above_seconds
+        above_seconds += gain
+        reached_above, chance_above = reached, chance
+    return expected + chance_above * above_seconds
+
+
 class RamGreedyDualSizeFrequency:
     """CachedBlockEvictionPolicy of the RAM pool (module docstring)."""
 
@@ -179,8 +340,15 @@ class RamGreedyDualSizeFrequency:
         gpu_keeps: Callable[[], Callable[[BlockHashWithGroupId], bool]] | None = None,
         leaving: Callable[[], Iterable[KVCacheBlock]] | None = None,
         dropped: Callable[[list[KVCacheBlock]], None] | None = None,
+        ladder_ranking: str = "fixed",
+        may_drop_point: Callable[[BlockHash, BlockHash], bool] | None = None,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
+        if ladder_ranking not in LADDER_RANKINGS:
+            raise ValueError(
+                f"ladder_ranking must be one of {LADDER_RANKINGS}, "
+                f"got {ladder_ranking!r}"
+            )
         self.pool = pool
         self.cost = cost
         self.now = now
@@ -239,6 +407,29 @@ class RamGreedyDualSizeFrequency:
         # session, the point it resumed at before, its blocks taken, and the
         # kinds of eviction.
         self._touched: dict[BlockHash, tuple[_Session, int, list[int], set[str]]] = {}
+        # How ladder points are valued (module docstring); whether the
+        # connector lets a session's point at a hash unit go on its own (one
+        # only it keeps, nobody queued at it); the points chosen to go,
+        # (session, unit, why), until the connector drops them
+        # (`take_dropped_points`).
+        self.ladder_ranking = ladder_ranking
+        self.may_drop_point = may_drop_point
+        self._dropped_points: list[tuple[BlockHash, BlockHash, str]] = []
+        # (when, clock) at most a second apart over `_RATE_WINDOW_S`, the
+        # clock's rise per second they give (None: unknown) and the one the
+        # scores were last rebuilt with.
+        self._clock_samples: deque[tuple[float, float]] = deque()
+        self.clock_rate: float | None = None
+        self._rate_built: float | None = None
+        # The average turn gap across sessions: a session with none on record
+        # is expected back after it (`_expected_gap`).
+        self._gap_avg = 0.0
+        # Sessions last scored with nothing RAM can rank, though they hold
+        # blocks of their own (`unranked_blocks`).
+        self._unranked: set[BlockHash] = set()
+        # Sessions' estimated chance of a cut tail before their next turn, by
+        # tenth, against what happened: (bucket, "cut" | "intact") -> count.
+        self.ladder_p: Counter[tuple[str, str]] = Counter()
 
     # ------------------------------------------------------------------
     # Sessions
@@ -249,10 +440,13 @@ class RamGreedyDualSizeFrequency:
         end: int,
         units: list[tuple[int, BlockHash]],
         parent: BlockHash | None,
+        rungs: Mapping[BlockHash, int] | None = None,
     ) -> None:
         """A request finished at `end` tokens, owning `units` ((position,
         hash) pairs). `parent`: the session it resumed, which it supersedes
-        and whose frequency it inherits."""
+        and whose frequency it inherits. `rungs`: its ladder points (hash
+        unit -> position), whose states may go on their own
+        (`ladder_ranking`)."""
         now = self.now()
         session = self.sessions.pop(key, None)
         if session is not None:
@@ -273,6 +467,7 @@ class RamGreedyDualSizeFrequency:
             stamp=self.clock,
             gap_tool=gaps[0],
             gap_user=gaps[1],
+            rungs=dict(rungs) if rungs and self.ladder_ranking != "fixed" else {},
         )
         self.sessions[key] = session
         for _, unit in session.units:
@@ -283,7 +478,9 @@ class RamGreedyDualSizeFrequency:
             for other in shared_with:
                 # Its unit is no longer its own: its value changed.
                 self._push(self.sessions[other])
-        self._push(session)
+        walk = self._push(session)
+        session.reach_at_add = walk.reach
+        session.p_cut = self._chance_tail_cut(session, walk, now)
         self._schedule_due(session)
         while len(self.sessions) > _MAX_SESSIONS:
             _, oldest = self.sessions.popitem(last=False)
@@ -302,13 +499,28 @@ class RamGreedyDualSizeFrequency:
                 freq, when, tool, user = retired
                 tool, user = self._with_gap(tool, user, at - when, extends_end)
                 self._retired[key] = (freq, when, tool, user)
+                self._note_gap(at - when)
             return
         if at > session.freq_at:
             session.gap_tool, session.gap_user = self._with_gap(
                 session.gap_tool, session.gap_user, at - session.freq_at, extends_end
             )
+            self._note_gap(at - session.freq_at)
         session.active += 1
         self._push(session)
+
+    def _note_gap(self, gap: float) -> None:
+        self._gap_avg = _averaged(self._gap_avg, gap, _GAP_AVG_WEIGHT)
+
+    def _expected_gap(self, session: _Session) -> float:
+        """Seconds until `session`'s next turn arrives, as `_patience` reads
+        its gaps: its longer one on record, else the average across sessions,
+        else the abandonment floor."""
+        return (
+            max(session.gap_tool, session.gap_user)
+            or self._gap_avg
+            or self.abandon_floor_s
+        )
 
     def departed(self, key: BlockHash) -> None:
         """A request `arrived` counted finished or left (`arrived`)."""
@@ -323,8 +535,7 @@ class RamGreedyDualSizeFrequency:
     def _with_gap(
         tool: float, user: float, gap: float, extends_end: bool
     ) -> tuple[float, float]:
-        old = tool if extends_end else user
-        new = gap if not old else _GAP_WEIGHT * gap + (1 - _GAP_WEIGHT) * old
+        new = _averaged(tool if extends_end else user, gap, _GAP_WEIGHT)
         return (new, user) if extends_end else (tool, new)
 
     def _parent_gaps(self, parent: BlockHash | None) -> tuple[float, float]:
@@ -389,6 +600,12 @@ class RamGreedyDualSizeFrequency:
                 )
                 self._retired.move_to_end(key)
             return
+        if session.p_cut is not None:
+            # Whether the estimate made when it was added came true.
+            cut = self._walk(session).reach < session.reach_at_add
+            bucket = f"{min(9, int(10 * session.p_cut)) / 10:.1f}"
+            self.ladder_p[bucket, "cut" if cut else "intact"] += 1
+            session.p_cut = None
         session.freq = self._freq(session, now) + 1.0
         session.freq_at = now
         session.stamp = self.clock
@@ -529,8 +746,8 @@ class RamGreedyDualSizeFrequency:
     def _freq(self, session: _Session, now: float) -> float:
         """Its resumes, halved every half-life; with turn gaps on record
         (`abandon_gap_multiplier`), undecayed while it is not overdue: a slow
-        agent's steady rhythm is no reason to forget it (window 5: 7 of 9
-        sessions RAM lost whole were slow agents)."""
+        agent's steady rhythm is no reason to forget it (window 5: 7 of the
+        9 sessions re-read whole were slow agents)."""
         if self._patience(session) is not None and not self._overdue(session, now):
             return min(session.freq, _MAX_LIVE_FREQ)
         return self._decayed(session.freq, session.freq_at, now)
@@ -554,16 +771,22 @@ class RamGreedyDualSizeFrequency:
         on_gpu = self.on_gpu
         key = session.key
         block_size = self.block_size
+        page_group_id = self.page_group_id
         reach = shared = previous = 0
         broken = False
+        walk = _Walk()
         # Per unit, ascending: (position, whether it is exclusive, its blocks
         # in either tier, its RAM blocks, whether the GPU alone holds its
         # page, whether the GPU alone holds one of its blocks).
         units: list[tuple[int, bool, int, list[KVCacheBlock], bool, bool]] = []
+        # Per point, ascending: (its index in `units`, its unit, its state
+        # groups' blocks in either tier, its exclusive RAM state blocks).
+        found: list[tuple[int, BlockHash, int, list[KVCacheBlock]]] = []
         for position, unit in reversed(session.units):
             exclusive = self.owners.get(unit) == {key}
-            held = 0
+            held = states = 0
             ram: list[KVCacheBlock] = []
+            ram_states: list[KVCacheBlock] = []
             complete = True
             page_on_gpu_only = any_on_gpu_only = False
             for group_id in self.group_ids:
@@ -573,13 +796,19 @@ class RamGreedyDualSizeFrequency:
                     blocks = [b for b in blocks if b.block_id not in gone]
                 if exclusive:
                     ram.extend(blocks)
+                    if group_id == page_group_id:
+                        walk.ram_pages += len(blocks)
+                    else:
+                        ram_states.extend(blocks)
+                        walk.ram_states += len(blocks)
                 gpu_only = not blocks and on_gpu(grouped)
                 if blocks or gpu_only:
                     held += 1
+                    states += group_id != page_group_id
                     if gpu_only:
                         any_on_gpu_only = True
-                        page_on_gpu_only |= group_id == self.page_group_id
-                elif group_id == self.page_group_id and not position % block_size:
+                        page_on_gpu_only |= group_id == page_group_id
+                elif group_id == page_group_id and not position % block_size:
                     # The chain has a hole: nothing past it resumes.
                     broken = True
                 else:
@@ -589,6 +818,7 @@ class RamGreedyDualSizeFrequency:
             )
             if broken or not complete:
                 continue
+            found.append((len(units) - 1, unit, states, ram_states))
             if position > reach:
                 # (An exact-end state and a hash unit's can end at the same
                 # token: one point.)
@@ -605,7 +835,9 @@ class RamGreedyDualSizeFrequency:
                 position < reach and page_on_gpu_only and not position % block_size
             ) or (position == reach and any_on_gpu_only):
                 cut = position
-        walk = _Walk()
+        if session.rungs and reach > shared:
+            # Only ladder points are valued by point (`_rung_values`).
+            self._add_points(session, walk, units, found, shared)
         # A block can hold several of the session's keys.
         listed: set[int] = set()
         for position, exclusive, held, ram, _, _ in reversed(units):
@@ -629,44 +861,251 @@ class RamGreedyDualSizeFrequency:
             walk.gain_last = self.cost.seconds(max(previous, shared), reach)
         return walk
 
+    def _add_points(
+        self,
+        session: _Session,
+        walk: _Walk,
+        units: list[tuple[int, bool, int, list[KVCacheBlock], bool, bool]],
+        found: list[tuple[int, BlockHash, int, list[KVCacheBlock]]],
+        shared: int,
+    ) -> None:
+        """`walk.points`: the session's points above `shared`, each with the
+        segment under it (from the point below): the seconds it saves and its
+        exclusive blocks in both tiers, as `_walk` counts the last segment."""
+        points = walk.points
+        by_index = {i: (unit, states, ram) for i, unit, states, ram in found}
+        lower, size = shared, 0
+        for i, (position, exclusive, held, *_) in enumerate(units):
+            if position <= shared:
+                continue
+            if exclusive:
+                size += held
+            point = by_index.get(i)
+            if point is None:
+                continue
+            unit, states, ram_states = point
+            if points and points[-1].position == position:
+                # Another unit ending at the same token: the same point, which
+                # one unit's states going would not remove.
+                points[-1].size += size
+                points[-1].rung = False
+            else:
+                points.append(
+                    _Point(
+                        position,
+                        unit,
+                        self.cost.seconds(lower, position),
+                        size,
+                        unit in session.rungs,
+                        states,
+                        ram_states,
+                    )
+                )
+            lower, size = position, 0
+
     def _score(
-        self, session: _Session, now: float, gone: Collection[int] = ()
+        self,
+        session: _Session,
+        now: float,
+        gone: Collection[int] = (),
+        skip: Collection[BlockHash] = (),
     ) -> float:
-        return self._scored(session, now, gone)[0]
+        return self._scored(session, now, gone, skip)[0]
 
     def _scored(
-        self, session: _Session, now: float, gone: Collection[int] = ()
-    ) -> tuple[float, _Walk]:
-        """What evicting `session`'s last segment loses per block, and its
-        walk: a session gives up its cheap tail (a turn back to its previous
-        resume point) long before the prefix under its first resume point,
-        which only the whole prefill brings back."""
+        self,
+        session: _Session,
+        now: float,
+        gone: Collection[int] = (),
+        skip: Collection[BlockHash] = (),
+    ) -> tuple[float, _Walk, _Point | None]:
+        """What evicting `session`'s last segment loses per block, its walk,
+        and None; or, if one of its ladder points (`skip` aside) loses less
+        per block, that and the point: a session gives up its cheap tail (a
+        turn back to its previous resume point) long before the prefix under
+        its first resume point, which only the whole prefill brings back."""
         walk = self._walk(session, gone)
         if walk.dead:
             # RAM blocks nothing reads: before any value.
-            return _DEAD_SCORE, walk
+            return _DEAD_SCORE, walk, None
         if walk.gain <= 0.0:
             self._to_retire.append(session)
-            return float("inf"), walk
-        if not walk.live:
-            # No tail in RAM to give.
-            return float("inf"), walk
-        value = (
-            (1.0 + self._freq(session, now)) * walk.gain_last / max(1, walk.size_last)
-        )
-        if self._overdue(session, now):
-            # Abandoned by its own rhythm: before every live session, the
-            # cheapest first.
-            return _OVERDUE_SCORE + value / (1.0 + value), walk
-        return session.stamp + value, walk
+            return float("inf"), walk, None
+        scale = 1.0 + self._freq(session, now)
+        overdue = self._overdue(session, now)
 
-    def _push(self, session: _Session) -> None:
+        def score_of(per_block: float) -> float:
+            value = scale * per_block
+            if overdue:
+                # Abandoned by its own rhythm: before every live session, the
+                # cheapest first.
+                return _OVERDUE_SCORE + value / (1.0 + value)
+            return session.stamp + value
+
+        # No tail in RAM to give: infinite.
+        score = (
+            score_of(walk.gain_last / max(1, walk.size_last))
+            if walk.live
+            else float("inf")
+        )
+        choice = None
+        for point, seconds in self._rung_values(session, walk, scale, overdue, skip):
+            rung_score = score_of(seconds / max(1, point.states))
+            if rung_score < score:
+                score, choice = rung_score, point
+        return score, walk, choice
+
+    def _push(self, session: _Session) -> _Walk:
         session.version = next(self._seq)
-        score = self._score(session, self.now())
+        score, walk, _ = self._scored(session, self.now())
+        if session.rungs and walk.points:
+            self._drop_safe(session, walk)
         # A session with nothing exclusive to give is not pushed; it is again
         # when RAM stores one of its units or it loses a sharer.
         if score != float("inf"):
             heapq.heappush(self.heap, (score, session.version, session.key))
+            self._unranked.discard(session.key)
+        elif walk.gain > 0.0 and not walk.dead:
+            self._unranked.add(session.key)
+        return walk
+
+    def _may_drop(self, session: BlockHash, unit: BlockHash) -> bool:
+        return self.may_drop_point is None or self.may_drop_point(session, unit)
+
+    def _drop_safe(self, session: _Session, walk: _Walk) -> None:
+        """The ladder points no cut could stop at go at once (`_safe_drops`):
+        the connector drops their states from both tiers
+        (`take_dropped_points`); the session is pushed again then."""
+        candidates = [
+            p.position
+            for p in walk.points[:-1]
+            if p.rung and self._may_drop(session.key, p.unit)
+        ]
+        if not candidates:
+            return
+        units = {p.position: p.unit for p in walk.points}
+        for position in _safe_drops(_segments(walk.points), candidates):
+            unit = units[position]
+            del session.rungs[unit]
+            self._dropped_points.append((session.key, unit, "safe"))
+            self.stats.rungs_safe += 1
+
+    def _rung_values(
+        self,
+        session: _Session,
+        walk: _Walk,
+        scale: float,
+        overdue: bool,
+        skip: Collection[BlockHash],
+    ) -> Iterator[tuple[_Point, float]]:
+        """`session`'s ladder points RAM can drop the states of (`skip`
+        aside), each with the seconds it is worth: with "expected" (and the
+        clock's rise known, the session live) what losing it adds to the
+        session's expected recompute, else the seconds its segment saves (as
+        if its tail were sure to be cut, and the cut to stop at it)."""
+        points = walk.points
+        candidates = [
+            k
+            for k, p in enumerate(points[:-1])
+            if p.rung
+            and p.ram_states
+            and p.unit not in skip
+            and self._may_drop(session.key, p.unit)
+        ]
+        if not candidates:
+            return
+        rate = self.clock_rate
+        if self.ladder_ranking != "expected" or overdue or rate is None:
+            for k in candidates:
+                yield points[k], points[k].gain
+            return
+        segments = _segments(points)
+        level, chance = self._cut_model(session, scale, rate)
+        base = _expected_recompute(segments, level, chance)
+        for k in candidates:
+            without = _expected_recompute(_merged(segments, k), level, chance)
+            yield points[k], max(0.0, without - base)
+
+    def _cut_model(
+        self, session: _Session, scale: float, rate: float
+    ) -> tuple[Callable[[float, int], float], Callable[[float], float]]:
+        """The clock at which a segment of `session` goes (`seconds` saved
+        over `blocks`), and the chance the clock gets there before the
+        session's next turn: its return and the clock's rise race, each at a
+        steady rate (a memoryless race: gap / (gap + time to reach it))."""
+        stamp, clock = session.stamp, self.clock
+        gap = self._expected_gap(session)
+
+        def level(seconds: float, blocks: int) -> float:
+            return stamp + scale * seconds / max(1, blocks)
+
+        def chance(at: float) -> float:
+            if at <= clock:
+                return 1.0
+            return gap / (gap + (at - clock) / rate)
+
+        return level, chance
+
+    def _chance_tail_cut(
+        self, session: _Session, walk: _Walk, now: float
+    ) -> float | None:
+        """The chance `session`'s last segment is cut before its next turn
+        (`_cut_model`), or None: the clock's rise unknown, the session
+        overdue or with no tail of its own."""
+        rate = self.clock_rate
+        if rate is None or walk.gain <= 0.0 or self._overdue(session, now):
+            return None
+        scale = 1.0 + self._freq(session, now)
+        level, chance = self._cut_model(session, scale, rate)
+        return chance(level(walk.gain_last, walk.size_last))
+
+    def take_dropped_points(self) -> list[tuple[BlockHash, BlockHash, str]]:
+        """The ladder points chosen to go since the last call, (session, hash
+        unit, "safe" | "ranked"): the connector drops their states from both
+        tiers and pushes the sessions again (`repush`). A ranked one's RAM
+        states are victims already."""
+        dropped, self._dropped_points = self._dropped_points, []
+        return dropped
+
+    def repush(self, keys: Iterable[BlockHash]) -> None:
+        """Rank sessions `keys` again: their blocks changed outside an
+        eviction (a ladder point's states dropped). The push makes their
+        overdue check (`_due`) stale, so it is scheduled again."""
+        for key in set(keys):
+            session = self.sessions.get(key)
+            if session is not None:
+                self._push(session)
+                self._schedule_due(session)
+
+    def unranked_blocks(self) -> tuple[int, int]:
+        """Live sessions' exclusive RAM blocks no eviction ranks (pages,
+        states): a session whose tail the GPU holds has no tail to give by
+        value (only its ladder points, if ranked), and RAM takes its other
+        blocks only in its own LRU order. Walks only the sessions last scored
+        so (`_unranked`)."""
+        now = self.now()
+        pages = states = 0
+        for key in list(self._unranked):
+            session = self.sessions.get(key)
+            if session is None:
+                self._unranked.discard(key)
+                continue
+            walk = self._walk(session)
+            if walk.dead or walk.gain <= 0.0 or walk.live:
+                continue
+            ranked = sum(
+                len(point.ram_states)
+                for point, _ in self._rung_values(
+                    session,
+                    walk,
+                    1.0 + self._freq(session, now),
+                    self._overdue(session, now),
+                    (),
+                )
+            )
+            pages += walk.ram_pages
+            states += walk.ram_states - ranked
+        return pages, states
 
     def stored(self, keys: list[BlockHashWithGroupId], block_ids: list[int]) -> None:
         """RAM now holds blocks `block_ids` under `keys`: their owners' values
@@ -706,11 +1145,13 @@ class RamGreedyDualSizeFrequency:
         them wait on. When one goes all the same, its GPU block may leave
         uncopied (`dropped`): RAM's value order chose it."""
         self._decay()
+        self._sample_clock(self.now())
         self._rescore_overdue(self.now())
         queue = self.pool.free_block_queue
         victims: list[KVCacheBlock] = []
         seen: set[int] = set()
         fresh = self._fresh | self._fresher
+        was_fresh = set(fresh)
         self._fresher, self._fresh = self._fresh, set()
         leaving: set[int] = (
             {b.block_id for b in self.leaving()} if self.leaving is not None else set()
@@ -733,14 +1174,17 @@ class RamGreedyDualSizeFrequency:
             )
 
         def take(
-            block: KVCacheBlock, even_fresh: bool = False, even_queued: bool = False
+            block: KVCacheBlock,
+            even_fresh: bool = False,
+            even_queued: bool = False,
+            label: str | None = None,
         ) -> bool:
             """Takes `block` if it may go."""
             if not may_go(block, even_fresh, even_queued):
                 return False
             seen.add(block.block_id)
             victims.append(block)
-            kinds[block.block_id] = kind[0]
+            kinds[block.block_id] = label or kind[0]
             return True
 
         extra = self.pool.cached_block_hashes_by_block
@@ -809,6 +1253,9 @@ class RamGreedyDualSizeFrequency:
             ]
             if dropped and self.dropped is not None:
                 self.dropped(dropped)
+        self.stats.rung_fresh += sum(
+            kinds[b.block_id] == "rung" and b.block_id in was_fresh for b in victims
+        )
         # The pool takes the first `num_blocks` (a unit can take it past).
         self._note_taken(victims[:num_blocks], kinds)
         moved = [b for b in victims if b.prev_free_block is not None]
@@ -1002,12 +1449,18 @@ class RamGreedyDualSizeFrequency:
         that gave its tail competes again with its next segment. A unit goes
         whole or not at all: one of its blocks gone loses the point (a page
         can be the unit's and a shallower unit's too), so taking the others
-        while one may not go yet (in use or fresh) would lose it unfreed."""
+        while one may not go yet (in use or fresh) would lose it unfreed. A
+        ladder point worth less goes before the segment (`_scored`): its
+        state blocks all or none, its page staying, so that the segments
+        around it join."""
         heap = self.heap
         now = self.now()
         # A session that gives nothing (its blocks in use or fresh) is pushed
         # back only after this eviction: it would come straight back.
         visited: list[_Session] = []
+        # By session, the ladder points that may not go in this eviction: it
+        # is ranked again without them.
+        skipped: dict[BlockHash, set[BlockHash]] = {}
         while heap and len(victims) < num_blocks:
             score, version, key = heap[0]
             session = self.sessions.get(key)
@@ -1019,7 +1472,8 @@ class RamGreedyDualSizeFrequency:
                 # once its request leaves the queue.
                 heapq.heappop(heap)
                 continue
-            current, walk = self._scored(session, now, gone)
+            skip = skipped.get(key, ())
+            current, walk, choice = self._scored(session, now, gone, skip)
             if current > score + 1e-12:
                 session.version = next(self._seq)
                 heapq.heapreplace(heap, (current, session.version, key))
@@ -1030,6 +1484,32 @@ class RamGreedyDualSizeFrequency:
                 continue
             dead = bool(walk.dead)
             taken = len(victims)
+            if choice is not None and not dead:
+                blocks = choice.ram_states
+                if not (
+                    all(may_go(block) for block in blocks)
+                    and self._may_drop(key, choice.unit)
+                ):
+                    skipped.setdefault(key, set()).add(choice.unit)
+                else:
+                    for block in blocks:
+                        take(block, label="rung")
+                    del session.rungs[choice.unit]
+                    self._dropped_points.append((key, choice.unit, "ranked"))
+                    self.stats.rungs += 1
+                    self.stats.rung_blocks += len(victims) - taken
+                    if current >= 0.0:
+                        self.clock = max(self.clock, current)
+                session.version = next(self._seq)
+                rest = self._score(session, now, gone, skipped.get(key, ()))
+                if rest != float("inf"):
+                    heapq.heappush(heap, (rest, session.version, key))
+                if key in skipped or rest == float("inf"):
+                    # Ranked again after this eviction, with every rung: one
+                    # refused now may go then, and a session left with nothing
+                    # to give now would leave the heap.
+                    visited.append(session)
+                continue
             if dead:
                 for block in walk.dead:
                     if take(block) and len(victims) >= num_blocks:
@@ -1062,18 +1542,55 @@ class RamGreedyDualSizeFrequency:
             if session.key in self.sessions:
                 self._push(session)
 
+    def _sample_clock(self, now: float) -> None:
+        """Measure the clock's rise per second (`clock_rate`), which values
+        ladder points with "expected"; their scores are rebuilt when it
+        changes much, or becomes known or unknown."""
+        samples = self._clock_samples
+        if not samples or now - samples[-1][0] >= 1.0:
+            samples.append((now, self.clock))
+        while len(samples) > 1 and now - samples[1][0] >= _RATE_WINDOW_S:
+            samples.popleft()
+        if len(samples) > 1 and now - samples[0][0] >= 2 * _RATE_WINDOW_S:
+            # No eviction for a while: the rate is the burst's, not the gap's.
+            samples.popleft()
+        first_at, first = samples[0]
+        span = now - first_at
+        rate = (
+            (self.clock - first) / span
+            if span >= _RATE_MIN_SPAN_S and self.clock > first
+            else None
+        )
+        self.clock_rate = rate
+        built = self._rate_built
+        if self.ladder_ranking != "expected" or rate == built:
+            return
+        if (
+            rate is None
+            or built is None
+            or max(rate / built, built / rate) > _RATE_REBUILD_RATIO
+        ):
+            self._rate_built = rate
+            self._rebuild(now)
+
     def _decay(self) -> None:
         now = self.now()
         if now - self._decayed_at < self._decay_every:
             return
+        self._rebuild(now)
+
+    def _rebuild(self, now: float) -> None:
         self._decayed_at = now
         # Frequencies decay continuously; scores are rebuilt at these steps.
         heap = []
+        self._unranked.clear()
         for session in self.sessions.values():
             session.version = next(self._seq)
-            score = self._score(session, now)
+            score, walk, _ = self._scored(session, now)
             if score != float("inf"):
                 heap.append((score, session.version, session.key))
+            elif walk.gain > 0.0 and not walk.dead:
+                self._unranked.add(session.key)
         heapq.heapify(heap)
         self.heap = heap
         self._retire_pending(now)
@@ -1094,3 +1611,7 @@ class RamGreedyDualSizeFrequency:
         self._fresher.clear()
         self._touched.clear()
         self._due.clear()
+        self._dropped_points.clear()
+        self._clock_samples.clear()
+        self.clock_rate = self._rate_built = None
+        self._unranked.clear()

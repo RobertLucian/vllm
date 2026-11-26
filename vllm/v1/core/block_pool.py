@@ -81,6 +81,13 @@ class SpillGuard(Protocol):
         allocation that waited too long evict them."""
         ...
 
+    @property
+    def spills_at_reuse(self) -> bool:
+        """Whether a block that needs a spill is copied in the step that
+        reuses it (`before_reuse`) instead of being held back until a copy
+        made ahead is acknowledged: nothing is held then."""
+        ...
+
     def needs_spill(self, block: KVCacheBlock) -> bool:
         """Whether evicting the free cached `block` now would lose it."""
         ...
@@ -99,6 +106,18 @@ class SpillGuard(Protocol):
     def on_unspilled_eviction(self, blocks: list[KVCacheBlock]) -> None:
         """`blocks` leave the free queue without a copy: no other free block
         was left."""
+        ...
+
+    def before_reuse(self, blocks: list[KVCacheBlock]) -> None:
+        """With `spills_at_reuse`: called with the blocks `get_new_blocks`
+        just took from the free queue, keys still on them, before they are
+        evicted."""
+        ...
+
+    def leaves_last(self, block: KVCacheBlock) -> bool:
+        """With `spills_at_reuse`: whether the free cached `block` leaves
+        behind the other free blocks: a copy taken as it left now would not
+        save what it is part of (a unit with a block still in use)."""
         ...
 
     def on_evicted(self, block: KVCacheBlock) -> None:
@@ -136,7 +155,12 @@ class SpillGuard(Protocol):
         """`allocate_slots` refused `request` this step: "full_sequence" (its
         whole sequence does not fit), "no_room" (its step's blocks do not),
         "claim" (they would take room the tier keeps for others) or "copies"
-        (they wait for spills)."""
+        (they wait for spills). Or the scheduler asked for no blocks: prefill
+        deferred this step ("deferred_step"), no room for a padded
+        speculative step ("spec_padding"), the low-priority prefill cap used
+        up ("low_priority_cap"), a chunk of 0 tokens after block alignment
+        ("aligned_chunk_zero") or after the lookahead or encoder limits
+        ("trimmed_chunk_zero")."""
         ...
 
 
@@ -865,6 +889,10 @@ class BlockPool:
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
+        guard = self.spill_guard
+        if guard is not None and self.enable_caching and guard.spills_at_reuse:
+            # Their keys still say what a slower tier must copy.
+            guard.before_reuse(ret)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -892,10 +920,28 @@ class BlockPool:
     def _take_spilled_first(self, num_blocks: int) -> None:
         """Before `num_blocks` blocks leave the queue front: the first free
         blocks the spill guard lets go move ahead of those it holds back.
-        Held blocks leave only when no other free block is left."""
+        Held blocks leave only when no other free block is left. A guard
+        that copies blocks as they are reused (`spills_at_reuse`) holds
+        none back: only the blocks it cannot save yet (`leaves_last`) move
+        behind the ones that leave now."""
         guard = self.spill_guard
         assert guard is not None
         queue = self.free_block_queue
+        if guard.spills_at_reuse:
+            first: list[KVCacheBlock] = []
+            passed = False
+            for block in queue.iter_blocks_after(None):
+                if len(first) == num_blocks:
+                    break
+                if guard.leaves_last(block):
+                    passed = True
+                else:
+                    first.append(block)
+            if passed:
+                for block in first:
+                    queue.remove(block)
+                queue.prepend_n(first)
+            return
         safe: list[KVCacheBlock] = []
         held = False
         for block in queue.iter_blocks_after(None):

@@ -31,6 +31,17 @@ _CPU_BYTES_BOUND = 64 << 30
 # It only ranks sessions, so any model's tests can share it.
 _PREFILL_COST = (7.4893e-04, 6.4382e-04)
 
+
+def scaled_cost(tokens: int) -> tuple[float, float]:
+    """`_PREFILL_COST` with its depth term scaled so that a token `tokens`
+    deep costs what one 150k deep does in production (~150k-token sessions,
+    against the tests' few thousand), relative to the per-token term: what
+    makes a session's far segments cheaper per block than its near ones
+    there (RAM GDSF's cut order, `ram_ladder_ranking`)."""
+    d, e = _PREFILL_COST
+    return d, e * 150_000 / max(1, tokens)
+
+
 Connector = Literal["none", "eager", "lazy", "tiered"]
 
 
@@ -44,12 +55,24 @@ class EngineSpec:
     gpu_blocks: int = 64
     ram_blocks: int = 128
     copy_ahead_blocks: int = 0
+    # How a cached GPU block reaches RAM (lazy and tiered connectors): "walk"
+    # (copied ahead of its eviction; the spill guard holds allocations until
+    # the copy is acknowledged) or "inline" (copied in the step that reuses
+    # it, before anything in that step writes it; nothing waits).
+    spill: Literal["walk", "inline"] = "walk"
     # RAM blocks a restore loads at a time when the GPU lacks room for all of
     # it (0: the whole session at once).
     restore_chunk_blocks: int = 16
     # A session's checkpoint ladder: its first rung this many blocks back from
-    # its end (0: none).
+    # its end (0: none), and how RAM GDSF values its rungs: "fixed" (rungs go
+    # only with the tail above them), "safe" (those no cut could stop at go
+    # at once, the others by the seconds their segment saves) or "expected"
+    # (by what losing one adds to the expected recompute).
     ram_ladder_blocks: int = 8
+    ram_ladder_ranking: Literal["fixed", "safe", "expected"] = "fixed"
+    # RAM GDSF's prefill cost model, seconds per token and per token per 100k
+    # of context (`scaled_cost`: production's depth at test lengths).
+    prefill_cost: tuple[float, float] = _PREFILL_COST
     # RAM GDSF: a session idle this many times its turn gap (at least the
     # floor) is abandoned (0: off).
     abandon_gap_multiplier: float = 2.5
@@ -187,8 +210,10 @@ class EngineSpec:
                 ram_state_spacing_blocks=self.ram_state_spacing_blocks,
                 prune_gpu_states=self.prune_gpu_states,
                 copy_ahead_blocks=self.copy_ahead_blocks,
+                spill=self.spill,
                 restore_chunk_blocks=self.restore_chunk_blocks,
                 ram_ladder_blocks=self.ram_ladder_blocks,
+                ram_ladder_ranking=self.ram_ladder_ranking,
                 abandon_gap_multiplier=self.abandon_gap_multiplier,
                 abandon_floor_seconds=self.abandon_floor_s,
                 admission=self.admission,
@@ -199,10 +224,12 @@ class EngineSpec:
                 summary_log_seconds=self.summary_log_s,
             )
             if self.ram_eviction == "gdsf":
-                extra["prefill_cost_coefficients"] = list(_PREFILL_COST)
+                extra["prefill_cost_coefficients"] = list(self.prefill_cost)
         else:
             name = "SimpleCPUOffloadConnector"
             extra["lazy_offload"] = self.connector == "lazy"
+            if self.connector == "lazy":
+                extra["spill"] = self.spill
         return KVTransferConfig(
             kv_connector=name,
             kv_role="kv_both",

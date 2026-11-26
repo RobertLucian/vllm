@@ -45,6 +45,7 @@ class SimpleCPUOffloadWorker:
         use_page_cache: bool = False,
         num_cpu_blocks: int | None = None,
         cpu_hugepage_size: int | None = None,
+        spill: str = "walk",
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -56,6 +57,13 @@ class SimpleCPUOffloadWorker:
         self.use_page_cache = use_page_cache
         self.disk_mode = kv_offload_backend == "disk"
         self.cpu_hugepage_size = cpu_hugepage_size
+        # Lazy mode's inline spills (`spill_before_reuse`).
+        self._inline = spill == "inline"
+        if self._inline and self.disk_mode:
+            raise ValueError(
+                'spill="inline" copies a block in the step that reuses it, '
+                'ordered on the device; it needs kv_offload_backend="cpu".'
+            )
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -85,6 +93,9 @@ class SimpleCPUOffloadWorker:
         # Compute-done event recorded before each store; reused across steps
         # (get_finished runs once per step, copy queue is FIFO).
         self._store_compute_done: torch.Event | None = None
+        # Inline spills: recorded and waited on in one call, so reused too.
+        self._spill_start: torch.Event | None = None
+        self._spill_done: torch.Event | None = None
 
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
@@ -260,6 +271,7 @@ class SimpleCPUOffloadWorker:
             device,
             self.load_stream,
             self.store_stream,
+            inline=self._inline,
         )
 
     def _alloc_cpu_caches(
@@ -324,6 +336,36 @@ class SimpleCPUOffloadWorker:
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
+
+    def spill_before_reuse(self, metadata: SimpleCPUOffloadMetadata) -> None:
+        """Inline spills: copy the GPU blocks this step reuses to the CPU
+        blocks the scheduler cached them under, before anything in the step
+        writes them. The copy is launched here, on the store stream, behind
+        everything on the compute stream so far (an earlier step may still
+        write a block's last tokens); the compute stream goes on behind it
+        (the step's zeroing, block copies and forward), and so does the load
+        stream: a load may read one of the CPU blocks, or write one of the
+        GPU blocks, in this very step. No event is kept: the scheduler waits
+        for no acknowledgement."""
+        if not metadata.spill_gpu_blocks:
+            return
+        backend = self._backend
+        assert isinstance(backend, DmaCopyBackend)
+        assert self.device is not None
+        assert self.store_stream is not None and self.load_stream is not None
+        if self._spill_start is None or self._spill_done is None:
+            self._spill_start = torch.Event()
+            self._spill_done = torch.Event()
+        # The device's context and compute stream, whichever thread calls
+        # (the copy thread sets its own once: `DmaCopyBackend._copy_loop`).
+        with torch.cuda.device(self.device):
+            compute_stream = torch.cuda.current_stream()
+            self._spill_start.record(compute_stream)
+            self.store_stream.wait_event(self._spill_start)
+            backend.copy_now(metadata.spill_gpu_blocks, metadata.spill_cpu_blocks)
+            self._spill_done.record(self.store_stream)
+            compute_stream.wait_event(self._spill_done)
+            self.load_stream.wait_event(self._spill_done)
 
     def start_load_kv(self) -> None:
         # Invoked after the forward launch on steps without sync loads

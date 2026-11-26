@@ -601,10 +601,18 @@ class HybridCheckpointManager:
         request_id = request.request_id
         managers = self.mamba_managers
         new = sum(request_id not in m.decode_boundary_scratch for m in managers)
-        # Under a spill guard only the blocks it lets go count as free.
-        if new and self.pool.num_spill_safe_free_blocks(new + 1) <= new:
-            self.num_scratch_skipped += 1
-            return
+        if new:
+            # Under a spill guard only the blocks it lets go count as free;
+            # one that copies blocks as they are reused lets every one go.
+            guard = self.pool.spill_guard
+            free = (
+                self.pool.get_num_free_blocks()
+                if guard is not None and guard.spills_at_reuse
+                else self.pool.num_spill_safe_free_blocks(new + 1)
+            )
+            if free <= new:
+                self.num_scratch_skipped += 1
+                return
         for manager, block in zip(managers, running):
             entry = manager.decode_boundary_scratch.get(request_id)
             scratch = self.pool.get_new_blocks(1)[0] if entry is None else entry[0]

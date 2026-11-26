@@ -605,7 +605,7 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
-                self._note_refused(
+                self.note_refused(
                     request,
                     # Mamba's count for a state another request cached this step.
                     "same_step_state"
@@ -657,7 +657,7 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
-            self._note_refused(
+            self.note_refused(
                 request,
                 # Mamba's count for a state another request cached this step.
                 "same_step_state"
@@ -759,7 +759,10 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def _note_refused(self, request: Request, reason: str) -> None:
+    def note_refused(self, request: Request, reason: str) -> None:
+        """`request` gets no blocks this step, for `reason`
+        (`SpillGuard.note_refused`): its allocation was refused here, or the
+        scheduler asked for none."""
         guard = self.block_pool.spill_guard
         if guard is not None:
             guard.note_refused(request, reason)

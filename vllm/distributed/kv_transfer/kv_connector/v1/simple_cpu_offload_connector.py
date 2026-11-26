@@ -56,6 +56,10 @@ logger = init_logger(__name__)
 DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 VALID_KV_OFFLOAD_BACKENDS = ("cpu", "disk")
+# Lazy mode: how a cached GPU block the CPU pool lacks gets its copy. "walk":
+# ahead of its eviction, which waits for the copy's acknowledgement. "inline":
+# in the step that reuses it, ordered on the device before that step's writes.
+VALID_SPILL_MODES = ("walk", "inline")
 # Keys that only apply to the disk backend, warned about under "cpu".
 _DISK_ONLY_KEYS = (
     "disk_path",
@@ -104,6 +108,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         #   step's completion when frees are deferred.
         # - Workers launch stores after the step's forward, ordered behind the
         #   gathers and copies on the compute stream.
+        # - Inline spills (`spill="inline"`) take only free blocks too, with
+        #   frees always deferred (`spills_at_reuse`), and workers launch them
+        #   behind the step's gathers.
         return True
 
     @property
@@ -173,6 +180,25 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             CacheHitSource.DISK if disk_mode else CacheHitSource.HOST
         )
 
+        spill = str(extra_config.get("spill", "walk"))
+        if spill not in VALID_SPILL_MODES:
+            raise ValueError(
+                f"Unknown spill {spill!r}; expected one of {VALID_SPILL_MODES}"
+            )
+        if spill == "inline" and (not lazy_offload or disk_mode):
+            raise ValueError(
+                'spill="inline" requires lazy_offload and kv_offload_backend="cpu".'
+            )
+        # Checked here: the GPU pool gets its eviction policy only after the
+        # connector is bound to it.
+        if spill == "inline" and vllm_config.cache_config.prefix_cache_eviction != (
+            "lru"
+        ):
+            raise ValueError(
+                'spill="inline" copies GPU blocks as they leave the free queue, '
+                "in its LRU order; use --prefix-cache-eviction lru."
+            )
+
         disk_path = extra_config.get("disk_path", None) or None
         disk_capacity_bytes = int(
             extra_config.get("disk_capacity_bytes", 100 * (1024**3))
@@ -226,6 +252,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             kv_offload_backend,
             disk_path or "none",
         )
+        if spill == "inline":
+            logger.info(
+                "SimpleCPUOffloadConnector: lazy stores spill inline, in the "
+                "step that reuses a block."
+            )
         if num_cpu_blocks is not None:
             logger.info(
                 "Using explicit num_cpu_blocks=%d for offload pool sizing "
@@ -254,6 +285,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 use_page_cache=use_page_cache if disk_mode else False,
                 num_cpu_blocks=num_cpu_blocks,
                 aligned_num_cpu_blocks=aligned_num_cpu_blocks,
+                spill=spill,
                 **self._scheduler_manager_kwargs(extra_config),
             )
         elif role == KVConnectorRole.WORKER:
@@ -268,6 +300,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 use_page_cache=use_page_cache,
                 num_cpu_blocks=num_cpu_blocks,
                 cpu_hugepage_size=cpu_hugepage_size,
+                spill=spill,
             )
 
     def _scheduler_manager_kwargs(self, extra_config: dict[str, Any]) -> dict[str, Any]:
@@ -304,6 +337,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.worker_handler is not None:
             assert isinstance(kv_connector_metadata, SimpleCPUOffloadMetadata)
             self.worker_handler.handle_preemptions(kv_connector_metadata)
+
+    def spill_before_reuse(self, connector_metadata: KVConnectorMetadata) -> None:
+        if self.worker_handler is not None:
+            assert isinstance(connector_metadata, SimpleCPUOffloadMetadata)
+            self.worker_handler.spill_before_reuse(connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         if self.worker_handler is not None:
@@ -383,6 +421,15 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         return (
             self.scheduler_manager is not None
             and self.scheduler_manager.has_pending_block_frees()
+        )
+
+    @property
+    def spills_at_reuse(self) -> bool:
+        # Lazy mode's inline spills read a free block in the step that takes
+        # it: no step in flight may still write it.
+        return (
+            self.scheduler_manager is not None
+            and self.scheduler_manager.spills_at_reuse
         )
 
     def on_held_allocation(

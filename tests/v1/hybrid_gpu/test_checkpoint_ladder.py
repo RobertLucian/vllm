@@ -5,13 +5,17 @@ ladder, not from the start.
 
 RAM evicts a session's tail first, down to its next point to resume at. Its
 points used to sit only near its end (exact end, prompt tail, loop start),
-so losing them lost it whole: GPU window 5 (2026-11-23) re-read nine
-sessions of 56-160k tokens with nothing left in either tier. A ladder keeps
+so losing them lost it whole. (GPU window 5, 2026-11-23, re-read nine
+sessions of 56-160k tokens whole and was first read that way; at least three
+of them RAM still held whole, and their restores gave up waiting for room.)
+A ladder keeps
 a state per doubling stretch back from the end, including inside a long
 first prefill, which production's sparse Mamba retention would not cache
 otherwise. Here unrelated prompts age a long session out of RAM until its
 last page is gone: with the ladder its next turn resumes at a rung and
-matches a cold run; without it, from the start."""
+matches a cold run; without it, from the start. However RAM values its rungs
+(`ram_ladder_ranking`): a session about to lose its tail keeps a rung to
+resume at."""
 
 import pytest
 
@@ -21,9 +25,10 @@ from .workloads import Session, fillers, greedy, run
 
 _SESSION_BLOCKS = 40
 _MAX_FILLERS = 60
+_RANKINGS = ("fixed", "safe", "expected")
 
 
-def _spec(tp: int, ladder: int) -> EngineSpec:
+def _spec(tp: int, ladder: int, ranking: str = "fixed") -> EngineSpec:
     return EngineSpec(
         family="gdn_fat",
         connector="tiered",
@@ -31,6 +36,7 @@ def _spec(tp: int, ladder: int) -> EngineSpec:
         gpu_blocks=64,
         ram_blocks=64,
         ram_ladder_blocks=ladder,
+        ram_ladder_ranking=ranking,
         abandon_gap_multiplier=0.0,
         tp=tp,
     )
@@ -79,14 +85,16 @@ def test_a_session_resumes_at_a_rung_once_its_tail_is_gone(
     engines, tp, record_property
 ):
     _, flat, _ = _lose_tail(engines, _spec(tp, 0), record_property, "flat")
-    first, laddered, probe = _lose_tail(
-        engines, _spec(tp, 8), record_property, "ladder"
-    )
-    end = len(first.prompt)
-    # Its tail is gone, but a rung below it resumes it: at least the first
-    # rung's stretch of the session comes back, at most up to its last page.
-    assert 0 < laddered.num_cached_tokens < end, laddered.num_cached_tokens
-    assert laddered.num_cached_tokens > flat.num_cached_tokens, (
-        flat.num_cached_tokens,
-        laddered.num_cached_tokens,
-    )
+    for ranking in _RANKINGS:
+        first, laddered, _ = _lose_tail(
+            engines, _spec(tp, 8, ranking), record_property, f"ladder_{ranking}"
+        )
+        end = len(first.prompt)
+        # Its tail is gone, but a rung below it resumes it: at least the first
+        # rung's stretch of the session comes back, at most up to its last page.
+        assert 0 < laddered.num_cached_tokens < end, (ranking, laddered)
+        assert laddered.num_cached_tokens > flat.num_cached_tokens, (
+            ranking,
+            flat.num_cached_tokens,
+            laddered.num_cached_tokens,
+        )

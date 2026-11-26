@@ -456,6 +456,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c, cm in zip(self._connectors, kv_connector_metadata.metadata):
             c.handle_preemptions(cm)
 
+    def spill_before_reuse(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Run every sub-connector's spills for the blocks this step reuses."""
+        assert isinstance(connector_metadata, MultiKVConnectorMetadata)
+        for c, cm in zip(self._connectors, connector_metadata.metadata):
+            c.spill_before_reuse(cm)
+
     def get_finished_count(self) -> int | None:
         child_counts = [
             connector.get_finished_count() for connector in self._connectors
@@ -684,6 +690,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
 
     def has_pending_block_frees(self) -> bool:
         return any(c.has_pending_block_frees() for c in self._connectors)
+
+    @property
+    def spills_at_reuse(self) -> bool:
+        return any(c.spills_at_reuse for c in self._connectors)
 
     def has_pending_push_work(self) -> bool:
         return any(c.has_pending_push_work() for c in self._connectors)

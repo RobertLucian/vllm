@@ -26,9 +26,19 @@ Configuration (``kv_connector_extra_config``): SimpleCPU's ``cpu_bytes_to_use``
 ``copy_ahead_blocks`` (default 0: the lazy walk's own target),
 ``restore_chunk_blocks`` (default 16: a restore the GPU lacks room for loads
 in chunks of this many blocks, a swap; 0 restores whole),
+``spill`` (default ``walk``: the lazy walk copies a block ahead of its
+eviction, and the GPU reuses it once the copy is acknowledged, which holds
+allocations for scheduling passes; ``inline``: a block RAM lacks is copied
+in the step that reuses it, ordered on the device before anything in that
+step writes it, so nothing is held or acknowledged; RAM in host memory
+only),
 ``ram_ladder_blocks`` (default 8: a session keeps a state per doubling
 stretch from this many blocks back from its end, so RAM evicts its tail down
-to a rung, not all of it; 0, off) and ``abandon_gap_multiplier`` /
+to a rung, not all of it; 0, off), ``ram_ladder_ranking`` (default ``fixed``:
+rungs go only with the tail above them; with ``gdsf``, ``safe``: a rung no
+cut could stop at goes at once and the others are ranked with the pages per
+state block; ``expected``: by what losing one adds to the session's expected
+recompute) and ``abandon_gap_multiplier`` /
 ``abandon_floor_seconds`` (default 2.5 / 30: RAM GDSF evicts a session idle
 that many times its turn gap, at least the floor, before any live one; 0,
 off), ``admission`` (default ``legacy``; ``pack``, ``pass``: window T, 2026-11-24,
@@ -55,6 +65,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector,
 )
+
 from vllm.v1.simple_kv_offload.metrics import TieredCPUOffloadPromMetrics
 from vllm.v1.simple_kv_offload.tiered import TieredCPUOffloadScheduler
 
@@ -108,6 +119,7 @@ class TieredCPUOffloadConnector(SimpleCPUOffloadConnector):
             "copy_ahead_blocks": int(extra_config.get("copy_ahead_blocks", 0)),
             "restore_chunk_blocks": int(extra_config.get("restore_chunk_blocks", 16)),
             "ram_ladder_blocks": int(extra_config.get("ram_ladder_blocks", 8)),
+            "ram_ladder_ranking": str(extra_config.get("ram_ladder_ranking", "fixed")),
             "abandon_gap_multiplier": float(
                 extra_config.get("abandon_gap_multiplier", 2.5)
             ),

@@ -27,6 +27,7 @@ class MetricName:
     LOAD_BLOCKS = "vllm:simple_kv_offload_load_blocks_total"
     USED_BLOCKS = "vllm:simple_kv_offload_used_blocks"
     PENDING_STORE_BLOCKS = "vllm:simple_kv_offload_pending_store_blocks"
+    STORE_ACK_PASSES = "vllm:simple_kv_offload_store_ack_passes_total"
     INFO = "vllm:simple_kv_offload_info"
 
 
@@ -48,6 +49,7 @@ LAZY_SPILL_EVENT_TO_FIELD = {
     "held_allocations": "held_allocations",
     "unspilled_evicted_blocks": "unspilled_evicted_blocks",
     "guard_releases": "guard_releases",
+    "guard_releases_in_flight": "guard_releases_in_flight",
     "cpu_evicted_blocks": "cpu_evicted_blocks",
     "uncopied_evicted_blocks": "uncopied_evicted_blocks",
     "hold_episodes": "hold_episodes",
@@ -60,6 +62,13 @@ LAZY_SPILL_EVENT_TO_FIELD = {
     "held_skips_running": "held_skips_running",
     "held_skips_waiting": "held_skips_waiting",
     "held_stop_untried": "held_stop_untried",
+    "store_acks": "store_acks",
+    "store_ack_ms": "store_ack_ms",
+    "inline_spilled_blocks": "inline_spilled_blocks",
+    "inline_units_lost": "inline_units_lost",
+    "inline_unwritten_blocks": "inline_unwritten_blocks",
+    "inline_spill_calls": "inline_spill_calls",
+    "inline_spill_us": "inline_spill_us",
 }
 
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]
@@ -85,6 +94,12 @@ class TieredMetricName:
     LANDED_WAITS = "vllm:tiered_kv_landed_waits_total"
     SCHEDULER_SECONDS = "vllm:tiered_kv_scheduler_seconds_total"
     RESTORE_PEAKS = "vllm:tiered_kv_restore_peaks"
+    TIER_BLOCKS = "vllm:tiered_kv_tier_blocks"
+    DUPLICATE_BLOCKS = "vllm:tiered_kv_duplicate_blocks"
+    RAM_UNRANKED_BLOCKS = "vllm:tiered_kv_ram_unranked_blocks"
+    LADDER = "vllm:tiered_kv_ladder_total"
+    LADDER_P = "vllm:tiered_kv_ladder_p_total"
+    RESUMES_BY_POINT = "vllm:tiered_kv_resumes_by_point_total"
 
 
 class _MetricType:
@@ -244,7 +259,11 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
                 "store new ones; holds (runs of steps with allocations held), "
                 "their total ms and those over 100 ms / 1 s / 5 s; held "
                 "allocations that stopped the scheduler's running or waiting "
-                "loop or were skipped, and the requests stops left untried."
+                "loop or were skipped, and the requests stops left untried; "
+                "stores acknowledged and the ms from their issue to that; "
+                "with inline spills, blocks copied in the step that reused "
+                "them, exact-end states lost with a block in use, and the "
+                "calls and microseconds of the hook that takes the copies."
             ),
             labelnames=self._labelnames + ["event"],
         )
@@ -279,6 +298,15 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=self._labelnames,
             multiprocess_mode="mostrecent",
         )
+        self._counter_store_ack_passes = self._counter_cls(
+            name="vllm:simple_kv_offload_store_ack_passes_total",
+            documentation=(
+                "Stores acknowledged, by the scheduling passes from the one "
+                "that issued the store to the first that sees it landed "
+                "(1, 2, 3, 4, 5+)."
+            ),
+            labelnames=self._labelnames + ["bucket"],
+        )
         self._gauge_info = self._gauge_cls(
             name="vllm:simple_kv_offload_info",
             documentation=(
@@ -297,6 +325,7 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             MetricName.LOAD_BLOCKS: self._counter_load_blocks,
             MetricName.USED_BLOCKS: self._gauge_used_blocks,
             MetricName.PENDING_STORE_BLOCKS: self._gauge_pending_store_blocks,
+            MetricName.STORE_ACK_PASSES: self._counter_store_ack_passes,
             MetricName.INFO: self._gauge_info,
         }
         self._num_label_values: dict[str, int] = {
@@ -305,6 +334,7 @@ class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
             MetricName.LOAD_BLOCKS: 0,
             MetricName.USED_BLOCKS: 0,
             MetricName.PENDING_STORE_BLOCKS: 0,
+            MetricName.STORE_ACK_PASSES: 1,
             MetricName.INFO: len(INFO_LABELS),
         }
 
@@ -497,7 +527,9 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                     "its allocation found no room, would take room others keep "
                     "(reserved) or the claimant's (claim), waited for copies, "
                     "did not fit whole, needed a state cached this step; the "
-                    "scheduler allocated nothing for it, or did not reach it."
+                    "scheduler scheduled nothing for it (prefill deferred, "
+                    "speculative padding, the low-priority cap, a chunk of 0 "
+                    "tokens, other), or did not reach it."
                 ),
                 ["reason"],
             ),
@@ -516,10 +548,71 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                 TieredMetricName.RESTORE_PEAKS,
                 _MetricType.GAUGE,
                 (
-                    "Most restores started in one step, and most loading at "
-                    "once, since the engine started."
+                    "Most restores started in one step, most loading at "
+                    "once, and most chunks of a chunked restore taken and not "
+                    "yet landed, since the engine started."
                 ),
                 ["kind"],
+            ),
+            (
+                TieredMetricName.TIER_BLOCKS,
+                _MetricType.GAUGE,
+                (
+                    "Blocks each tier holds, by kind: free, in use (running, or "
+                    "a copy between the tiers), RAM orphans, attention pages "
+                    "(an exact end's or not), recurrent states by role (exact "
+                    "end, queued, held by a running request, ladder rung, other "
+                    "resume point, shared, prompt tail, other)."
+                ),
+                ["tier", "kind"],
+            ),
+            (
+                TieredMetricName.DUPLICATE_BLOCKS,
+                _MetricType.GAUGE,
+                "RAM blocks the GPU caches too, pages and states.",
+                ["kind"],
+            ),
+            (
+                TieredMetricName.RAM_UNRANKED_BLOCKS,
+                _MetricType.GAUGE,
+                (
+                    "Live sessions' exclusive RAM blocks no eviction ranks (the "
+                    "GPU holds their tail), pages and states."
+                ),
+                ["kind"],
+            ),
+            (
+                TieredMetricName.LADDER,
+                _MetricType.COUNTER,
+                (
+                    "Checkpoint-ladder points, by event: dropped because no "
+                    "cut could stop there or by value (and the RAM blocks that "
+                    "freed, copies just made among them); resumes at a rung "
+                    "and the tokens it saved; resumes below a dropped rung and "
+                    "the tokens between."
+                ),
+                ["event"],
+            ),
+            (
+                TieredMetricName.LADDER_P,
+                _MetricType.COUNTER,
+                (
+                    "Sessions' estimated chance of losing their tail before "
+                    "their next turn, by tenth, against what happened."
+                ),
+                ["bucket", "outcome"],
+            ),
+            (
+                TieredMetricName.RESUMES_BY_POINT,
+                _MetricType.COUNTER,
+                (
+                    "Admitted requests that resume a finished request's "
+                    "session, by the kind of point they landed on (its exact "
+                    "end, a kept block boundary near its end, its prompt tail, "
+                    "a ladder rung, a shared point, another state, none) and "
+                    "the tier."
+                ),
+                ["kind", "tier"],
             ),
         ]
         for name, kind, documentation, extra_labels in definitions:

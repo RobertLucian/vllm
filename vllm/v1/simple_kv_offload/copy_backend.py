@@ -41,12 +41,17 @@ class DmaCopyBackend:
         device: torch.device,
         load_stream: torch.cuda.Stream,
         store_stream: torch.cuda.Stream,
+        inline: bool = False,
     ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
 
         # Stores read the live KV cache -> STREAM (paired with the compute-done
         # wait in get_finished); loads read stable pinned host memory -> ANY.
+        # With inline spills (`copy_now`) a host block is cached before its
+        # copy has run, and a load of it may follow in the same step: loads
+        # read in stream order too, behind the event the spill leaves on
+        # their stream.
         self._store_params = build_params(
             gpu_caches,
             cpu_caches,
@@ -57,7 +62,11 @@ class DmaCopyBackend:
             cpu_caches,
             gpu_caches,
             load_stream,
-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            src_access_order=(
+                CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+                if inline
+                else CU_MEMCPY_SRC_ACCESS_ORDER_ANY
+            ),
         )
 
         self._queue = queue.SimpleQueue()
@@ -90,6 +99,16 @@ class DmaCopyBackend:
                 wait_event,
             )
         )
+
+    def copy_now(self, src_blocks: list[int], dst_blocks: list[int]) -> None:
+        """Launch a GPU -> CPU copy on the store stream from the calling
+        thread, past the copy thread's queue: the caller orders it against
+        its own stream with events (`SimpleCPUOffloadWorker.
+        spill_before_reuse`), and must have the device's context current as
+        the copy thread does."""
+        params = self._store_params
+        assert params is not None
+        copy_blocks(src_blocks, dst_blocks, params)
 
     def shutdown(self) -> None:
         if self._shutdown:

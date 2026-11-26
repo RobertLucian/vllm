@@ -202,6 +202,11 @@ class Scheduler(SchedulerInterface):
             multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
             if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
                 self.defer_block_free = True
+            # A connector that copies a cached block out in the step that
+            # reuses it reads it there: a block still written, or yet to be
+            # (a state gather or copy the next step runs), must not be free.
+            if self.connector.spills_at_reuse:
+                self.defer_block_free = True
             # HiSparse keeps reading a released page until the pool reuses it,
             # so a load into a reused page must also wait for in-flight steps.
             self.defer_async_loads = (
@@ -1638,6 +1643,7 @@ class Scheduler(SchedulerInterface):
                 ):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    self.kv_cache_manager.note_refused(request, "deferred_step")
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1673,6 +1679,9 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                self.kv_cache_manager.note_refused(
+                                    request, "spec_padding"
+                                )
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1706,6 +1715,9 @@ class Scheduler(SchedulerInterface):
                     if capped:
                         assert low_prefill_left is not None
                         if not low_prefill_left:
+                            self.kv_cache_manager.note_refused(
+                                request, "low_priority_cap"
+                            )
                             skip_request(request_queue)
                             continue
                         num_new_tokens = min(num_new_tokens, low_prefill_left)
@@ -1719,6 +1731,9 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            self.kv_cache_manager.note_refused(
+                                request, "aligned_chunk_zero"
+                            )
                             if capped:
                                 # Its chunk does not fit the cap; an urgent
                                 # request in another queue may still.
@@ -1775,6 +1790,9 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         # The request cannot be scheduled. Requeue it so it does
                         # not stall the requests behind it.
+                        self.kv_cache_manager.note_refused(
+                            request, "trimmed_chunk_zero"
+                        )
                         skip_request(request_queue)
                         continue
 
