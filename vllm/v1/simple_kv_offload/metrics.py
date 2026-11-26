@@ -100,6 +100,7 @@ class TieredMetricName:
     LADDER = "vllm:tiered_kv_ladder_total"
     LADDER_P = "vllm:tiered_kv_ladder_p_total"
     RESUMES_BY_POINT = "vllm:tiered_kv_resumes_by_point_total"
+    UNCOPIED_EVICTIONS = "vllm:tiered_kv_uncopied_evictions_total"
 
 
 class _MetricType:
@@ -613,6 +614,18 @@ class TieredCPUOffloadPromMetrics(SimpleCPUOffloadPromMetrics):
                     "the tier."
                 ),
                 ["kind", "tier"],
+            ),
+            (
+                TieredMetricName.UNCOPIED_EVICTIONS,
+                _MetricType.COUNTER,
+                (
+                    "GPU blocks a lookup could restore that left with no copy "
+                    "in RAM, by what they held: an attention page, a state at "
+                    "a block boundary a session resumes at or another, a live "
+                    "exact-end state, another state inside a block (one the "
+                    "GPU released itself, as a rule)."
+                ),
+                ["kind"],
             ),
         ]
         for name, kind, documentation, extra_labels in definitions:

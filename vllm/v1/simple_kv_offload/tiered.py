@@ -858,6 +858,7 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
         # GPU blocks that left with no copy in RAM though a lookup could
         # restore them, by what they held (`_note_uncopied`).
         self.uncopied_kinds: Counter[str] = Counter()
+        self._uncopied_kinds_snapshot: Counter[str] = Counter()
         self._restores: dict[str, _Restore] = {}
         # Loads by restore (its whole session, or a chunk of it).
         self._unsent: list[
@@ -4129,6 +4130,13 @@ class TieredCPUOffloadScheduler(SimpleCPUOffloadScheduler):
             if delta > 0:
                 stats.increase_counter(TieredMetricName.RESUMES_BY_POINT, delta, labels)
         self._resume_points_snapshot = Counter(self.resume_points)
+        for kind, count in self.uncopied_kinds.items():
+            delta = count - self._uncopied_kinds_snapshot[kind]
+            if delta > 0:
+                stats.increase_counter(
+                    TieredMetricName.UNCOPIED_EVICTIONS, delta, (kind,)
+                )
+        self._uncopied_kinds_snapshot = Counter(self.uncopied_kinds)
         now = time.monotonic()
         if now - self._tier_blocks_at >= _TIER_BLOCKS_EVERY_S:
             self._tier_blocks_at = now
